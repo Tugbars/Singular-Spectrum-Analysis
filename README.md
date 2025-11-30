@@ -1,0 +1,2 @@
+# Singular Spectrum Analysis
+
