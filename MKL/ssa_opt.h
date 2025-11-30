@@ -466,19 +466,16 @@ extern "C"
         int n = ssa->fft_len;
         double *ws = ssa->ws_fft1;
 
-        // Zero workspace and reverse v into real parts
+        // Zero workspace and REVERSE v into real parts
+        // X @ v = conv(x, reverse(v))[K-1 : K-1+L]
         ssa_opt_zero(ws, 2 * n);
 
-#ifdef SSA_USE_MKL
-        // cblas_dcopy with negative stride: reverse v directly into stride-2 positions
-        // src = v + K - 1, incx = -1; dst = ws, incy = 2
-        cblas_dcopy(K, v + K - 1, -1, ws, 2);
-#else
+        // Note: cblas_dcopy with negative stride is broken on MKL Windows
+        // Use simple loop for portability
         for (int i = 0; i < K; i++)
         {
             ws[2 * i] = v[K - 1 - i];
         }
-#endif
 
         // FFT of reversed v
 #ifdef SSA_USE_MKL
@@ -522,18 +519,15 @@ extern "C"
 
         // X^T @ u = conv(x, reverse(u))[L-1 : L-1+K]
 
-        // Zero workspace and reverse u into real parts
+        // Zero workspace and REVERSE u into real parts
         ssa_opt_zero(ws, 2 * n);
 
-#ifdef SSA_USE_MKL
-        // cblas_dcopy with negative stride: reverse u directly into stride-2 positions
-        cblas_dcopy(L, u + L - 1, -1, ws, 2);
-#else
+        // Note: cblas_dcopy with negative stride is broken on MKL Windows
+        // Use simple loop for portability
         for (int i = 0; i < L; i++)
         {
             ws[2 * i] = u[L - 1 - i];
         }
-#endif
 
         // FFT of reversed u
 #ifdef SSA_USE_MKL
@@ -580,7 +574,11 @@ extern "C"
         ssa->L = L;
         ssa->K = N - L + 1;
 
-        int fft_n = ssa_opt_next_pow2(N);
+        // FFT length must accommodate full linear convolution:
+        // conv(x, v) has length N + K - 1 = N + (N - L + 1) - 1 = 2N - L
+        // Must use next power of 2 >= 2N - L to avoid circular convolution artifacts
+        int conv_len = N + ssa->K - 1; // = 2*N - L
+        int fft_n = ssa_opt_next_pow2(conv_len);
         ssa->fft_len = fft_n;
 
         // Allocate all workspace upfront
