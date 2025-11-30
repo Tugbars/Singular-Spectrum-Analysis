@@ -46,11 +46,11 @@ static double correlation(const double* a, const double* b, int n) {
 int main() {
     printf("=== Phase 2: Block Power Method Test ===\n\n");
     
-    // Test parameters
-    int N = 1000;      // Larger signal for meaningful benchmark
-    int L = 400;
-    int k = 20;        // Number of components
-    int block_size = 8;
+    // Test parameters - larger problem where block method excels
+    int N = 5000;      // Larger signal
+    int L = 2000;
+    int k = 32;        // Number of components (match block_size)
+    int block_size = 32;  // Match SSA_BATCH_SIZE for FFT efficiency
     int max_iter = 100;
     
     printf("Parameters: N=%d, L=%d, K=%d, k=%d, block_size=%d\n\n", 
