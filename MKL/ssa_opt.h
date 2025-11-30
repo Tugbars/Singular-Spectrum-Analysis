@@ -76,8 +76,9 @@ extern "C"
 
 #ifdef SSA_USE_MKL
         // MKL FFT descriptors
-        DFTI_DESCRIPTOR_HANDLE fft_handle;       // Single FFT for matvec
-        DFTI_DESCRIPTOR_HANDLE fft_batch_handle; // Batched FFT for reconstruction
+        DFTI_DESCRIPTOR_HANDLE fft_handle;        // Single FFT for matvec
+        DFTI_DESCRIPTOR_HANDLE fft_batch_handle;  // Batched FFT for block matvec (NOT_INPLACE)
+        DFTI_DESCRIPTOR_HANDLE fft_batch_inplace; // Batched FFT for reconstruction (INPLACE)
 
         // MKL Random Number Generator
         VSLStreamStatePtr rng;
@@ -94,8 +95,13 @@ extern "C"
         double *ws_proj; // Projection coefficients for GEMV orthog, length k
 
         // Batch FFT workspace for reconstruction
-        double *ws_batch_u; // Batch of u FFTs, length 2*fft_len*SSA_BATCH_SIZE
-        double *ws_batch_v; // Batch of v FFTs, length 2*fft_len*SSA_BATCH_SIZE
+        double *ws_batch_u;   // Batch of u FFTs, length 2*fft_len*SSA_BATCH_SIZE
+        double *ws_batch_v;   // Batch of v FFTs, length 2*fft_len*SSA_BATCH_SIZE
+        double *ws_batch_out; // Output buffer for not-in-place FFT
+
+        // Split-complex storage for FFT(x) - better SIMD performance
+        double *fft_x_re; // Real part of FFT(x), length fft_len
+        double *fft_x_im; // Imag part of FFT(x), length fft_len
 #else
     double *fft_x;
     double *ws_fft1;
@@ -565,6 +571,29 @@ extern "C"
 
 #ifdef SSA_USE_MKL
 
+    // Optimized complex multiply using split-complex storage
+    // Computes: out = fft_x * in (element-wise complex multiply)
+    // Uses split-complex fft_x for better SIMD, interleaved in/out
+    static void ssa_opt_complex_mul_split(
+        const double *fft_x_re, // Real part of FFT(x), length n
+        const double *fft_x_im, // Imag part of FFT(x), length n
+        const double *in,       // Interleaved complex input, length 2*n
+        double *out,            // Interleaved complex output, length 2*n
+        int n)
+    {
+        // (a + bi)(c + di) = (ac - bd) + (ad + bc)i
+        // where a,b = fft_x_re,fft_x_im and c,d = in_re,in_im
+        for (int i = 0; i < n; i++)
+        {
+            double a = fft_x_re[i];
+            double b = fft_x_im[i];
+            double c = in[2 * i];
+            double d = in[2 * i + 1];
+            out[2 * i] = a * c - b * d;     // real
+            out[2 * i + 1] = a * d + b * c; // imag
+        }
+    }
+
     // Y = X @ V_block  where V_block is K × b, Y is L × b
     // Uses batched FFT for efficiency
     static void ssa_opt_hankel_matvec_block(
@@ -579,7 +608,8 @@ extern "C"
         int n = ssa->fft_len;
         size_t stride = 2 * n; // Complex interleaved stride
 
-        double *ws = ssa->ws_batch_u; // Reuse batch workspace
+        double *ws_in = ssa->ws_batch_u;    // Input buffer
+        double *ws_out = ssa->ws_batch_out; // Output buffer for NOT_INPLACE
 
         // Process in batches of SSA_BATCH_SIZE
         int col = 0;
@@ -587,11 +617,11 @@ extern "C"
         {
             int batch_count = (b - col < SSA_BATCH_SIZE) ? (b - col) : SSA_BATCH_SIZE;
 
-            // Pack reversed vectors into workspace
+            // Pack reversed vectors into input workspace
             for (int i = 0; i < batch_count; i++)
             {
                 const double *v = &V_block[(col + i) * K];
-                double *dst = ws + i * stride;
+                double *dst = ws_in + i * stride;
 
                 ssa_opt_zero(dst, stride);
                 for (int j = 0; j < K; j++)
@@ -603,27 +633,27 @@ extern "C"
             // Zero remaining slots for partial batch
             if (batch_count < SSA_BATCH_SIZE)
             {
-                ssa_opt_zero(ws + batch_count * stride, (SSA_BATCH_SIZE - batch_count) * stride);
+                ssa_opt_zero(ws_in + batch_count * stride, (SSA_BATCH_SIZE - batch_count) * stride);
             }
 
-            // Batch forward FFT
-            DftiComputeForward(ssa->fft_batch_handle, ws);
+            // Batch forward FFT (NOT_INPLACE: ws_in -> ws_out)
+            DftiComputeForward(ssa->fft_batch_handle, ws_in, ws_out);
 
-            // Complex multiply each with precomputed FFT(x)
+            // Complex multiply each with precomputed FFT(x) using MKL vzMul
             for (int i = 0; i < batch_count; i++)
             {
-                double *fft_v = ws + i * stride;
+                double *fft_v = ws_out + i * stride;
                 vzMul(n, (const MKL_Complex16 *)ssa->fft_x, (const MKL_Complex16 *)fft_v,
                       (MKL_Complex16 *)fft_v);
             }
 
-            // Batch inverse FFT
-            DftiComputeBackward(ssa->fft_batch_handle, ws);
+            // Batch inverse FFT (NOT_INPLACE: ws_out -> ws_in)
+            DftiComputeBackward(ssa->fft_batch_handle, ws_out, ws_in);
 
             // Extract results: conv[K-1 : K-1+L] for each column
             for (int i = 0; i < batch_count; i++)
             {
-                double *conv = ws + i * stride;
+                double *conv = ws_in + i * stride;
                 double *y = &Y_block[(col + i) * L];
                 cblas_dcopy(L, conv + 2 * (K - 1), 2, y, 1);
             }
@@ -645,7 +675,8 @@ extern "C"
         int n = ssa->fft_len;
         size_t stride = 2 * n;
 
-        double *ws = ssa->ws_batch_u;
+        double *ws_in = ssa->ws_batch_u;
+        double *ws_out = ssa->ws_batch_out;
 
         int col = 0;
         while (col < b)
@@ -656,7 +687,7 @@ extern "C"
             for (int i = 0; i < batch_count; i++)
             {
                 const double *u = &U_block[(col + i) * L];
-                double *dst = ws + i * stride;
+                double *dst = ws_in + i * stride;
 
                 ssa_opt_zero(dst, stride);
                 for (int j = 0; j < L; j++)
@@ -668,27 +699,27 @@ extern "C"
             // Zero remaining slots
             if (batch_count < SSA_BATCH_SIZE)
             {
-                ssa_opt_zero(ws + batch_count * stride, (SSA_BATCH_SIZE - batch_count) * stride);
+                ssa_opt_zero(ws_in + batch_count * stride, (SSA_BATCH_SIZE - batch_count) * stride);
             }
 
-            // Batch forward FFT
-            DftiComputeForward(ssa->fft_batch_handle, ws);
+            // Batch forward FFT (NOT_INPLACE)
+            DftiComputeForward(ssa->fft_batch_handle, ws_in, ws_out);
 
-            // Complex multiply each with FFT(x)
+            // Complex multiply each with FFT(x) using MKL vzMul
             for (int i = 0; i < batch_count; i++)
             {
-                double *fft_u = ws + i * stride;
+                double *fft_u = ws_out + i * stride;
                 vzMul(n, (const MKL_Complex16 *)ssa->fft_x, (const MKL_Complex16 *)fft_u,
                       (MKL_Complex16 *)fft_u);
             }
 
-            // Batch inverse FFT
-            DftiComputeBackward(ssa->fft_batch_handle, ws);
+            // Batch inverse FFT (NOT_INPLACE)
+            DftiComputeBackward(ssa->fft_batch_handle, ws_out, ws_in);
 
             // Extract results: conv[L-1 : L-1+K]
             for (int i = 0; i < batch_count; i++)
             {
-                double *conv = ws + i * stride;
+                double *conv = ws_in + i * stride;
                 double *y = &Y_block[(col + i) * K];
                 cblas_dcopy(K, conv + 2 * (L - 1), 2, y, 1);
             }
@@ -746,8 +777,14 @@ extern "C"
         size_t batch_size = fft_size * SSA_BATCH_SIZE;
         ssa->ws_batch_u = (double *)ssa_opt_alloc(batch_size);
         ssa->ws_batch_v = (double *)ssa_opt_alloc(batch_size);
+        ssa->ws_batch_out = (double *)ssa_opt_alloc(batch_size); // For not-in-place FFT
 
-        if (!ssa->ws_batch_u || !ssa->ws_batch_v)
+        // Split-complex storage for FFT(x)
+        ssa->fft_x_re = (double *)ssa_opt_alloc(fft_n * sizeof(double));
+        ssa->fft_x_im = (double *)ssa_opt_alloc(fft_n * sizeof(double));
+
+        if (!ssa->ws_batch_u || !ssa->ws_batch_v || !ssa->ws_batch_out ||
+            !ssa->fft_x_re || !ssa->fft_x_im)
         {
             ssa_opt_free(ssa);
             return -1;
@@ -772,7 +809,7 @@ extern "C"
             return -1;
         }
 
-        // Create MKL batched FFT descriptor for reconstruction
+        // Create MKL batched FFT descriptor - NOT_INPLACE for better performance
         status = DftiCreateDescriptor(&ssa->fft_batch_handle, DFTI_DOUBLE, DFTI_COMPLEX, 1, fft_n);
         if (status != 0)
         {
@@ -780,13 +817,34 @@ extern "C"
             return -1;
         }
 
-        DftiSetValue(ssa->fft_batch_handle, DFTI_PLACEMENT, DFTI_INPLACE);
+        DftiSetValue(ssa->fft_batch_handle, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
         DftiSetValue(ssa->fft_batch_handle, DFTI_BACKWARD_SCALE, 1.0 / fft_n);
         DftiSetValue(ssa->fft_batch_handle, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)SSA_BATCH_SIZE);
-        DftiSetValue(ssa->fft_batch_handle, DFTI_INPUT_DISTANCE, (MKL_LONG)fft_n);  // Distance in complex elements
-        DftiSetValue(ssa->fft_batch_handle, DFTI_OUTPUT_DISTANCE, (MKL_LONG)fft_n); // Distance in complex elements
+        DftiSetValue(ssa->fft_batch_handle, DFTI_INPUT_DISTANCE, (MKL_LONG)fft_n);
+        DftiSetValue(ssa->fft_batch_handle, DFTI_OUTPUT_DISTANCE, (MKL_LONG)fft_n);
 
         status = DftiCommitDescriptor(ssa->fft_batch_handle);
+        if (status != 0)
+        {
+            ssa_opt_free(ssa);
+            return -1;
+        }
+
+        // Create MKL batched FFT descriptor - INPLACE for reconstruction
+        status = DftiCreateDescriptor(&ssa->fft_batch_inplace, DFTI_DOUBLE, DFTI_COMPLEX, 1, fft_n);
+        if (status != 0)
+        {
+            ssa_opt_free(ssa);
+            return -1;
+        }
+
+        DftiSetValue(ssa->fft_batch_inplace, DFTI_PLACEMENT, DFTI_INPLACE);
+        DftiSetValue(ssa->fft_batch_inplace, DFTI_BACKWARD_SCALE, 1.0 / fft_n);
+        DftiSetValue(ssa->fft_batch_inplace, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)SSA_BATCH_SIZE);
+        DftiSetValue(ssa->fft_batch_inplace, DFTI_INPUT_DISTANCE, (MKL_LONG)fft_n);
+        DftiSetValue(ssa->fft_batch_inplace, DFTI_OUTPUT_DISTANCE, (MKL_LONG)fft_n);
+
+        status = DftiCommitDescriptor(ssa->fft_batch_inplace);
         if (status != 0)
         {
             ssa_opt_free(ssa);
@@ -804,6 +862,15 @@ extern "C"
 
         // Precompute FFT of x (used by both matvec and matvec_T)
         ssa_opt_fft_r2c(ssa, x, N, ssa->fft_x);
+
+#ifdef SSA_USE_MKL
+        // Also store in split-complex format for faster SIMD multiply
+        for (int i = 0; i < fft_n; i++)
+        {
+            ssa->fft_x_re[i] = ssa->fft_x[2 * i];
+            ssa->fft_x_im[i] = ssa->fft_x[2 * i + 1];
+        }
+#endif
 
         ssa->initialized = true;
         return 0;
@@ -1568,10 +1635,10 @@ extern "C"
             }
 
             // ---------------------------------------------------------------------
-            // Batch forward FFT (always use batch descriptor)
+            // Batch forward FFT (use in-place handle for reconstruction)
             // ---------------------------------------------------------------------
-            DftiComputeForward(ssa->fft_batch_handle, ws_u);
-            DftiComputeForward(ssa->fft_batch_handle, ws_v);
+            DftiComputeForward(ssa->fft_batch_inplace, ws_u);
+            DftiComputeForward(ssa->fft_batch_inplace, ws_v);
 
             // ---------------------------------------------------------------------
             // Batch complex multiply: ws_u = ws_u * ws_v
@@ -1586,9 +1653,9 @@ extern "C"
             }
 
             // ---------------------------------------------------------------------
-            // Batch inverse FFT (always use batch descriptor)
+            // Batch inverse FFT (use in-place handle)
             // ---------------------------------------------------------------------
-            DftiComputeBackward(ssa->fft_batch_handle, ws_u);
+            DftiComputeBackward(ssa->fft_batch_inplace, ws_u);
 
             // ---------------------------------------------------------------------
             // Vectorized accumulation using cblas_daxpy
@@ -1667,6 +1734,8 @@ extern "C"
             DftiFreeDescriptor(&ssa->fft_handle);
         if (ssa->fft_batch_handle)
             DftiFreeDescriptor(&ssa->fft_batch_handle);
+        if (ssa->fft_batch_inplace)
+            DftiFreeDescriptor(&ssa->fft_batch_inplace);
         if (ssa->rng)
             vslDeleteStream(&ssa->rng);
         ssa_opt_free_ptr(ssa->ws_real);
@@ -1675,6 +1744,9 @@ extern "C"
         ssa_opt_free_ptr(ssa->ws_proj);
         ssa_opt_free_ptr(ssa->ws_batch_u);
         ssa_opt_free_ptr(ssa->ws_batch_v);
+        ssa_opt_free_ptr(ssa->ws_batch_out);
+        ssa_opt_free_ptr(ssa->fft_x_re);
+        ssa_opt_free_ptr(ssa->fft_x_im);
 #endif
 
         ssa_opt_free_ptr(ssa->fft_x);
