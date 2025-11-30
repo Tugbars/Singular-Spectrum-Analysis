@@ -20,11 +20,20 @@
 #ifndef SSA_OPT_H
 #define SSA_OPT_H
 
+#define _USE_MATH_DEFINES
+#include <math.h>
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
+
+// Platform-specific intrinsics
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__GNUC__) || defined(__clang__)
+#include <xmmintrin.h>
+#endif
 
 #ifdef SSA_USE_MKL
 #include <mkl.h>

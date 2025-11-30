@@ -575,5 +575,11 @@ int main(int argc, char **argv)
         printf(" (%d FAILED)", g_failed);
     printf("\n==========================================\n");
 
+    #ifdef _WIN32
+    printf("\nPress Enter to exit...\n");
+    getchar();
+#endif
+
     return g_failed > 0 ? 1 : 0;
+    
 }
