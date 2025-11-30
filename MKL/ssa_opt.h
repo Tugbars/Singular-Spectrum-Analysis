@@ -20,13 +20,11 @@
 #ifndef SSA_OPT_H
 #define SSA_OPT_H
 
-#define _USE_MATH_DEFINES
-#include <math.h>
-
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 // Platform-specific intrinsics
 #if defined(_MSC_VER)
@@ -645,8 +643,8 @@ extern "C"
         DftiSetValue(ssa->fft_batch_handle, DFTI_PLACEMENT, DFTI_INPLACE);
         DftiSetValue(ssa->fft_batch_handle, DFTI_BACKWARD_SCALE, 1.0 / fft_n);
         DftiSetValue(ssa->fft_batch_handle, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)SSA_BATCH_SIZE);
-        DftiSetValue(ssa->fft_batch_handle, DFTI_INPUT_DISTANCE, (MKL_LONG)(2 * fft_n)); // Stride between transforms
-        DftiSetValue(ssa->fft_batch_handle, DFTI_OUTPUT_DISTANCE, (MKL_LONG)(2 * fft_n));
+        DftiSetValue(ssa->fft_batch_handle, DFTI_INPUT_DISTANCE, (MKL_LONG)fft_n);  // Distance in complex elements
+        DftiSetValue(ssa->fft_batch_handle, DFTI_OUTPUT_DISTANCE, (MKL_LONG)fft_n); // Distance in complex elements
 
         status = DftiCommitDescriptor(ssa->fft_batch_handle);
         if (status != 0)
