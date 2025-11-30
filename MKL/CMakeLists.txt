@@ -9,15 +9,18 @@ add_executable(ssa_opt_test ssa_opt_test.c)
 add_executable(ssa_example ssa_example.c)
 
 if(USE_MKL)
+    # Force LP64 (32-bit integers) instead of ILP64
+    set(MKL_INTERFACE lp64)
     find_package(MKL CONFIG REQUIRED)
     
-    target_compile_definitions(ssa_opt_test PRIVATE SSA_USE_MKL)
+    target_compile_definitions(ssa_opt_test PRIVATE SSA_USE_MKL _USE_MATH_DEFINES)
     target_link_libraries(ssa_opt_test PRIVATE MKL::MKL)
     
-    target_compile_definitions(ssa_example PRIVATE SSA_USE_MKL)
+    target_compile_definitions(ssa_example PRIVATE SSA_USE_MKL _USE_MATH_DEFINES)
     target_link_libraries(ssa_example PRIVATE MKL::MKL)
     
     message(STATUS "MKL found: ${MKL_ROOT}")
+    message(STATUS "MKL interface: ${MKL_INTERFACE}")
 else()
     if(NOT MSVC)
         target_link_libraries(ssa_opt_test PRIVATE m)
@@ -26,11 +29,7 @@ else()
     message(STATUS "Building without MKL (built-in FFT)")
 endif()
 
-# Only add optimization flags in Release mode
 if(MSVC)
     target_compile_options(ssa_opt_test PRIVATE $<$<CONFIG:Release>:/O2 /fp:fast> /W3)
     target_compile_options(ssa_example PRIVATE $<$<CONFIG:Release>:/O2 /fp:fast> /W3)
-else()
-    target_compile_options(ssa_opt_test PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math> -Wall)
-    target_compile_options(ssa_example PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math> -Wall)
 endif()
