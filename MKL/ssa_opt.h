@@ -459,12 +459,19 @@ extern "C"
         int n = ssa->fft_len;
         double *ws = ssa->ws_fft1;
 
-        // Reverse v into workspace (real part of complex array)
+        // Zero workspace and reverse v into real parts
         ssa_opt_zero(ws, 2 * n);
+
+#ifdef SSA_USE_MKL
+        // cblas_dcopy with negative stride: reverse v directly into stride-2 positions
+        // src = v + K - 1, incx = -1; dst = ws, incy = 2
+        cblas_dcopy(K, v + K - 1, -1, ws, 2);
+#else
         for (int i = 0; i < K; i++)
         {
             ws[2 * i] = v[K - 1 - i];
         }
+#endif
 
         // FFT of reversed v
 #ifdef SSA_USE_MKL
@@ -484,10 +491,14 @@ extern "C"
 #endif
 
         // Extract result: conv[K-1 : K-1+L]
+#ifdef SSA_USE_MKL
+        cblas_dcopy(L, ws + 2 * (K - 1), 2, y, 1);
+#else
         for (int i = 0; i < L; i++)
         {
             y[i] = ws[2 * (K - 1 + i)];
         }
+#endif
     }
 
     // y = X^T @ u
@@ -503,14 +514,19 @@ extern "C"
         double *ws = ssa->ws_fft1;
 
         // X^T @ u = conv(x, reverse(u))[L-1 : L-1+K]
-        // NOT conv(reverse(x), u) as previously implemented!
 
-        // Reverse u into workspace (real part of complex array)
+        // Zero workspace and reverse u into real parts
         ssa_opt_zero(ws, 2 * n);
+
+#ifdef SSA_USE_MKL
+        // cblas_dcopy with negative stride: reverse u directly into stride-2 positions
+        cblas_dcopy(L, u + L - 1, -1, ws, 2);
+#else
         for (int i = 0; i < L; i++)
         {
             ws[2 * i] = u[L - 1 - i];
         }
+#endif
 
         // FFT of reversed u
 #ifdef SSA_USE_MKL
@@ -519,7 +535,7 @@ extern "C"
         ssa_opt_fft_builtin(ws, n, -1);
 #endif
 
-        // Complex multiply with FFT(x) (not FFT(reverse(x))!)
+        // Complex multiply with FFT(x)
         ssa_opt_complex_mul(ssa->fft_x, ws, ws, n);
 
         // Inverse FFT
@@ -530,10 +546,14 @@ extern "C"
 #endif
 
         // Extract: conv[L-1 : L-1+K]
+#ifdef SSA_USE_MKL
+        cblas_dcopy(K, ws + 2 * (L - 1), 2, y, 1);
+#else
         for (int j = 0; j < K; j++)
         {
             y[j] = ws[2 * (L - 1 + j)];
         }
+#endif
     }
 
     // ----------------------------------------------------------------------------
@@ -789,7 +809,14 @@ extern "C"
                     break;
             }
 
-            // Final orthogonalization and store
+            // =====================================================================
+            // Final orthogonalization
+            //
+            // To ensure SVD consistency (X @ v = σ*u AND X^T @ u = σ*v),
+            // we must recompute v after finalizing u.
+            // =====================================================================
+
+            // Step 1: Orthogonalize v against previous components
             if (comp > 0)
             {
 #ifdef SSA_USE_MKL
@@ -808,8 +835,10 @@ extern "C"
             }
             ssa_opt_normalize(v, K);
 
+            // Step 2: Compute u = X @ v
             ssa_opt_hankel_matvec(ssa, v, u);
 
+            // Step 3: Orthogonalize u and extract sigma
             if (comp > 0)
             {
 #ifdef SSA_USE_MKL
@@ -829,6 +858,30 @@ extern "C"
 
             double sigma = ssa_opt_normalize(u, L);
 
+            // Step 4: Recompute v = X^T @ u to ensure SVD consistency
+            // This guarantees X^T @ u = σ * v (approximately)
+            ssa_opt_hankel_matvec_T(ssa, u, v);
+
+            // Step 5: Orthogonalize v against previous components
+            if (comp > 0)
+            {
+#ifdef SSA_USE_MKL
+                cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
+                            1.0, ssa->V, K, v, 1, 0.0, ssa->ws_proj, 1);
+                cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
+                            -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v, 1);
+#else
+                for (int j = 0; j < comp; j++)
+                {
+                    double *v_j = &ssa->V[j * K];
+                    double dot = ssa_opt_dot(v, v_j, K);
+                    ssa_opt_axpy(v, v_j, -dot, K);
+                }
+#endif
+            }
+            ssa_opt_normalize(v, K);
+
+            // Store final u, v, sigma
             ssa_opt_copy(u, &ssa->U[comp * L], L);
             ssa_opt_copy(v, &ssa->V[comp * K], K);
             ssa->sigma[comp] = sigma;
@@ -913,13 +966,17 @@ extern "C"
 
 #ifdef SSA_USE_MKL
         // ==========================================================================
-        // MKL Batched FFT Reconstruction
-        // Process components in chunks of SSA_BATCH_SIZE for efficiency
+        // MKL Batched FFT Reconstruction (Optimized)
+        //
+        // Optimizations:
+        // 1. Pre-scale u by σ during packing (saves N multiplies per component)
+        // 2. Always use batch FFT (zero unused slots for partial batches)
+        // 3. Use cblas_daxpy for vectorized accumulation with stride-2 access
         // ==========================================================================
 
         double *ws_u = ssa->ws_batch_u;
         double *ws_v = ssa->ws_batch_v;
-        size_t stride = 2 * fft_n; // Stride between transforms
+        size_t stride = 2 * fft_n; // Stride between transforms (complex interleaved)
 
         int g = 0;
         while (g < n_group)
@@ -942,21 +999,26 @@ extern "C"
             if (batch_count == 0)
                 continue;
 
-            // Pack u vectors into batch workspace
+            // ---------------------------------------------------------------------
+            // Pack u vectors with σ pre-scaling
+            // σ*IFFT(FFT(u)*FFT(v)) = IFFT(FFT(σ*u)*FFT(v)) by FFT linearity
+            // This moves σ from the N-length accumulation to L-length packing
+            // ---------------------------------------------------------------------
             for (int b = 0; b < batch_count; b++)
             {
                 int idx = batch_indices[b];
+                double sigma = ssa->sigma[idx];
                 const double *u_vec = &ssa->U[idx * L];
                 double *dst = ws_u + b * stride;
 
                 ssa_opt_zero(dst, stride);
                 for (int i = 0; i < L; i++)
                 {
-                    dst[2 * i] = u_vec[i];
+                    dst[2 * i] = sigma * u_vec[i]; // Pre-scale by σ
                 }
             }
 
-            // Pack v vectors into batch workspace
+            // Pack v vectors (no scaling needed)
             for (int b = 0; b < batch_count; b++)
             {
                 int idx = batch_indices[b];
@@ -970,67 +1032,55 @@ extern "C"
                 }
             }
 
-            // Batch forward FFT
-            if (batch_count == SSA_BATCH_SIZE)
+            // ---------------------------------------------------------------------
+            // Zero unused slots for partial batches (single memset per array)
+            // This allows always using batch FFT descriptor
+            // ---------------------------------------------------------------------
+            int pad = SSA_BATCH_SIZE - batch_count;
+            if (pad > 0)
             {
-                // Full batch - use batch descriptor
-                DftiComputeForward(ssa->fft_batch_handle, ws_u);
-                DftiComputeForward(ssa->fft_batch_handle, ws_v);
-            }
-            else
-            {
-                // Partial batch - use single descriptor for each
-                for (int b = 0; b < batch_count; b++)
-                {
-                    DftiComputeForward(ssa->fft_handle, ws_u + b * stride);
-                    DftiComputeForward(ssa->fft_handle, ws_v + b * stride);
-                }
+                ssa_opt_zero(ws_u + batch_count * stride, pad * stride);
+                ssa_opt_zero(ws_v + batch_count * stride, pad * stride);
             }
 
-            // Batch complex multiply and accumulate
+            // ---------------------------------------------------------------------
+            // Batch forward FFT (always use batch descriptor)
+            // ---------------------------------------------------------------------
+            DftiComputeForward(ssa->fft_batch_handle, ws_u);
+            DftiComputeForward(ssa->fft_batch_handle, ws_v);
+
+            // ---------------------------------------------------------------------
+            // Batch complex multiply: ws_u = ws_u * ws_v
+            // Only process valid batch elements
+            // ---------------------------------------------------------------------
             for (int b = 0; b < batch_count; b++)
             {
-                int idx = batch_indices[b];
-                double sigma = ssa->sigma[idx];
                 double *u_fft = ws_u + b * stride;
                 double *v_fft = ws_v + b * stride;
-
-                // Complex multiply: u_fft = u_fft * v_fft
                 vzMul(fft_n, (const MKL_Complex16 *)u_fft, (const MKL_Complex16 *)v_fft,
                       (MKL_Complex16 *)u_fft);
             }
 
-            // Batch inverse FFT
-            if (batch_count == SSA_BATCH_SIZE)
-            {
-                DftiComputeBackward(ssa->fft_batch_handle, ws_u);
-            }
-            else
-            {
-                for (int b = 0; b < batch_count; b++)
-                {
-                    DftiComputeBackward(ssa->fft_handle, ws_u + b * stride);
-                }
-            }
+            // ---------------------------------------------------------------------
+            // Batch inverse FFT (always use batch descriptor)
+            // ---------------------------------------------------------------------
+            DftiComputeBackward(ssa->fft_batch_handle, ws_u);
 
-            // Accumulate results (vectorized with MKL)
+            // ---------------------------------------------------------------------
+            // Vectorized accumulation using cblas_daxpy
+            // output += conv (σ already applied during packing)
+            // daxpy with incx=2 handles stride-2 access to real parts
+            // ---------------------------------------------------------------------
             for (int b = 0; b < batch_count; b++)
             {
-                int idx = batch_indices[b];
-                double sigma = ssa->sigma[idx];
                 double *conv = ws_u + b * stride;
-
-                // output[t] += sigma * conv[2*t] for t in [0, N)
-                for (int t = 0; t < N; t++)
-                {
-                    output[t] += sigma * conv[2 * t];
-                }
+                cblas_daxpy(N, 1.0, conv, 2, output, 1);
             }
         }
 
 #else
         // ==========================================================================
-        // Non-MKL Fallback: Sequential FFT
+        // Non-MKL Fallback: Sequential FFT (with pre-scaling optimization)
         // ==========================================================================
 
         double *ws1 = ssa->ws_fft1;
@@ -1046,10 +1096,10 @@ extern "C"
             const double *u_vec = &ssa->U[idx * L];
             const double *v_vec = &ssa->V[idx * K];
 
-            // FFT of u
+            // FFT of u with σ pre-scaling
             ssa_opt_zero(ws1, 2 * fft_n);
             for (int i = 0; i < L; i++)
-                ws1[2 * i] = u_vec[i];
+                ws1[2 * i] = sigma * u_vec[i];
             ssa_opt_fft_builtin(ws1, fft_n, -1);
 
             // FFT of v
@@ -1064,10 +1114,10 @@ extern "C"
             // Inverse FFT
             ssa_opt_fft_builtin(ws1, fft_n, 1);
 
-            // Accumulate
+            // Accumulate (no σ multiply needed - already applied)
             for (int t = 0; t < N; t++)
             {
-                output[t] += sigma * ws1[2 * t];
+                output[t] += ws1[2 * t];
             }
         }
 #endif

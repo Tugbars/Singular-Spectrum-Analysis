@@ -1,0 +1,42 @@
+cmake_minimum_required(VERSION 3.16)
+project(ssa_mkl C)
+
+set(CMAKE_C_STANDARD 11)
+
+# Option to enable/disable MKL
+option(USE_MKL "Use Intel MKL for optimized FFT and BLAS" ON)
+
+# Executables
+add_executable(ssa_opt_test ssa_opt_test.c)
+add_executable(ssa_example ssa_example.c)
+
+if(USE_MKL)
+    # Find MKL (oneAPI provides MKLConfig.cmake)
+    find_package(MKL CONFIG REQUIRED)
+    
+    # Apply to ssa_opt_test
+    target_compile_definitions(ssa_opt_test PRIVATE SSA_USE_MKL)
+    target_link_libraries(ssa_opt_test PRIVATE MKL::MKL)
+    
+    # Apply to ssa_example
+    target_compile_definitions(ssa_example PRIVATE SSA_USE_MKL)
+    target_link_libraries(ssa_example PRIVATE MKL::MKL)
+    
+    message(STATUS "MKL found: ${MKL_ROOT}")
+else()
+    # Fallback: built-in FFT
+    if(NOT MSVC)
+        target_link_libraries(ssa_opt_test PRIVATE m)
+        target_link_libraries(ssa_example PRIVATE m)
+    endif()
+    message(STATUS "Building without MKL (built-in FFT)")
+endif()
+
+# Compiler-specific optimization flags
+if(MSVC)
+    target_compile_options(ssa_opt_test PRIVATE /O2 /fp:fast /W3)
+    target_compile_options(ssa_example PRIVATE /O2 /fp:fast /W3)
+else()
+    target_compile_options(ssa_opt_test PRIVATE -O3 -march=native -ffast-math -Wall)
+    target_compile_options(ssa_example PRIVATE -O3 -march=native -ffast-math -Wall)
+endif()
