@@ -1,22 +1,22 @@
-- /*
-   * SSA Optimized Test Suite
-   *
-   * Compares ssa_opt.h (optimized) performance.
-   *
-   * Compile without MKL:
-   *   gcc -O3 -march=native -o ssa_opt_test ssa_opt_test.c -lm
-   *
-   * Compile with MKL:
-   *   source /opt/intel/oneapi/setvars.sh
-   *   gcc -O3 -march=native -DSSA_USE_MKL -I${MKLROOT}/include \
-   *       -o ssa_opt_test ssa_opt_test.c \
-   *       -L${MKLROOT}/lib/intel64 -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core \
-   *       -liomp5 -lpthread -lm
-   *
-   * Run:
-   *   ./ssa_opt_test           # Tests only
-   *   ./ssa_opt_test --bench   # Include benchmarks
-   */
+/*
+ * SSA Optimized Test Suite
+ *
+ * Compares ssa_opt.h (optimized) performance.
+ *
+ * Compile without MKL:
+ *   gcc -O3 -march=native -o ssa_opt_test ssa_opt_test.c -lm
+ *
+ * Compile with MKL:
+ *   source /opt/intel/oneapi/setvars.sh
+ *   gcc -O3 -march=native -DSSA_USE_MKL -I${MKLROOT}/include \
+ *       -o ssa_opt_test ssa_opt_test.c \
+ *       -L${MKLROOT}/lib/intel64 -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core \
+ *       -liomp5 -lpthread -lm
+ *
+ * Run:
+ *   ./ssa_opt_test           # Tests only
+ *   ./ssa_opt_test --bench   # Include benchmarks
+ */
 
 #define SSA_OPT_IMPLEMENTATION
 #include "ssa_opt.h"
@@ -34,8 +34,7 @@
 #define TEST_PASS "\033[32mPASS\033[0m"
 #define TEST_FAIL "\033[31mFAIL\033[0m"
 
-    static int g_total = 0,
-               g_passed = 0, g_failed = 0;
+static int g_total = 0, g_passed = 0, g_failed = 0;
 static int g_benchmarks = 0;
 
 #define ASSERT_TRUE(cond, msg)                                         \
