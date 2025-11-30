@@ -814,10 +814,31 @@ extern "C"
         double *ws_in = ssa->ws_batch_u;
         double *ws_out = ssa->ws_batch_out;
 
+        // Threshold for using batched FFT vs sequential
+        // Below this, sequential FFT avoids computing unused transforms
+        const int BATCH_THRESHOLD = SSA_BATCH_SIZE / 4;
+
         int col = 0;
         while (col < b)
         {
             int batch_count = (b - col < SSA_BATCH_SIZE) ? (b - col) : SSA_BATCH_SIZE;
+
+            // OPTIMIZATION: Fall back to sequential FFT for small batches
+            // MKL batch descriptor always computes SSA_BATCH_SIZE transforms,
+            // so for small batches, sequential is more efficient
+            if (batch_count < BATCH_THRESHOLD)
+            {
+                for (int i = 0; i < batch_count; i++)
+                {
+                    ssa_opt_hankel_matvec(ssa, &V_block[(col + i) * K], &Y_block[(col + i) * L]);
+                }
+                col += batch_count;
+                continue;
+            }
+
+            // OPTIMIZATION: Single memset for entire workspace
+            // Replaces per-vector memset + trailing padding memset
+            memset(ws_in, 0, SSA_BATCH_SIZE * stride * sizeof(double));
 
             // Pack reversed vectors into workspace in interleaved complex format
             // Each transform occupies 'stride' doubles: [re₀,im₀,re₁,im₁,...]
@@ -826,18 +847,11 @@ extern "C"
                 const double *v = &V_block[(col + i) * K]; // Column i of V_block
                 double *dst = ws_in + i * stride;
 
-                memset(dst, 0, stride * sizeof(double));
+                // Only write non-zero values (buffer already zeroed)
                 for (int j = 0; j < K; j++)
                 {
                     dst[2 * j] = v[K - 1 - j]; // Pack reversed v into real parts
                 }
-            }
-
-            // Zero unused slots so MKL batch descriptor processes valid data
-            if (batch_count < SSA_BATCH_SIZE)
-            {
-                memset(ws_in + batch_count * stride, 0,
-                       (SSA_BATCH_SIZE - batch_count) * stride * sizeof(double));
             }
 
             // Batched forward FFT: ws_in → ws_out (NOT_INPLACE is faster)
@@ -882,29 +896,38 @@ extern "C"
         double *ws_in = ssa->ws_batch_u;
         double *ws_out = ssa->ws_batch_out;
 
+        // Threshold for using batched FFT vs sequential
+        const int BATCH_THRESHOLD = SSA_BATCH_SIZE / 4;
+
         int col = 0;
         while (col < b)
         {
             int batch_count = (b - col < SSA_BATCH_SIZE) ? (b - col) : SSA_BATCH_SIZE;
 
-            // Pack reversed u vectors
+            // OPTIMIZATION: Fall back to sequential FFT for small batches
+            if (batch_count < BATCH_THRESHOLD)
+            {
+                for (int i = 0; i < batch_count; i++)
+                {
+                    ssa_opt_hankel_matvec_T(ssa, &U_block[(col + i) * L], &Y_block[(col + i) * K]);
+                }
+                col += batch_count;
+                continue;
+            }
+
+            // OPTIMIZATION: Single memset for entire workspace
+            memset(ws_in, 0, SSA_BATCH_SIZE * stride * sizeof(double));
+
+            // Pack reversed u vectors (buffer already zeroed)
             for (int i = 0; i < batch_count; i++)
             {
                 const double *u = &U_block[(col + i) * L];
                 double *dst = ws_in + i * stride;
 
-                memset(dst, 0, stride * sizeof(double));
                 for (int j = 0; j < L; j++)
                 {
                     dst[2 * j] = u[L - 1 - j];
                 }
-            }
-
-            // Zero remaining slots
-            if (batch_count < SSA_BATCH_SIZE)
-            {
-                memset(ws_in + batch_count * stride, 0,
-                       (SSA_BATCH_SIZE - batch_count) * stride * sizeof(double));
             }
 
             // Batch forward FFT (NOT_INPLACE)
@@ -1832,7 +1855,10 @@ extern "C"
                 }
 
                 // Periodic QR for V_block
-                if ((iter % QR_INTERVAL == 0) || (iter == max_iter - 1))
+                // Skip iter=0: initial QR already orthonormalized V_block, and we just
+                // recomputed it. The iter=0 U_block QR ensures U is orthonormal, so
+                // V_block = H^T @ U_block is reasonably well-conditioned for iter 1-4.
+                if ((iter > 0 && iter % QR_INTERVAL == 0) || (iter == max_iter - 1))
                 {
                     LAPACKE_dgeqrf(LAPACK_COL_MAJOR, K, cur_b, V_block, K, tau_v);
                     LAPACKE_dorgqr(LAPACK_COL_MAJOR, K, cur_b, cur_b, V_block, K, tau_v);
@@ -2325,6 +2351,11 @@ extern "C"
             if (batch_count == 0)
                 continue;
 
+            // OPTIMIZATION: Single memset for entire workspace
+            // Replaces per-vector ssa_opt_zero + trailing padding
+            memset(ws_u, 0, SSA_BATCH_SIZE * stride * sizeof(double));
+            memset(ws_v, 0, SSA_BATCH_SIZE * stride * sizeof(double));
+
             // OPTIMIZATION [1]: Pack u vectors with σ pre-scaling
             // σ·IFFT(FFT(u)·FFT(v)) = IFFT(FFT(σ·u)·FFT(v)) by linearity
             for (int b = 0; b < batch_count; b++)
@@ -2334,33 +2365,24 @@ extern "C"
                 const double *u_vec = &ssa->U[idx * L];
                 double *dst = ws_u + b * stride;
 
-                ssa_opt_zero(dst, stride);
+                // Buffer already zeroed, only write non-zero values
                 for (int i = 0; i < L; i++)
                 {
                     dst[2 * i] = sigma * u_vec[i]; // Pre-scale: saves N mults later
                 }
             }
 
-            // Pack v vectors (no scaling)
+            // Pack v vectors (no scaling, buffer already zeroed)
             for (int b = 0; b < batch_count; b++)
             {
                 int idx = batch_indices[b];
                 const double *v_vec = &ssa->V[idx * K];
                 double *dst = ws_v + b * stride;
 
-                ssa_opt_zero(dst, stride);
                 for (int i = 0; i < K; i++)
                 {
                     dst[2 * i] = v_vec[i];
                 }
-            }
-
-            // Zero pad unused batch slots (allows using fixed-size batch descriptor)
-            int pad = SSA_BATCH_SIZE - batch_count;
-            if (pad > 0)
-            {
-                ssa_opt_zero(ws_u + batch_count * stride, pad * stride);
-                ssa_opt_zero(ws_v + batch_count * stride, pad * stride);
             }
 
             // OPTIMIZATION [2]: Batched forward FFT
