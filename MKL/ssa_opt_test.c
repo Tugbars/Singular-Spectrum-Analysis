@@ -1,22 +1,22 @@
-/*
- * SSA Optimized Test Suite
- *
- * Compares ssa_opt.h (optimized) performance.
- *
- * Compile without MKL:
- *   gcc -O3 -march=native -o ssa_opt_test ssa_opt_test.c -lm
- *
- * Compile with MKL:
- *   source /opt/intel/oneapi/setvars.sh
- *   gcc -O3 -march=native -DSSA_USE_MKL -I${MKLROOT}/include \
- *       -o ssa_opt_test ssa_opt_test.c \
- *       -L${MKLROOT}/lib/intel64 -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core \
- *       -liomp5 -lpthread -lm
- *
- * Run:
- *   ./ssa_opt_test           # Tests only
- *   ./ssa_opt_test --bench   # Include benchmarks
- */
+- /*
+   * SSA Optimized Test Suite
+   *
+   * Compares ssa_opt.h (optimized) performance.
+   *
+   * Compile without MKL:
+   *   gcc -O3 -march=native -o ssa_opt_test ssa_opt_test.c -lm
+   *
+   * Compile with MKL:
+   *   source /opt/intel/oneapi/setvars.sh
+   *   gcc -O3 -march=native -DSSA_USE_MKL -I${MKLROOT}/include \
+   *       -o ssa_opt_test ssa_opt_test.c \
+   *       -L${MKLROOT}/lib/intel64 -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core \
+   *       -liomp5 -lpthread -lm
+   *
+   * Run:
+   *   ./ssa_opt_test           # Tests only
+   *   ./ssa_opt_test --bench   # Include benchmarks
+   */
 
 #define SSA_OPT_IMPLEMENTATION
 #include "ssa_opt.h"
@@ -34,7 +34,8 @@
 #define TEST_PASS "\033[32mPASS\033[0m"
 #define TEST_FAIL "\033[31mFAIL\033[0m"
 
-static int g_total = 0, g_passed = 0, g_failed = 0;
+    static int g_total = 0,
+               g_passed = 0, g_failed = 0;
 static int g_benchmarks = 0;
 
 #define ASSERT_TRUE(cond, msg)                                         \
@@ -459,7 +460,7 @@ void benchmark_memory_efficiency(void)
         fft_n <<= 1;
 
     // Calculate memory usage
-    size_t fft_mem = 2 * fft_n * sizeof(double) * 4;                 // 4 FFT buffers
+    size_t fft_mem = 2 * fft_n * sizeof(double) * 3;                 // fft_x, ws_fft1, ws_fft2
     size_t vec_mem = ssa_opt_max(L, N - L + 1) * sizeof(double) * 2; // u, v workspace
     size_t total_workspace = fft_mem + vec_mem;
 
@@ -468,6 +469,64 @@ void benchmark_memory_efficiency(void)
     printf("  Vector workspace: %.2f MB\n", vec_mem / 1e6);
     printf("  Total workspace: %.2f MB\n", total_workspace / 1e6);
     printf("  (No additional allocations during decomposition)\n");
+}
+
+void benchmark_reconstruction_scaling(void)
+{
+    if (!g_benchmarks)
+        return;
+
+    printf("\n  === Reconstruction Scaling (k components) ===\n");
+
+    int N = 10000;
+    int L = N / 4;
+
+    g_seed = 77777;
+    double *x = (double *)malloc(N * sizeof(double));
+    generate_signal(x, N);
+
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    ssa_opt_decompose(&ssa, 64, 100); // Decompose with max k we'll test
+
+    printf("  N=%d, L=%d\n\n", N, L);
+    printf("  %-8s  %-12s  %-12s\n", "k", "Time (ms)", "ms/component");
+    printf("  %-8s  %-12s  %-12s\n", "---", "---------", "------------");
+
+    int k_values[] = {1, 5, 10, 20, 32, 50, 64};
+    int n_k = sizeof(k_values) / sizeof(k_values[0]);
+
+    double *output = (double *)malloc(N * sizeof(double));
+    int *group = (int *)malloc(64 * sizeof(int));
+
+    for (int ki = 0; ki < n_k; ki++)
+    {
+        int k = k_values[ki];
+        for (int i = 0; i < k; i++)
+            group[i] = i;
+
+        // Warmup
+        ssa_opt_reconstruct(&ssa, group, k, output);
+
+        // Timed
+        int reps = 100;
+        double t0 = get_time_ms();
+        for (int r = 0; r < reps; r++)
+        {
+            ssa_opt_reconstruct(&ssa, group, k, output);
+        }
+        double t1 = get_time_ms();
+
+        double ms_total = (t1 - t0) / reps;
+        double ms_per_k = ms_total / k;
+
+        printf("  %-8d  %-12.2f  %-12.3f\n", k, ms_total, ms_per_k);
+    }
+
+    ssa_opt_free(&ssa);
+    free(x);
+    free(output);
+    free(group);
 }
 
 // ============================================================================
@@ -507,6 +566,7 @@ int main(int argc, char **argv)
         printf("\n=== Benchmarks ===");
         benchmark_decomposition();
         benchmark_matvec_throughput();
+        benchmark_reconstruction_scaling();
         benchmark_memory_efficiency();
     }
 
