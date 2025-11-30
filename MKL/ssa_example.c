@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
     
 #ifdef SSA_USE_MKL
     // Option A: Use our configuration helper (recommended)
-    mkl_config_14900kf(verbose);
+    //mkl_config_14900kf(verbose);
     
     // Option B: Manual configuration
     // mkl_set_num_threads(16);        // P-cores only

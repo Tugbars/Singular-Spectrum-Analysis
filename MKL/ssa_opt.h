@@ -866,7 +866,8 @@ extern "C"
             double sigma = ssa_opt_normalize(u, L);
 
             // Step 4: Recompute v = X^T @ u to ensure SVD consistency
-            // This guarantees X^T @ u = σ * v (approximately)
+            // Since u is now unit length, X^T @ u gives a vector with ||v|| ≈ σ
+            // We scale by 1/σ to get unit v: v = (1/σ) * X^T @ u
             ssa_opt_hankel_matvec_T(ssa, u, v);
 
             // Step 5: Orthogonalize v against previous components
@@ -886,7 +887,13 @@ extern "C"
                 }
 #endif
             }
-            ssa_opt_normalize(v, K);
+
+            // Scale v by 1/σ to maintain SVD relationship: X^T @ u = σ * v
+            // This ensures v is unit length AND satisfies the SVD equations
+            if (sigma > 1e-15)
+            {
+                ssa_opt_scal(v, K, 1.0 / sigma);
+            }
 
             // Store final u, v, sigma
             ssa_opt_copy(u, &ssa->U[comp * L], L);
