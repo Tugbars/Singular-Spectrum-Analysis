@@ -13,6 +13,7 @@ add_executable(ssa_block_test test/ssa_block_test.c)
 add_executable(ssa_forecast_test test/test_ssa_forecast.c)
 add_executable(mssa_test test/test_mssa.c)
 
+
 # All test executables
 set(TEST_TARGETS
     ssa_opt_test
@@ -55,8 +56,27 @@ if(MSVC)
     endforeach()
 endif()
 
+# ============================================================================
 # Python shared library
-add_library(ssa SHARED py/ssa_wrapper.c)
+# ============================================================================
+if(WIN32)
+    # Windows: use .def file for exports
+    add_library(ssa SHARED py/ssa_wrapper.c py/ssa.def)
+else()
+    add_library(ssa SHARED py/ssa_wrapper.c)
+endif()
+
 target_include_directories(ssa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(ssa PRIVATE SSA_OPT_IMPLEMENTATION SSA_USE_MKL _USE_MATH_DEFINES)
-target_link_libraries(ssa PRIVATE MKL::MKL)
+
+if(USE_MKL)
+    target_link_libraries(ssa PRIVATE MKL::MKL)
+else()
+    if(NOT MSVC)
+        target_link_libraries(ssa PRIVATE m)
+    endif()
+endif()
+
+if(MSVC)
+    target_compile_options(ssa PRIVATE $<$<CONFIG:Release>:/O2 /fp:fast> /W3)
+endif()
