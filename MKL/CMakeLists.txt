@@ -54,3 +54,9 @@ if(MSVC)
         target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2 /fp:fast> /W3)
     endforeach()
 endif()
+
+# Python shared library
+add_library(ssa SHARED py/ssa_wrapper.c)
+target_include_directories(ssa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(ssa PRIVATE SSA_OPT_IMPLEMENTATION SSA_USE_MKL _USE_MATH_DEFINES)
+target_link_libraries(ssa PRIVATE MKL::MKL)

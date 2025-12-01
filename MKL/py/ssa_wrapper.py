@@ -25,8 +25,49 @@ Requirements:
 
 import ctypes
 import numpy as np
+import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Union, Tuple
+
+print(f"Python: {sys.version}")
+print(f"Platform: {sys.platform}")
+
+# Check if ssa.dll exists
+dll_path = Path(__file__).parent / "ssa.dll"
+print(f"Looking for: {dll_path}")
+print(f"Exists: {dll_path.exists()}")
+
+# Check MKL paths
+mkl_paths = [
+    r"C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin",
+    r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin",
+]
+for p in mkl_paths:
+    print(f"MKL path {p}: exists={os.path.exists(p)}")
+    if os.path.exists(p):
+        os.add_dll_directory(p)
+
+# Try loading directly
+import ctypes
+try:
+    lib = ctypes.CDLL(str(dll_path))
+    print("SUCCESS!")
+except OSError as e:
+    print(f"FAILED: {e}")
+
+# ============================================================================
+# Windows MKL DLL paths (must be set BEFORE loading the library)
+# ============================================================================
+
+if sys.platform == "win32":
+    mkl_paths = [
+        r"C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin",
+        r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin",
+    ]
+    for p in mkl_paths:
+        if os.path.exists(p):
+            os.add_dll_directory(p)
 
 # ============================================================================
 # Load shared library
@@ -38,10 +79,13 @@ def _load_library():
     search_paths = [
         Path(__file__).parent / "libssa.so",
         Path(__file__).parent / "libssa.dll",
+        Path(__file__).parent / "ssa.dll",     
         Path(".") / "libssa.so",
         Path(".") / "libssa.dll",
+        Path(".") / "ssa.dll",                  
         "libssa.so",
         "libssa.dll",
+        "ssa.dll",                             
     ]
     
     for path in search_paths:
@@ -52,7 +96,7 @@ def _load_library():
     
     raise RuntimeError(
         "Could not load libssa.so/.dll. Build it with:\n"
-        "  gcc -shared -fPIC -O3 -o libssa.so ssa_wrapper.c \\\n"
+        "  gcc -shared -fPIC -O3 -o libssa.so ssa_wrapper.c \\\n"   
         "      -DSSA_OPT_IMPLEMENTATION -DSSA_USE_MKL \\\n"
         "      -I${MKLROOT}/include -L${MKLROOT}/lib/intel64 -lmkl_rt -lm"
     )
