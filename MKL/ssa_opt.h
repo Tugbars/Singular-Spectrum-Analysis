@@ -1992,8 +1992,9 @@ extern "C"
         int L = ssa->L;
         int K = ssa->K;
         int fft_n = ssa->fft_len;
-        size_t fft_size = 2 * fft_n; // Interleaved complex
+        size_t fft_size = 2 * fft_n; // Interleaved complex: [re₀, im₀, re₁, im₁, ...]
 
+        // Initialize output to zero - we'll accumulate component contributions
         ssa_opt_zero(output, N);
 
         // Cast away const for workspace access (workspace not logically part of result)
@@ -2006,6 +2007,85 @@ extern "C"
         {
             // =====================================================================
             // FAST PATH: Use precomputed FFTs (skip forward FFT entirely)
+            //
+            // When FFTs are cached, U_fft[i] = FFT(σᵢ × uᵢ) and V_fft[i] = FFT(vᵢ)
+            // are already computed. We only need:
+            //   1. Pointwise multiply: FFT(σu) ⊙ FFT(v)
+            //   2. Inverse FFT to get convolution result
+            //   3. Accumulate real parts into output
+            //
+            // This saves 2 forward FFTs per component (significant when n_group large)
+            // =====================================================================
+            int g = 0;
+            while (g < n_group)
+            {
+                // Gather batch of valid component indices (filter out-of-range)
+                int batch_count = 0;
+                int batch_indices[SSA_BATCH_SIZE];
+
+                while (batch_count < SSA_BATCH_SIZE && g < n_group)
+                {
+                    int idx = group[g];
+                    if (idx >= 0 && idx < ssa->n_components)
+                    {
+                        batch_indices[batch_count++] = idx;
+                    }
+                    g++;
+                }
+
+                if (batch_count == 0)
+                    continue;
+
+                // Pointwise complex multiply: conv_fft = FFT(σu) ⊙ FFT(v)
+                // By convolution theorem: IFFT(conv_fft) = σu * v (circular convolution)
+                for (int b = 0; b < batch_count; b++)
+                {
+                    int idx = batch_indices[b];
+                    const double *u_fft_cached = &ssa->U_fft[idx * fft_size];
+                    const double *v_fft_cached = &ssa->V_fft[idx * fft_size];
+                    double *dst = ws_u + b * stride;
+
+                    // vzMul: vectorized complex multiply using MKL VML
+                    vzMul(fft_n, (const MKL_Complex16 *)u_fft_cached,
+                          (const MKL_Complex16 *)v_fft_cached,
+                          (MKL_Complex16 *)dst);
+                }
+
+                // Zero-pad unused batch slots (batched FFT expects full SSA_BATCH_SIZE)
+                if (batch_count < SSA_BATCH_SIZE)
+                {
+                    memset(ws_u + batch_count * stride, 0,
+                           (SSA_BATCH_SIZE - batch_count) * stride * sizeof(double));
+                }
+
+                // Batched IFFT: convert frequency domain back to time domain
+                // Result: ws_u[b] contains conv(σᵢuᵢ, vᵢ) for each component
+                DftiComputeBackward(ssa_mut->fft_batch_inplace, ws_u);
+
+                // Accumulate convolution results into output
+                // incx=2 extracts real parts from interleaved complex format
+                // The convolution gives us the anti-diagonal sums of the outer product
+                for (int b = 0; b < batch_count; b++)
+                {
+                    double *conv = ws_u + b * stride;
+                    cblas_daxpy(N, 1.0, conv, 2, output, 1);
+                }
+            }
+        }
+        else
+        {
+            // =====================================================================
+            // STANDARD PATH: Compute FFTs on-the-fly
+            //
+            // For each component i in group:
+            //   1. Pack σᵢ × uᵢ into complex format (real parts only, imag=0)
+            //   2. Pack vᵢ into complex format
+            //   3. Forward FFT both
+            //   4. Pointwise multiply in frequency domain
+            //   5. Inverse FFT to get convolution
+            //   6. Accumulate into output
+            //
+            // The convolution σᵢ × uᵢ * vᵢ gives anti-diagonal sums of rank-1 matrix
             // =====================================================================
             int g = 0;
             while (g < n_group)
@@ -2027,59 +2107,12 @@ extern "C"
                 if (batch_count == 0)
                     continue;
 
-                // Element-wise complex multiply cached FFTs
-                for (int b = 0; b < batch_count; b++)
-                {
-                    int idx = batch_indices[b];
-                    const double *u_fft_cached = &ssa->U_fft[idx * fft_size];
-                    const double *v_fft_cached = &ssa->V_fft[idx * fft_size];
-                    double *dst = ws_u + b * stride;
-
-                    vzMul(fft_n, (const MKL_Complex16 *)u_fft_cached,
-                          (const MKL_Complex16 *)v_fft_cached,
-                          (MKL_Complex16 *)dst);
-                }
-
-                if (batch_count < SSA_BATCH_SIZE)
-                {
-                    memset(ws_u + batch_count * stride, 0,
-                           (SSA_BATCH_SIZE - batch_count) * stride * sizeof(double));
-                }
-
-                DftiComputeBackward(ssa_mut->fft_batch_inplace, ws_u);
-
-                for (int b = 0; b < batch_count; b++)
-                {
-                    double *conv = ws_u + b * stride;
-                    cblas_daxpy(N, 1.0, conv, 2, output, 1);
-                }
-            }
-        }
-        else
-        {
-            // Standard path
-            int g = 0;
-            while (g < n_group)
-            {
-                int batch_count = 0;
-                int batch_indices[SSA_BATCH_SIZE];
-
-                while (batch_count < SSA_BATCH_SIZE && g < n_group)
-                {
-                    int idx = group[g];
-                    if (idx >= 0 && idx < ssa->n_components)
-                    {
-                        batch_indices[batch_count++] = idx;
-                    }
-                    g++;
-                }
-
-                if (batch_count == 0)
-                    continue;
-
+                // Zero workspace for clean FFT input
                 memset(ws_u, 0, SSA_BATCH_SIZE * stride * sizeof(double));
                 memset(ws_v, 0, SSA_BATCH_SIZE * stride * sizeof(double));
 
+                // Pack scaled U vectors: ws_u[b] = σᵢ × uᵢ in complex format
+                // Only real parts are set; imaginary parts stay zero
                 for (int b = 0; b < batch_count; b++)
                 {
                     int idx = batch_indices[b];
@@ -2087,27 +2120,33 @@ extern "C"
                     const double *u_vec = &ssa->U[idx * L];
                     double *dst = ws_u + b * stride;
 
+                    // Interleave into complex: [σu₀, 0, σu₁, 0, σu₂, 0, ...]
                     for (int i = 0; i < L; i++)
                     {
                         dst[2 * i] = sigma * u_vec[i];
                     }
                 }
 
+                // Pack V vectors into complex format
                 for (int b = 0; b < batch_count; b++)
                 {
                     int idx = batch_indices[b];
                     const double *v_vec = &ssa->V[idx * K];
                     double *dst = ws_v + b * stride;
 
+                    // Interleave into complex: [v₀, 0, v₁, 0, v₂, 0, ...]
                     for (int i = 0; i < K; i++)
                     {
                         dst[2 * i] = v_vec[i];
                     }
                 }
 
+                // Batched forward FFT: time domain → frequency domain
                 DftiComputeForward(ssa_mut->fft_batch_inplace, ws_u);
                 DftiComputeForward(ssa_mut->fft_batch_inplace, ws_v);
 
+                // Pointwise complex multiply in frequency domain
+                // By convolution theorem: IFFT(FFT(a) ⊙ FFT(b)) = a * b
                 for (int b = 0; b < batch_count; b++)
                 {
                     double *u_fft = ws_u + b * stride;
@@ -2116,18 +2155,31 @@ extern "C"
                           (MKL_Complex16 *)u_fft);
                 }
 
+                // Batched inverse FFT: frequency domain → time domain (convolution result)
                 DftiComputeBackward(ssa_mut->fft_batch_inplace, ws_u);
 
+                // Accumulate convolution results into output
+                // conv[t] = Σᵢ (σuᵢ)[i] × v[t-i] = anti-diagonal sum at position t
                 for (int b = 0; b < batch_count; b++)
                 {
                     double *conv = ws_u + b * stride;
-                    cblas_daxpy(N, 1.0, conv, 2, output, 1);
+                    cblas_daxpy(N, 1.0, conv, 2, output, 1); // incx=2 skips imaginary parts
                 }
             }
         }
 
-        // Diagonal averaging
-        // Apply diagonal averaging weights using precomputed 1/count
+        // =========================================================================
+        // DIAGONAL AVERAGING (Hankelization)
+        //
+        // The convolution gives us Σ(anti-diagonal elements), but each position t
+        // has a different number of contributing elements:
+        //   count[t] = min(t+1, L, K, N-t)
+        //
+        // Diagonal averaging divides by count[t] to get the average, converting
+        // the rank-1 sum back to a proper time series reconstruction.
+        //
+        // We use precomputed 1/count[t] for multiplication instead of division.
+        // =========================================================================
         vdMul(N, output, ssa->inv_diag_count, output);
 
         return 0;
@@ -2156,17 +2208,34 @@ extern "C"
         int K = ssa->K;
         int n = ssa->n_components;
 
-        // Compute diagonal averaging weights
+        // =========================================================================
+        // STEP 1: Compute diagonal averaging weights
+        //
+        // The weight w[t] counts how many elements contribute to position t in
+        // diagonal averaging. This forms a trapezoid shape:
+        //   - Ramps up from 1 to min(L, K) at the start
+        //   - Flat plateau at min(L, K) in the middle
+        //   - Ramps down symmetrically at the end
+        //
+        // These weights define the W-inner product: <X, Y>_W = Σₜ w[t]·X[t]·Y[t]
+        // =========================================================================
         double *weights = (double *)ssa_opt_alloc(N * sizeof(double));
         if (!weights)
             return -1;
 
         for (int t = 0; t < N; t++)
         {
+            // w[t] = min(t+1, L, K, N-t) - the number of anti-diagonal elements at t
             weights[t] = (double)ssa_opt_min(ssa_opt_min(t + 1, L),
                                              ssa_opt_min(K, N - t));
         }
 
+        // =========================================================================
+        // STEP 2: Reconstruct all individual components
+        //
+        // For W-correlation, we need the reconstructed time series Xᵢ for each
+        // component i. These are stored contiguously: reconstructed[i*N : (i+1)*N]
+        // =========================================================================
         double *reconstructed = (double *)ssa_opt_alloc(N * n * sizeof(double));
         if (!reconstructed)
         {
@@ -2174,12 +2243,19 @@ extern "C"
             return -1;
         }
 
+        // Reconstruct each component individually
         for (int i = 0; i < n; i++)
         {
             int group[] = {i};
             ssa_opt_reconstruct(ssa, group, 1, &reconstructed[i * N]);
         }
 
+        // =========================================================================
+        // STEP 3: Compute weighted norms ‖Xᵢ‖_W for normalization
+        //
+        // ‖X‖_W = √(<X, X>_W) = √(Σₜ w[t]·X[t]²)
+        // These are precomputed to avoid redundant calculations in the matrix loop
+        // =========================================================================
         double *norms = (double *)ssa_opt_alloc(n * sizeof(double));
         if (!norms)
         {
@@ -2199,6 +2275,19 @@ extern "C"
             norms[i] = sqrt(sum);
         }
 
+        // =========================================================================
+        // STEP 4: Compute W-correlation matrix
+        //
+        // ρ_W(i,j) = <Xᵢ, Xⱼ>_W / (‖Xᵢ‖_W × ‖Xⱼ‖_W)
+        //
+        // The matrix is symmetric, so we only compute upper triangle and mirror.
+        // Diagonal elements are always 1.0 (component correlated with itself).
+        //
+        // INTERPRETATION:
+        //   - |ρ_W| ≈ 1: Components are highly correlated, should be grouped
+        //   - |ρ_W| ≈ 0: Components are independent, can be separated
+        //   - Periodic signals show high correlation between sine/cosine pairs
+        // =========================================================================
         for (int i = 0; i < n; i++)
         {
             double *x_i = &reconstructed[i * N];
@@ -2207,20 +2296,24 @@ extern "C"
             {
                 double *x_j = &reconstructed[j * N];
 
+                // Weighted inner product: <Xᵢ, Xⱼ>_W = Σₜ w[t]·Xᵢ[t]·Xⱼ[t]
                 double inner = 0.0;
                 for (int t = 0; t < N; t++)
                 {
                     inner += weights[t] * x_i[t] * x_j[t];
                 }
 
+                // Normalize to get correlation in [-1, 1]
                 double denom = norms[i] * norms[j];
                 double corr = (denom > 1e-15) ? inner / denom : 0.0;
 
+                // Store in both (i,j) and (j,i) for symmetric matrix
                 W[i * n + j] = corr;
                 W[j * n + i] = corr;
             }
         }
 
+        // Cleanup temporary allocations
         ssa_opt_free_ptr(weights);
         ssa_opt_free_ptr(reconstructed);
         ssa_opt_free_ptr(norms);
@@ -2228,6 +2321,10 @@ extern "C"
         return 0;
     }
 
+    /**
+     * Compute W-correlation between two specific components (more efficient than full matrix).
+     * Same formula as wcorr_matrix but only for one pair.
+     */
     double ssa_opt_wcorr_pair(const SSA_Opt *ssa, int i, int j)
     {
         if (!ssa || !ssa->decomposed ||
@@ -2239,6 +2336,7 @@ extern "C"
         int L = ssa->L;
         int K = ssa->K;
 
+        // Reconstruct the two components we're comparing
         double *x_i = (double *)ssa_opt_alloc(N * sizeof(double));
         double *x_j = (double *)ssa_opt_alloc(N * sizeof(double));
 
@@ -2254,27 +2352,33 @@ extern "C"
         ssa_opt_reconstruct(ssa, group_i, 1, x_i);
         ssa_opt_reconstruct(ssa, group_j, 1, x_j);
 
+        // Compute weighted inner product and norms in single pass
         double inner = 0.0, norm_i = 0.0, norm_j = 0.0;
 
         for (int t = 0; t < N; t++)
         {
+            // Diagonal averaging weight at position t
             double w = (double)ssa_opt_min(ssa_opt_min(t + 1, L),
                                            ssa_opt_min(K, N - t));
-            inner += w * x_i[t] * x_j[t];
-            norm_i += w * x_i[t] * x_i[t];
-            norm_j += w * x_j[t] * x_j[t];
+            inner += w * x_i[t] * x_j[t];  // <Xᵢ, Xⱼ>_W
+            norm_i += w * x_i[t] * x_i[t]; // ‖Xᵢ‖²_W
+            norm_j += w * x_j[t] * x_j[t]; // ‖Xⱼ‖²_W
         }
 
         ssa_opt_free_ptr(x_i);
         ssa_opt_free_ptr(x_j);
 
+        // ρ_W(i,j) = <Xᵢ, Xⱼ>_W / (‖Xᵢ‖_W × ‖Xⱼ‖_W)
         double denom = sqrt(norm_i) * sqrt(norm_j);
         return (denom > 1e-15) ? inner / denom : 0.0;
     }
 
-    // ----------------------------------------------------------------------------
-    // Component Statistics
-    // ----------------------------------------------------------------------------
+    // ============================================================================
+    // COMPONENT STATISTICS FOR AUTOMATIC SELECTION
+    //
+    // Analyzes singular value spectrum to help identify signal/noise boundary.
+    // Provides multiple diagnostic metrics that can be used individually or combined.
+    // ============================================================================
 
     int ssa_opt_component_stats(const SSA_Opt *ssa, SSA_ComponentStats *stats)
     {
@@ -2283,11 +2387,12 @@ extern "C"
 
         int n = ssa->n_components;
         if (n < 2)
-            return -1;
+            return -1; // Need at least 2 components for gap analysis
 
         memset(stats, 0, sizeof(SSA_ComponentStats));
         stats->n = n;
 
+        // Allocate diagnostic arrays
         stats->singular_values = (double *)ssa_opt_alloc(n * sizeof(double));
         stats->log_sv = (double *)ssa_opt_alloc(n * sizeof(double));
         stats->gaps = (double *)ssa_opt_alloc((n - 1) * sizeof(double));
@@ -2301,12 +2406,28 @@ extern "C"
             return -1;
         }
 
+        // =========================================================================
+        // Compute log singular values for scree plot analysis
+        //
+        // In a scree plot, signal components typically show a steep decline,
+        // while noise components form a nearly flat "elbow". The log transform
+        // makes this pattern easier to detect algorithmically.
+        // =========================================================================
         for (int i = 0; i < n; i++)
         {
             stats->singular_values[i] = ssa->sigma[i];
-            stats->log_sv[i] = log(ssa->sigma[i] + 1e-300);
+            stats->log_sv[i] = log(ssa->sigma[i] + 1e-300); // Avoid log(0)
         }
 
+        // =========================================================================
+        // Compute gap ratios: gaps[i] = σᵢ / σᵢ₊₁
+        //
+        // Large gap ratio indicates a boundary between component groups.
+        // Signal components decay slowly (gap ≈ 1), while the signal/noise
+        // boundary often shows a large gap (gap >> 1).
+        //
+        // Track the maximum gap as a simple automatic cutoff suggestion.
+        // =========================================================================
         double max_gap = 0.0;
         int max_gap_idx = 0;
 
@@ -2322,6 +2443,14 @@ extern "C"
             }
         }
 
+        // =========================================================================
+        // Compute cumulative explained variance ratio
+        //
+        // cumulative_var[i] = (σ₀² + σ₁² + ... + σᵢ²) / (total variance)
+        //
+        // Useful for determining how many components capture "most" of the signal.
+        // Common heuristics: keep components until 90% or 95% variance explained.
+        // =========================================================================
         double cumsum = 0.0;
         for (int i = 0; i < n; i++)
         {
@@ -2329,6 +2458,15 @@ extern "C"
             stats->cumulative_var[i] = cumsum / ssa->total_variance;
         }
 
+        // =========================================================================
+        // Compute second difference of log singular values
+        //
+        // d²[i] = log(σᵢ₋₁) - 2·log(σᵢ) + log(σᵢ₊₁)
+        //
+        // This is a discrete approximation to the second derivative, which
+        // helps detect the "elbow" in the scree plot. Large positive d² values
+        // indicate convex regions (potential signal/noise boundaries).
+        // =========================================================================
         stats->second_diff[0] = 0.0;
         stats->second_diff[n - 1] = 0.0;
 
@@ -2338,6 +2476,7 @@ extern "C"
             stats->second_diff[i] = d2;
         }
 
+        // Simple heuristic: suggest including components 0..max_gap_idx as signal
         stats->suggested_signal = max_gap_idx + 1;
         stats->gap_threshold = max_gap;
 
@@ -2358,24 +2497,39 @@ extern "C"
         memset(stats, 0, sizeof(SSA_ComponentStats));
     }
 
+    // ============================================================================
+    // PERIODIC PAIR DETECTION
+    //
+    // Periodic signals in SSA typically appear as pairs of components with:
+    //   1. Nearly equal singular values (sine and cosine have same amplitude)
+    //   2. High W-correlation (they reconstruct similar-looking signals)
+    //
+    // This function identifies such pairs automatically for grouping.
+    // ============================================================================
+
     int ssa_opt_find_periodic_pairs(const SSA_Opt *ssa, int *pairs, int max_pairs,
                                     double sv_tol, double wcorr_thresh)
     {
         if (!ssa || !ssa->decomposed || !pairs || max_pairs < 1)
             return 0;
 
+        // Default tolerances if not specified
         if (sv_tol <= 0)
-            sv_tol = 0.1;
+            sv_tol = 0.1; // Within 10% singular value ratio
         if (wcorr_thresh <= 0)
-            wcorr_thresh = 0.5;
+            wcorr_thresh = 0.5; // W-correlation > 0.5 indicates related components
 
         int n = ssa->n_components;
         int n_pairs = 0;
 
+        // Track which components have already been paired
         bool *used = (bool *)calloc(n, sizeof(bool));
         if (!used)
             return 0;
 
+        // Scan through components looking for pairs
+        // We check consecutive or nearby components since periodic pairs
+        // typically have adjacent or very close singular values
         for (int i = 0; i < n - 1 && n_pairs < max_pairs; i++)
         {
             if (used[i])
@@ -2386,20 +2540,25 @@ extern "C"
                 if (used[j])
                     continue;
 
+                // Check 1: Singular values must be close
+                // For a pure periodic signal, sin and cos components have equal σ
                 double sv_ratio = ssa->sigma[j] / (ssa->sigma[i] + 1e-300);
                 if (fabs(1.0 - sv_ratio) > sv_tol)
                     continue;
 
+                // Check 2: W-correlation must be high
+                // Periodic pairs reconstruct similar-looking signals
                 double wcorr = fabs(ssa_opt_wcorr_pair(ssa, i, j));
                 if (wcorr < wcorr_thresh)
                     continue;
 
+                // Found a pair! Record it
                 pairs[2 * n_pairs] = i;
                 pairs[2 * n_pairs + 1] = j;
                 used[i] = true;
                 used[j] = true;
                 n_pairs++;
-                break;
+                break; // Move to next i
             }
         }
 
