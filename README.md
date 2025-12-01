@@ -192,11 +192,6 @@ for each block of b components:
     Rayleigh-Ritz refinement
 ```
 
-**Why it's faster:**
-1. Batched FFT: MKL processes 32 transforms with single function call, better SIMD utilization
-2. Memory locality: V_block columns are contiguous, better cache behavior
-3. BLAS3 operations: Orthogonalization uses GEMM instead of GEMV
-
 ### Optimization 3: Periodic QR Orthogonalization
 
 Full QR factorization every iteration is expensive. In practice, orthogonality drifts slowly:
