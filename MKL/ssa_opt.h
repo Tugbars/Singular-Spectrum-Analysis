@@ -1,7 +1,11 @@
 /*
  * ============================================================================
- * SSA-OPT: High-Performance Singular Spectrum Analysis
+ * SSA-OPT: High-Performance Singular Spectrum Analysis (MKL Version)
  * ============================================================================
+ *
+ * PURPOSE:
+ *   Production-grade SSA implementation using Intel MKL for maximum performance.
+ *   Use ssa_opt_ref.h for accuracy testing and educational purposes.
  *
  * WHAT IS SSA?
  *   Singular Spectrum Analysis decomposes a time series into trend, periodic
@@ -9,11 +13,11 @@
  *   its SVD. This implementation avoids forming the explicit matrix.
  *
  * WHAT THIS IMPLEMENTATION PROVIDES:
- *   - O(N log N) Hankel matvec via FFT convolution (vs O(N²) naive)
+ *   - O(N log N) Hankel matvec via FFT convolution
  *   - Three decomposition methods:
  *       1. Sequential power iteration (baseline)
- *       2. Block power iteration with Rayleigh-Ritz (Phase 2)
- *       3. Randomized SVD (Phase 3)
+ *       2. Block power iteration with Rayleigh-Ritz (~3x faster)
+ *       3. Randomized SVD (~15-25x faster)
  *   - Batched FFT operations for throughput
  *   - MKL-optimized BLAS/LAPACK throughout
  *
@@ -23,26 +27,22 @@
  *   Randomized:  ~20-40ms (15-25x)
  *
  * USAGE:
+ *   #define SSA_OPT_IMPLEMENTATION
+ *   #include "ssa_opt.h"
+ *
  *   SSA_Opt ssa = {0};
  *   ssa_opt_init(&ssa, signal, N, L);
- *   ssa_opt_decompose_randomized(&ssa, k, 8);  // or _block, or _decompose
+ *   ssa_opt_decompose_randomized(&ssa, k, 8);
  *   ssa_opt_reconstruct(&ssa, components, n_components, output);
  *   ssa_opt_free(&ssa);
  *
  * BUILD (Windows + MKL):
- *   cl /O2 /DSSA_USE_MKL /DSSA_OPT_IMPLEMENTATION your_code.c
- *      /I"%MKLROOT%\include" /link /LIBPATH:"%MKLROOT%\lib"
+ *   cl /O2 your_code.c /I"%MKLROOT%\include" /link /LIBPATH:"%MKLROOT%\lib"
  *      mkl_intel_lp64.lib mkl_intel_thread.lib mkl_core.lib
  *
- * KEY INSIGHT - WHY FFT?
- *   The Hankel matrix H has structure: H[i,j] = x[i+j]. This means
- *   y = H @ v is equivalent to convolution: y[i] = Σⱼ x[i+j]·v[j].
- *   Convolution theorem converts O(N²) multiply to O(N log N) FFT.
- *
- * MKL DOCUMENTATION REFERENCES:
- *   - DFTI: Intel MKL Developer Reference > FFT Functions
- *   - BLAS: Intel MKL Developer Reference > BLAS Routines
- *   - LAPACK: Intel MKL Developer Reference > LAPACK Routines
+ * BUILD (Linux + MKL):
+ *   gcc -O2 your_code.c -I${MKLROOT}/include -L${MKLROOT}/lib/intel64
+ *       -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core -liomp5 -lpthread -lm
  *
  * ============================================================================
  */
@@ -56,19 +56,16 @@
 #include <string.h>
 #include <math.h>
 
-// Platform-specific intrinsics
+#include <mkl.h>
+#include <mkl_dfti.h>
+#include <mkl_vml.h>
+#include <mkl_vsl.h>
+#include <mkl_lapacke.h>
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(__GNUC__) || defined(__clang__)
 #include <xmmintrin.h>
-#endif
-
-#ifdef SSA_USE_MKL
-#include <mkl.h>
-#include <mkl_dfti.h>
-#include <mkl_vml.h>
-#include <mkl_vsl.h>     // Vector Statistical Library for RNG
-#include <mkl_lapacke.h> // LAPACK for QR factorization (Phase 2)
 #endif
 
 #ifdef __cplusplus
@@ -76,21 +73,16 @@ extern "C"
 {
 #endif
 
-// ============================================================================
-// Configuration
-// ============================================================================
+    // ============================================================================
+    // Configuration
+    // ============================================================================
 
-// Convergence tolerance for power iteration
-// Iteration stops when |σ_new - σ_old| / σ_old < TOL
 #ifndef SSA_CONVERGENCE_TOL
 #define SSA_CONVERGENCE_TOL 1e-12
 #endif
 
-// Memory alignment for SIMD (AVX-512 = 64 bytes)
 #define SSA_ALIGN 64
 
-// Number of vectors processed simultaneously in batched FFT operations.
-// Larger = better throughput but more memory. 32 is optimal for most cases.
 #ifndef SSA_BATCH_SIZE
 #define SSA_BATCH_SIZE 32
 #endif
@@ -107,122 +99,73 @@ extern "C"
      *   - U is L × k: column i is the i-th left singular vector
      *   - V is K × k: column i is the i-th right singular vector
      *   - Complex arrays are interleaved: [re₀, im₀, re₁, im₁, ...]
-     *
-     * LIFECYCLE:
-     *   1. Zero-initialize: SSA_Opt ssa = {0};
-     *   2. ssa_opt_init() — allocates workspace, precomputes FFT(x)
-     *   3. ssa_opt_decompose*() — computes SVD, fills U, V, sigma
-     *   4. ssa_opt_reconstruct() — reconstructs signal from components
-     *   5. ssa_opt_free() — releases all memory
-     *
-     * WORKSPACE STRATEGY:
-     *   All workspace is allocated once in init(). Hot paths (matvec, iteration)
-     *   perform zero allocations. This is critical for performance.
      */
     typedef struct
     {
-        // -------------------------------------------------------------------------
-        // Dimensions (set in init, immutable thereafter)
-        // -------------------------------------------------------------------------
+        // Dimensions
         int N;       // Original series length
-        int L;       // Window length (embedding dimension), typically N/3 to N/2
-        int K;       // K = N - L + 1, number of lagged vectors
-        int fft_len; // FFT length, next power of 2 ≥ N + K - 1
+        int L;       // Window length (embedding dimension)
+        int K;       // K = N - L + 1
+        int fft_len; // FFT length (next power of 2)
 
-#ifdef SSA_USE_MKL
-        // -------------------------------------------------------------------------
         // MKL FFT Descriptors
-        //
-        // MKL requires pre-configured "descriptor" objects for FFT. We create
-        // multiple descriptors for different use cases:
-        //   - fft_handle: single transform (sequential matvec)
-        //   - fft_batch_c2c: batched NOT_INPLACE (block matvec) — faster
-        //   - fft_batch_inplace: batched INPLACE (reconstruction)
-        //
-        // See Intel MKL DFTI documentation for descriptor semantics.
-        // -------------------------------------------------------------------------
         DFTI_DESCRIPTOR_HANDLE fft_handle;        // Single C2C FFT (in-place)
-        DFTI_DESCRIPTOR_HANDLE fft_batch_c2c;     // Batched C2C (not-in-place, faster)
-        DFTI_DESCRIPTOR_HANDLE fft_batch_inplace; // Batched C2C (in-place, for reconstruction)
+        DFTI_DESCRIPTOR_HANDLE fft_batch_c2c;     // Batched C2C (not-in-place)
+        DFTI_DESCRIPTOR_HANDLE fft_batch_inplace; // Batched C2C (in-place)
 
-        // -------------------------------------------------------------------------
-        // Random Number Generator (for randomized SVD and initialization)
-        // -------------------------------------------------------------------------
+        // Random Number Generator
         VSLStreamStatePtr rng;
 
-        // -------------------------------------------------------------------------
         // Precomputed Data
-        //
-        // FFT(x) is computed once in init() and reused for all matvecs.
-        // This saves one FFT call per iteration.
-        // -------------------------------------------------------------------------
-        double *fft_x; // FFT of input signal, interleaved complex, length 2×fft_len
+        double *fft_x; // FFT of input signal, interleaved complex
 
-        // -------------------------------------------------------------------------
-        // Workspace Buffers (pre-allocated, zero allocations in hot paths)
-        //
-        // Naming: ws_* = workspace
-        // All complex buffers use interleaved format: [re, im, re, im, ...]
-        // -------------------------------------------------------------------------
-        double *ws_fft1; // FFT scratch buffer 1, length 2×fft_len
-        double *ws_fft2; // FFT scratch buffer 2, length 2×fft_len
-        double *ws_real; // Real-valued scratch, length fft_len
-        double *ws_v;    // Vector scratch for sequential iteration, length max(L,K)
-        double *ws_u;    // Vector scratch for sequential iteration, length max(L,K)
-        double *ws_proj; // Projection coefficients for orthogonalization, length k
-
-        // Batch workspace for block methods (sized for SSA_BATCH_SIZE transforms)
-        double *ws_batch_u;   // Batch buffer, length 2×fft_len×SSA_BATCH_SIZE
-        double *ws_batch_v;   // Batch buffer, length 2×fft_len×SSA_BATCH_SIZE
+        // Workspace Buffers
+        double *ws_fft1;      // FFT scratch buffer 1
+        double *ws_fft2;      // FFT scratch buffer 2
+        double *ws_real;      // Real-valued scratch
+        double *ws_v;         // Vector scratch for sequential iteration
+        double *ws_u;         // Vector scratch for sequential iteration
+        double *ws_proj;      // Projection coefficients for orthogonalization
+        double *ws_batch_u;   // Batch buffer for FFT
+        double *ws_batch_v;   // Batch buffer for FFT
         double *ws_batch_out; // Output buffer for NOT_INPLACE FFT
-#else
-    // Non-MKL fallback (minimal workspace)
-    double *fft_x;
-    double *ws_fft1;
-    double *ws_fft2;
-#endif
 
-        // -------------------------------------------------------------------------
-        // Results (populated by decompose, used by reconstruct)
-        // -------------------------------------------------------------------------
+        // Results
         double *U;           // Left singular vectors, L × k, column-major
         double *V;           // Right singular vectors, K × k, column-major
-        double *sigma;       // Singular values σ₁ ≥ σ₂ ≥ ... ≥ σₖ
-        double *eigenvalues; // Squared singular values (σᵢ²), for variance computation
-        int n_components;    // Number of computed components (≤ k requested)
+        double *sigma;       // Singular values
+        double *eigenvalues; // Squared singular values
+        int n_components;    // Number of computed components
 
-        // -------------------------------------------------------------------------
         // Reconstruction Optimization
-        // -------------------------------------------------------------------------
-        double *inv_diag_count; // Precomputed 1/count[t] for diagonal averaging, length N
-        double *U_fft;          // Cached FFT of U vectors, 2×fft_len×k (NULL if not cached)
-        double *V_fft;          // Cached FFT of V vectors, 2×fft_len×k (NULL if not cached)
+        double *inv_diag_count; // Precomputed 1/count for diagonal averaging
+        double *U_fft;          // Cached FFT of U vectors
+        double *V_fft;          // Cached FFT of V vectors
         bool fft_cached;        // True if U_fft/V_fft are populated
 
-        // -------------------------------------------------------------------------
-        // State Flags
-        // -------------------------------------------------------------------------
-        bool initialized;      // True after successful init()
-        bool decomposed;       // True after successful decompose*()
-        double total_variance; // Σᵢ σᵢ², for computing explained variance ratio
+        // State
+        bool initialized;
+        bool decomposed;
+        double total_variance;
     } SSA_Opt;
 
-    // ============================================================================
-    // Component Statistics (for automatic selection)
-    // ============================================================================
-
+    /**
+     * @brief Statistics for automatic component selection and analysis.
+     *
+     * Populated by ssa_opt_component_stats(). Provides gap ratios, cumulative
+     * variance, and automatic signal/noise cutoff suggestions based on singular
+     * value decay analysis.
+     */
     typedef struct
     {
-        int n;                   // Number of components analyzed
-        double *singular_values; // Copy of σ_i
-        double *log_sv;          // log(σ_i) for scree plot
-        double *gaps;            // σ_i / σ_{i+1} for i = 0..n-2
-        double *cumulative_var;  // Cumulative explained variance ratio
-        double *second_diff;     // Second difference of log(σ) for elbow detection
-
-        // Automatic selection results
-        int suggested_signal; // Components 0..suggested_signal-1 are "signal"
-        double gap_threshold; // Gap ratio at suggested cutoff
+        int n;                   ///< Number of components analyzed
+        double *singular_values; ///< Copy of singular values σ₁ ≥ σ₂ ≥ ... ≥ σₙ
+        double *log_sv;          ///< log(σᵢ) for scree plot visualization
+        double *gaps;            ///< Gap ratios: σᵢ/σᵢ₊₁ for i=0..n-2 (large gap = signal/noise boundary)
+        double *cumulative_var;  ///< Cumulative explained variance ratio at each component
+        double *second_diff;     ///< Second difference of log(σ) for elbow detection
+        int suggested_signal;    ///< Suggested signal component count (0..suggested_signal-1 are signal)
+        double gap_threshold;    ///< Gap ratio at the suggested cutoff point
     } SSA_ComponentStats;
 
     // ============================================================================
@@ -232,130 +175,177 @@ extern "C"
     /**
      * @brief Initialize SSA context with input signal.
      *
-     * Allocates all workspace, precomputes FFT(x), sets up MKL descriptors.
-     * After this call, no further allocations occur in hot paths.
+     * Allocates all workspace buffers, creates MKL FFT descriptors, and precomputes
+     * FFT(x) for reuse in all subsequent matvec operations. After this call, no
+     * further allocations occur in hot paths (decompose, reconstruct).
      *
-     * @param ssa   Pointer to zero-initialized SSA_Opt struct
-     * @param x     Input time series, length N
-     * @param N     Length of input signal
-     * @param L     Window length (embedding dimension). Typical choice: N/3 to N/2.
-     *              Larger L = better frequency resolution, smaller L = better trend.
-     * @return      0 on success, -1 on error
+     * @param[out] ssa  Pointer to zero-initialized SSA_Opt struct
+     * @param[in]  x    Input time series, length N (copied internally)
+     * @param[in]  N    Length of input signal (must be ≥ 4)
+     * @param[in]  L    Window length (embedding dimension), must satisfy 2 ≤ L ≤ N-1.
+     *                  Typical choice: N/3 to N/2. Larger L gives better frequency
+     *                  resolution; smaller L gives better trend extraction.
+     * @return          0 on success, -1 on invalid parameters or allocation failure
+     *
+     * @note The Hankel matrix dimensions are L×K where K = N - L + 1.
+     * @note Call ssa_opt_free() to release all allocated resources.
      */
     int ssa_opt_init(SSA_Opt *ssa, const double *x, int N, int L);
 
     /**
      * @brief Compute SVD via sequential power iteration (baseline method).
      *
-     * Computes k singular triplets one at a time using power iteration with
-     * deflation. Each component requires O(max_iter × N log N) operations.
+     * Computes k singular triplets (σᵢ, uᵢ, vᵢ) one at a time using power iteration
+     * with deflation. Each component requires O(max_iter × N log N) operations.
+     * This is the simplest but slowest method; use decompose_block or
+     * decompose_randomized for better performance.
      *
-     * @param ssa       Initialized SSA context
-     * @param k         Number of singular triplets to compute
-     * @param max_iter  Maximum iterations per component (100-200 typical)
-     * @return          0 on success, -1 on error
+     * @param[in,out] ssa       Initialized SSA context (from ssa_opt_init)
+     * @param[in]     k         Number of singular triplets to compute (1 to min(L,K))
+     * @param[in]     max_iter  Maximum iterations per component (typical: 100-200)
+     * @return                  0 on success, -1 on error
+     *
+     * @note Results stored in ssa->U, ssa->V, ssa->sigma, ssa->eigenvalues
+     * @note Components are sorted by descending singular value after computation
+     *
+     * @see ssa_opt_decompose_block() for ~3x faster block method
+     * @see ssa_opt_decompose_randomized() for ~15-25x faster randomized method
      */
     int ssa_opt_decompose(SSA_Opt *ssa, int k, int max_iter);
 
     /**
-     * @brief Compute SVD via block power iteration (Phase 2).
+     * @brief Compute SVD via block power iteration with Rayleigh-Ritz refinement.
      *
-     * Computes k singular triplets in blocks of size b. Uses Rayleigh-Ritz
-     * refinement for accurate singular values and periodic QR for stability.
-     * ~3x faster than sequential for k ≥ block_size.
+     * Processes multiple vectors simultaneously using batched FFT operations and
+     * GEMM-based orthogonalization. Uses periodic QR factorization for stability
+     * and Rayleigh-Ritz extraction for accurate singular values.
      *
-     * @param ssa        Initialized SSA context
-     * @param k          Number of singular triplets to compute
-     * @param block_size Block size (0 = use SSA_BATCH_SIZE). Should match
-     *                   SSA_BATCH_SIZE for optimal FFT batching.
-     * @param max_iter   Maximum iterations per block (100 typical)
-     * @return           0 on success, -1 on error
+     * Algorithm complexity: O(max_iter × N log N) for all k components together
+     * (vs O(k × max_iter × N log N) for sequential method).
+     *
+     * @param[in,out] ssa        Initialized SSA context
+     * @param[in]     k          Number of singular triplets to compute
+     * @param[in]     block_size Block size b (use 0 for default=SSA_BATCH_SIZE).
+     *                           Should match SSA_BATCH_SIZE for optimal FFT batching.
+     * @param[in]     max_iter   Maximum iterations per block (typical: 100)
+     * @return                   0 on success, -1 on error
+     *
+     * @note ~3x faster than sequential for k ≥ block_size
+     * @note Requires MKL LAPACK for QR factorization (dgeqrf/dorgqr)
      */
     int ssa_opt_decompose_block(SSA_Opt *ssa, int k, int block_size, int max_iter);
 
     /**
-     * @brief Compute SVD via randomized algorithm (Phase 3).
+     * @brief Compute SVD via Halko-Martinsson-Tropp randomized algorithm.
      *
-     * Uses Halko-Martinsson-Tropp randomized SVD: only 2 passes over the data.
-     * Fastest method for most cases, especially when k << min(L, K).
+     * Uses random projection to find an approximate basis for the column space,
+     * then computes a small dense SVD. Only requires 2 passes over the data,
+     * making it the fastest method for most use cases.
      *
      * Algorithm:
-     *   1. Y = X @ Ω          (random sampling, Ω is K×(k+p) Gaussian)
-     *   2. Q = orth(Y)        (QR factorization)
-     *   3. B = Xᵀ @ Q         (projection)
-     *   4. SVD(B) → U, Σ, V   (small dense SVD)
+     *   1. Ω = randn(K, k+p)     — Gaussian random test matrix
+     *   2. Y = H × Ω             — Range sampling (batched matvec)
+     *   3. Q = orth(Y)           — QR factorization
+     *   4. B = Hᵀ × Q            — Projection (batched matvec transpose)
+     *   5. SVD(B) → U, Σ, V      — Small dense SVD via MKL dgesdd
      *
-     * @param ssa          Initialized SSA context
-     * @param k            Number of singular triplets to compute
-     * @param oversampling Oversampling parameter p (typically 5-10, use 0 for default=8)
-     *                     Larger p = more accurate but slower
-     * @return             0 on success, -1 on error
+     * @param[in,out] ssa          Initialized SSA context
+     * @param[in]     k            Number of singular triplets to compute
+     * @param[in]     oversampling Oversampling parameter p (use 0 for default=8).
+     *                             Larger p improves accuracy at cost of speed.
+     *                             Theory guarantees error bounded by O(σₖ₊₁).
+     * @return                     0 on success, -1 on error
+     *
+     * @note ~15-25x faster than sequential method
+     * @note Best when k << min(L, K) and singular values decay rapidly
+     * @note Reference: Halko, Martinsson, Tropp. "Finding structure with randomness",
+     *       SIAM Review 2011, Algorithm 5.1
      */
     int ssa_opt_decompose_randomized(SSA_Opt *ssa, int k, int oversampling);
 
     /**
      * @brief Extend existing decomposition with additional components.
      *
-     * Adds more components to an already-decomposed SSA context without
-     * recomputing existing ones. Uses power iteration with orthogonalization
-     * against all existing components.
+     * Computes more singular triplets without recomputing existing ones. Uses
+     * power iteration with orthogonalization against all previously computed
+     * components. Useful when initial k was too small.
      *
-     * @param ssa          Already decomposed SSA context
-     * @param additional_k Number of additional components to compute
-     * @param max_iter     Maximum iterations per component
-     * @return             0 on success, -1 on error
+     * @param[in,out] ssa          Already decomposed SSA context
+     * @param[in]     additional_k Number of additional components to compute
+     * @param[in]     max_iter     Maximum iterations per new component
+     * @return                     0 on success, -1 on error
+     *
+     * @note Invalidates any cached FFTs (call ssa_opt_cache_ffts() again if needed)
+     * @note New components are merged and sorted with existing ones
      */
     int ssa_opt_extend(SSA_Opt *ssa, int additional_k, int max_iter);
 
     /**
-     * @brief Reconstruct signal from selected components.
+     * @brief Reconstruct signal from selected SSA components.
      *
-     * Computes: output = Σᵢ∈group σᵢ · (uᵢ ⊗ vᵢ) averaged along anti-diagonals.
-     * The outer product uᵢ ⊗ vᵢ is computed implicitly via FFT convolution.
+     * Computes the sum of rank-1 matrices for selected components and applies
+     * diagonal averaging (Hankelization) to produce the reconstructed signal:
      *
-     * @param ssa      Decomposed SSA context
-     * @param group    Array of component indices to include (0-based)
-     * @param n_group  Number of components in group
-     * @param output   Output buffer, length N (will be overwritten)
-     * @return         0 on success, -1 on error
+     *   output[t] = (1/count[t]) × Σᵢ∈group σᵢ × (uᵢ ⊗ vᵢ)[anti-diagonal t]
+     *
+     * The outer products are computed implicitly via FFT convolution for O(N log N)
+     * complexity per component.
+     *
+     * @param[in]  ssa      Decomposed SSA context
+     * @param[in]  group    Array of component indices to include (0-based)
+     * @param[in]  n_group  Number of components in group array
+     * @param[out] output   Output buffer of length N (will be overwritten)
+     * @return              0 on success, -1 on error
+     *
+     * @note For multiple reconstructions, call ssa_opt_cache_ffts() first for 2-3x speedup
      *
      * @example
-     *   // Reconstruct trend (first component)
+     *   // Extract trend (first component)
      *   int trend[] = {0};
      *   ssa_opt_reconstruct(&ssa, trend, 1, trend_output);
      *
-     *   // Reconstruct periodic (components 1-4)
+     *   // Extract periodic signal (components 1-4)
      *   int periodic[] = {1, 2, 3, 4};
      *   ssa_opt_reconstruct(&ssa, periodic, 4, periodic_output);
      */
     int ssa_opt_reconstruct(const SSA_Opt *ssa, const int *group, int n_group, double *output);
 
     /**
-     * @brief Cache FFTs of U and V vectors for faster reconstruction.
+     * @brief Cache FFTs of U and V vectors for faster repeated reconstruction.
      *
-     * Precomputes FFT(u_i) and FFT(v_i) for all components. Subsequent calls
-     * to ssa_opt_reconstruct() will skip the forward FFT step, saving k FFTs
-     * per reconstruction call.
+     * Precomputes FFT(σᵢ × uᵢ) and FFT(vᵢ) for all components. Subsequent calls
+     * to ssa_opt_reconstruct() skip the forward FFT step, saving 2k FFT operations
+     * per reconstruction.
      *
      * Typical speedup: 2-3x for workflows that call reconstruct multiple times
      * with different groupings (e.g., extract trend, then periodic, then noise).
      *
-     * Memory cost: ~4MB for k=32, N=5000 (2 × fft_len × k × 8 bytes)
+     * @param[in,out] ssa  Decomposed SSA context
+     * @return             0 on success, -1 on error
      *
-     * @param ssa  Decomposed SSA context
-     * @return     0 on success, -1 on error
+     * @note Memory cost: ~16 × fft_len × k bytes (e.g., ~4MB for k=32, N=5000)
+     * @note Cache is automatically invalidated by ssa_opt_extend()
+     * @note Call ssa_opt_free_cached_ffts() to manually release cache memory
      */
     int ssa_opt_cache_ffts(SSA_Opt *ssa);
 
     /**
-     * @brief Free cached FFTs (optional, also freed by ssa_opt_free).
-     * @param ssa  SSA context with cached FFTs
+     * @brief Free cached FFTs to release memory.
+     *
+     * Optional cleanup function. Cached FFTs are also freed by ssa_opt_free()
+     * and automatically invalidated by ssa_opt_extend().
+     *
+     * @param[in,out] ssa  SSA context (safe to call if cache not populated)
      */
     void ssa_opt_free_cached_ffts(SSA_Opt *ssa);
 
     /**
      * @brief Free all memory associated with SSA context.
-     * @param ssa  SSA context to free (safe to call on partially initialized or NULL)
+     *
+     * Releases all allocated buffers, destroys MKL FFT descriptors, and frees
+     * the RNG stream. Safe to call on partially initialized or already-freed contexts.
+     *
+     * @param[in,out] ssa  SSA context to free (zeroed after call)
      */
     void ssa_opt_free(SSA_Opt *ssa);
 
@@ -364,58 +354,136 @@ extern "C"
     // ============================================================================
 
     /**
-     * @brief Compute W-correlation matrix between SSA components.
+     * @brief Compute W-correlation matrix between all SSA components.
      *
-     * W-correlation uses diagonal averaging weights to measure similarity
-     * between reconstructed components. High |ρ_W| indicates components
-     * that should be grouped together.
+     * W-correlation measures similarity between reconstructed components using
+     * diagonal averaging weights. High |ρ_W(i,j)| indicates components i and j
+     * should be grouped together (e.g., sine/cosine pairs for periodic signals).
      *
-     * @param ssa  Decomposed SSA context
-     * @param W    Output matrix, n_components × n_components, row-major
-     *             W[i*n + j] = ρ_W(component_i, component_j)
-     * @return     0 on success, -1 on error
+     * Formula: ρ_W(i,j) = <Xᵢ, Xⱼ>_W / (‖Xᵢ‖_W × ‖Xⱼ‖_W)
+     * where <·,·>_W uses weights w[t] = min(t+1, L, K, N-t).
+     *
+     * @param[in]  ssa  Decomposed SSA context
+     * @param[out] W    Output matrix, n_components × n_components, row-major.
+     *                  W[i*n + j] = ρ_W(component_i, component_j).
+     *                  Caller must allocate n_components² doubles.
+     * @return          0 on success, -1 on error
+     *
+     * @note Diagonal elements W[i,i] = 1.0; matrix is symmetric
+     * @note Computationally expensive: reconstructs all components internally
      */
     int ssa_opt_wcorr_matrix(const SSA_Opt *ssa, double *W);
 
     /**
      * @brief Compute W-correlation between two specific components.
-     * @return W-correlation value, or 0.0 on error
+     *
+     * Efficient alternative to ssa_opt_wcorr_matrix() when only one pair is needed.
+     *
+     * @param[in] ssa  Decomposed SSA context
+     * @param[in] i    First component index (0-based)
+     * @param[in] j    Second component index (0-based)
+     * @return         W-correlation value in [-1, 1], or 0.0 on error
      */
     double ssa_opt_wcorr_pair(const SSA_Opt *ssa, int i, int j);
 
     /**
-     * @brief Analyze singular value spectrum for component selection.
+     * @brief Analyze singular value spectrum for automatic component selection.
      *
-     * Computes gap ratios, cumulative variance, and suggests signal/noise cutoff.
+     * Computes various diagnostics to help identify signal/noise boundary:
+     * - Gap ratios (σᵢ/σᵢ₊₁): large gaps suggest component boundaries
+     * - Cumulative variance: how much variance each component explains
+     * - Second differences of log(σ): for elbow detection in scree plots
      *
-     * @param ssa    Decomposed SSA context
-     * @param stats  Output statistics structure
-     * @return       0 on success, -1 on error
+     * @param[in]  ssa    Decomposed SSA context (must have ≥2 components)
+     * @param[out] stats  Output statistics structure (caller allocates struct,
+     *                    function allocates internal arrays)
+     * @return            0 on success, -1 on error
+     *
+     * @note Call ssa_opt_component_stats_free() to release internal arrays
      */
     int ssa_opt_component_stats(const SSA_Opt *ssa, SSA_ComponentStats *stats);
 
     /**
-     * @brief Free component statistics structure.
+     * @brief Free memory allocated inside SSA_ComponentStats structure.
+     *
+     * @param[in,out] stats  Statistics structure to free (zeroed after call)
      */
     void ssa_opt_component_stats_free(SSA_ComponentStats *stats);
 
     /**
-     * @brief Find components that likely form periodic pairs.
+     * @brief Find component pairs that likely represent periodic signals.
      *
-     * @param ssa          Decomposed SSA context
-     * @param pairs        Output: pairs[2*j], pairs[2*j+1] are paired indices
-     * @param max_pairs    Maximum pairs to find
-     * @param sv_tol       Singular value tolerance (0 = default 0.1)
-     * @param wcorr_thresh W-correlation threshold (0 = default 0.5)
-     * @return             Number of pairs found
+     * Periodic signals in SSA typically appear as pairs of components with nearly
+     * equal singular values and high W-correlation (sine/cosine pairs at same
+     * frequency). This function identifies such pairs automatically.
+     *
+     * @param[in]  ssa          Decomposed SSA context
+     * @param[out] pairs        Output array: pairs[2*j] and pairs[2*j+1] are the
+     *                          indices of the j-th detected pair. Caller must
+     *                          allocate 2*max_pairs integers.
+     * @param[in]  max_pairs    Maximum number of pairs to find
+     * @param[in]  sv_tol       Singular value tolerance: |1 - σⱼ/σᵢ| < sv_tol
+     *                          (use 0 for default=0.1, i.e., within 10%)
+     * @param[in]  wcorr_thresh W-correlation threshold: |ρ_W| > wcorr_thresh
+     *                          (use 0 for default=0.5)
+     * @return                  Number of pairs found (0 to max_pairs)
+     *
+     * @example
+     *   int pairs[20];  // Space for up to 10 pairs
+     *   int n = ssa_opt_find_periodic_pairs(&ssa, pairs, 10, 0, 0);
+     *   for (int i = 0; i < n; i++) {
+     *       printf("Periodic pair: components %d and %d\n", pairs[2*i], pairs[2*i+1]);
+     *   }
      */
     int ssa_opt_find_periodic_pairs(const SSA_Opt *ssa, int *pairs, int max_pairs,
                                     double sv_tol, double wcorr_thresh);
 
-    // Convenience functions
-    int ssa_opt_get_trend(const SSA_Opt *ssa, double *output);                  ///< Reconstruct component 0
-    int ssa_opt_get_noise(const SSA_Opt *ssa, int noise_start, double *output); ///< Reconstruct components [noise_start, end]
-    double ssa_opt_variance_explained(const SSA_Opt *ssa, int start, int end);  ///< Compute Σᵢ σᵢ² / total
+    // ============================================================================
+    // Convenience Functions
+    // ============================================================================
+
+    /**
+     * @brief Reconstruct trend component (component 0 only).
+     *
+     * Shorthand for reconstructing just the first singular component, which
+     * typically captures the overall trend in the time series.
+     *
+     * @param[in]  ssa     Decomposed SSA context
+     * @param[out] output  Output buffer of length N
+     * @return             0 on success, -1 on error
+     */
+    int ssa_opt_get_trend(const SSA_Opt *ssa, double *output);
+
+    /**
+     * @brief Reconstruct noise components (from noise_start to end).
+     *
+     * Reconstructs all components from index noise_start to n_components-1,
+     * typically representing the noise portion of the signal.
+     *
+     * @param[in]  ssa         Decomposed SSA context
+     * @param[in]  noise_start First noise component index (0-based)
+     * @param[out] output      Output buffer of length N
+     * @return                 0 on success, -1 on error
+     */
+    int ssa_opt_get_noise(const SSA_Opt *ssa, int noise_start, double *output);
+
+    /**
+     * @brief Compute explained variance ratio for a component range.
+     *
+     * Returns (Σᵢ₌ₛₜₐᵣₜᵉⁿᵈ σᵢ²) / (Σⱼ σⱼ²), i.e., the fraction of total variance
+     * explained by components in range [start, end].
+     *
+     * @param[in] ssa    Decomposed SSA context
+     * @param[in] start  First component index (0-based, inclusive)
+     * @param[in] end    Last component index (inclusive, use -1 for last component)
+     * @return           Variance ratio in [0, 1], or 0.0 on error
+     *
+     * @example
+     *   // Variance explained by first 5 components
+     *   double var = ssa_opt_variance_explained(&ssa, 0, 4);
+     *   printf("Components 0-4 explain %.1f%% of variance\n", var * 100);
+     */
+    double ssa_opt_variance_explained(const SSA_Opt *ssa, int start, int end);
 
     // ============================================================================
     // Implementation
@@ -424,9 +492,10 @@ extern "C"
 #ifdef SSA_OPT_IMPLEMENTATION
 
     // ----------------------------------------------------------------------------
-    // Helpers
+    // Internal Helpers
     // ----------------------------------------------------------------------------
 
+    /** @brief Round up to next power of 2. Used for FFT length calculation. */
     static inline int ssa_opt_next_pow2(int n)
     {
         int p = 1;
@@ -438,35 +507,28 @@ extern "C"
     static inline int ssa_opt_min(int a, int b) { return a < b ? a : b; }
     static inline int ssa_opt_max(int a, int b) { return a > b ? a : b; }
 
+    /** @brief Allocate aligned memory using MKL allocator (64-byte alignment for AVX-512). */
     static inline void *ssa_opt_alloc(size_t size)
     {
-#ifdef SSA_USE_MKL
         return mkl_malloc(size, SSA_ALIGN);
-#else
-        return aligned_alloc(SSA_ALIGN, (size + SSA_ALIGN - 1) & ~(SSA_ALIGN - 1));
-#endif
     }
 
+    /** @brief Free memory allocated with ssa_opt_alloc(). */
     static inline void ssa_opt_free_ptr(void *ptr)
     {
-#ifdef SSA_USE_MKL
         mkl_free(ptr);
-#else
-        free(ptr);
-#endif
     }
 
     // ----------------------------------------------------------------------------
-    // Vectorized Operations (using MKL VML when available)
+    // Vectorized BLAS Operations (MKL wrappers)
     // ----------------------------------------------------------------------------
 
-#ifdef SSA_USE_MKL
-
-    // Vectorized reverse: out[i] = in[n-1-i]
+    /**
+     * @brief Reverse array with prefetching: out[i] = in[n-1-i].
+     * Uses software prefetch to hide memory latency for large arrays.
+     */
     static inline void ssa_opt_reverse(const double *in, double *out, int n)
     {
-        // MKL doesn't have a direct reverse, but we can use gather
-        // For now, use optimized scalar loop with prefetch
         const double *src = in + n - 1;
         for (int i = 0; i < n; i += 4)
         {
@@ -481,48 +543,50 @@ extern "C"
         }
     }
 
-    // Vectorized complex multiply: c = a * b (interleaved format)
-    // c[2i] = a[2i]*b[2i] - a[2i+1]*b[2i+1]
-    // c[2i+1] = a[2i]*b[2i+1] + a[2i+1]*b[2i]
-    static void ssa_opt_complex_mul(
-        const double *a, const double *b, double *c, int n)
+    /**
+     * @brief Element-wise complex multiply: c = a ⊙ b (interleaved format).
+     * Uses MKL vzMul for vectorized complex multiplication.
+     * @param n Number of complex elements (array lengths are 2n doubles)
+     */
+    static void ssa_opt_complex_mul(const double *a, const double *b, double *c, int n)
     {
-        // Use MKL's vzMul for complex multiplication
-        // vzMul expects MKL_Complex16 format which is same as interleaved double
         vzMul(n, (const MKL_Complex16 *)a, (const MKL_Complex16 *)b, (MKL_Complex16 *)c);
     }
 
-    // Dot product
+    /** @brief Dot product: return a·b = Σᵢ aᵢbᵢ */
     static inline double ssa_opt_dot(const double *a, const double *b, int n)
     {
         return cblas_ddot(n, a, 1, b, 1);
     }
 
-    // Norm
+    /** @brief Euclidean norm: return ‖v‖₂ = √(Σᵢ vᵢ²) */
     static inline double ssa_opt_nrm2(const double *v, int n)
     {
         return cblas_dnrm2(n, v, 1);
     }
 
-    // Scale: v *= s
+    /** @brief Scale vector: v ← s·v */
     static inline void ssa_opt_scal(double *v, int n, double s)
     {
         cblas_dscal(n, s, v, 1);
     }
 
-    // AXPY: y += a*x
+    /** @brief AXPY operation: y ← y + a·x */
     static inline void ssa_opt_axpy(double *y, const double *x, double a, int n)
     {
         cblas_daxpy(n, a, x, 1, y, 1);
     }
 
-    // Copy
+    /** @brief Copy vector: dst ← src */
     static inline void ssa_opt_copy(const double *src, double *dst, int n)
     {
         cblas_dcopy(n, src, 1, dst, 1);
     }
 
-    // Normalize and return norm
+    /**
+     * @brief Normalize vector to unit length: v ← v/‖v‖₂
+     * @return Original norm before normalization
+     */
     static inline double ssa_opt_normalize(double *v, int n)
     {
         double norm = cblas_dnrm2(n, v, 1);
@@ -534,319 +598,151 @@ extern "C"
         return norm;
     }
 
-    // Zero array
-    static inline void ssa_opt_zero(double *v, int n)
-    {
-        // MKL doesn't have memset, but we can use dscal with 0
-        // Actually, just use memset - it's optimized
-        memset(v, 0, n * sizeof(double));
-    }
-
-#else
-    // Non-MKL fallbacks
-
-    static inline void ssa_opt_reverse(const double *in, double *out, int n)
-    {
-        for (int i = 0; i < n; i++)
-            out[i] = in[n - 1 - i];
-    }
-
-    static void ssa_opt_complex_mul(const double *a, const double *b, double *c, int n)
-    {
-        for (int i = 0; i < n; i++)
-        {
-            double ar = a[2 * i], ai = a[2 * i + 1];
-            double br = b[2 * i], bi = b[2 * i + 1];
-            c[2 * i] = ar * br - ai * bi;
-            c[2 * i + 1] = ar * bi + ai * br;
-        }
-    }
-
-    static inline double ssa_opt_dot(const double *a, const double *b, int n)
-    {
-        double sum = 0;
-        for (int i = 0; i < n; i++)
-            sum += a[i] * b[i];
-        return sum;
-    }
-
-    static inline double ssa_opt_nrm2(const double *v, int n)
-    {
-        return sqrt(ssa_opt_dot(v, v, n));
-    }
-
-    static inline void ssa_opt_scal(double *v, int n, double s)
-    {
-        for (int i = 0; i < n; i++)
-            v[i] *= s;
-    }
-
-    static inline void ssa_opt_axpy(double *y, const double *x, double a, int n)
-    {
-        for (int i = 0; i < n; i++)
-            y[i] += a * x[i];
-    }
-
-    static inline void ssa_opt_copy(const double *src, double *dst, int n)
-    {
-        memcpy(dst, src, n * sizeof(double));
-    }
-
-    static inline double ssa_opt_normalize(double *v, int n)
-    {
-        double norm = ssa_opt_nrm2(v, n);
-        if (norm > 1e-15)
-            ssa_opt_scal(v, n, 1.0 / norm);
-        return norm;
-    }
-
+    /** @brief Zero-fill array: v[i] = 0 for all i */
     static inline void ssa_opt_zero(double *v, int n)
     {
         memset(v, 0, n * sizeof(double));
     }
 
-#endif // SSA_USE_MKL
-
     // ----------------------------------------------------------------------------
-    // FFT Operations
+    // FFT Operations (MKL DFTI wrappers)
     // ----------------------------------------------------------------------------
 
-#ifdef SSA_USE_MKL
-
-    // In-place FFT (interleaved complex format)
-    // Input/output: [re0, im0, re1, im1, ...]
+    /** @brief In-place forward FFT using precomputed MKL descriptor. */
     static void ssa_opt_fft_forward_inplace(SSA_Opt *ssa, double *data)
     {
-        // MKL DFTI for complex-to-complex
-        // We'll use the real FFT and convert, or just do complex FFT
-        // For simplicity, use complex FFT (input is zero-padded real in complex format)
         DftiComputeForward(ssa->fft_handle, data);
     }
 
+    /** @brief In-place inverse FFT (includes 1/n scaling). */
     static void ssa_opt_fft_inverse_inplace(SSA_Opt *ssa, double *data)
     {
         DftiComputeBackward(ssa->fft_handle, data);
     }
 
-    // Forward FFT: real input -> complex output (interleaved)
-    static void ssa_opt_fft_r2c(
-        SSA_Opt *ssa,
-        const double *input, int input_len,
-        double *output // length 2*fft_len
-    )
-    {
-        int n = ssa->fft_len;
-
-        // Zero-pad and convert to complex format
-        ssa_opt_zero(output, 2 * n);
-        for (int i = 0; i < input_len; i++)
-        {
-            output[2 * i] = input[i];
-            // output[2*i+1] = 0 already
-        }
-
-        ssa_opt_fft_forward_inplace(ssa, output);
-    }
-
-    // Inverse FFT: complex input -> real output (takes first n real values)
-    static void ssa_opt_fft_c2r(
-        SSA_Opt *ssa,
-        double *data, // in-place, length 2*fft_len
-        double *output, int output_len)
-    {
-        ssa_opt_fft_inverse_inplace(ssa, data);
-
-        // Extract real parts
-        for (int i = 0; i < output_len; i++)
-        {
-            output[i] = data[2 * i];
-        }
-    }
-
-#else
-    // Built-in FFT (Cooley-Tukey)
-
-    static void ssa_opt_fft_builtin(double *data, int n, int sign)
-    {
-        // Bit-reversal
-        int j = 0;
-        for (int i = 0; i < n - 1; i++)
-        {
-            if (i < j)
-            {
-                double tr = data[2 * j], ti = data[2 * j + 1];
-                data[2 * j] = data[2 * i];
-                data[2 * j + 1] = data[2 * i + 1];
-                data[2 * i] = tr;
-                data[2 * i + 1] = ti;
-            }
-            int k = n >> 1;
-            while (k <= j)
-            {
-                j -= k;
-                k >>= 1;
-            }
-            j += k;
-        }
-
-        // Cooley-Tukey
-        for (int len = 2; len <= n; len <<= 1)
-        {
-            double ang = sign * 2.0 * M_PI / len;
-            double wpr = cos(ang), wpi = sin(ang);
-            for (int i = 0; i < n; i += len)
-            {
-                double wr = 1.0, wi = 0.0;
-                for (int jj = 0; jj < len / 2; jj++)
-                {
-                    int a = i + jj, b = a + len / 2;
-                    double tr = wr * data[2 * b] - wi * data[2 * b + 1];
-                    double ti = wr * data[2 * b + 1] + wi * data[2 * b];
-                    data[2 * b] = data[2 * a] - tr;
-                    data[2 * b + 1] = data[2 * a + 1] - ti;
-                    data[2 * a] += tr;
-                    data[2 * a + 1] += ti;
-                    double wt = wr;
-                    wr = wr * wpr - wi * wpi;
-                    wi = wi * wpr + wt * wpi;
-                }
-            }
-        }
-
-        if (sign == 1)
-        {
-            double scale = 1.0 / n;
-            for (int i = 0; i < 2 * n; i++)
-                data[i] *= scale;
-        }
-    }
-
+    /**
+     * @brief Real-to-complex FFT: zero-pads input, computes FFT, stores interleaved.
+     * @param input      Real input array of length input_len
+     * @param input_len  Length of real input
+     * @param output     Output interleaved complex array of length 2*fft_len
+     */
     static void ssa_opt_fft_r2c(SSA_Opt *ssa, const double *input, int input_len, double *output)
     {
         int n = ssa->fft_len;
         ssa_opt_zero(output, 2 * n);
         for (int i = 0; i < input_len; i++)
-            output[2 * i] = input[i];
-        ssa_opt_fft_builtin(output, n, -1);
+        {
+            output[2 * i] = input[i]; // Pack real into complex: [re, 0, re, 0, ...]
+        }
+        ssa_opt_fft_forward_inplace(ssa, output);
     }
 
-    static void ssa_opt_fft_c2r(SSA_Opt *ssa, double *data, double *output, int output_len)
-    {
-        ssa_opt_fft_builtin(data, ssa->fft_len, 1);
-        for (int i = 0; i < output_len; i++)
-            output[i] = data[2 * i];
-    }
+    // ----------------------------------------------------------------------------
+    // Hankel Matrix-Vector Products via FFT Convolution
+    //
+    // KEY INSIGHT: The Hankel matrix H has structure H[i,j] = x[i+j], so
+    // y = H @ v is equivalent to convolution: y[i] = Σⱼ x[i+j]·v[j].
+    // Using convolution theorem: y = IFFT(FFT(x) ⊙ FFT(v_reversed))[K-1:K-1+L]
+    // This converts O(L×K) multiply to O(N log N) FFT operations.
+    // ----------------------------------------------------------------------------
 
-#endif // SSA_USE_MKL
-
-    // ============================================================================
-    // HANKEL MATRIX-VECTOR PRODUCTS
-    // ============================================================================
-
-    static void ssa_opt_hankel_matvec(
-        SSA_Opt *ssa,
-        const double *v, // Input: length K
-        double *y        // Output: length L
-    )
+    /**
+     * @brief Compute y = H @ v via FFT convolution.
+     *
+     * Hankel matvec: y[i] = Σⱼ x[i+j] × v[j] for i=0..L-1, j=0..K-1
+     * Implemented as: y = conv(x, reverse(v))[K-1 : K-1+L]
+     *
+     * @param v  Input vector of length K (right singular vector direction)
+     * @param y  Output vector of length L (left singular vector direction)
+     */
+    static void ssa_opt_hankel_matvec(SSA_Opt *ssa, const double *v, double *y)
     {
         int K = ssa->K;
         int L = ssa->L;
         int n = ssa->fft_len;
         double *ws = ssa->ws_fft1;
 
+        // Pack reversed v into interleaved complex format
         ssa_opt_zero(ws, 2 * n);
         for (int i = 0; i < K; i++)
         {
             ws[2 * i] = v[K - 1 - i];
         }
 
-#ifdef SSA_USE_MKL
+        // Compute convolution via FFT: y = IFFT(FFT(x) ⊙ FFT(v_rev))
         DftiComputeForward(ssa->fft_handle, ws);
-#else
-        ssa_opt_fft_builtin(ws, n, -1);
-#endif
-
-        ssa_opt_complex_mul(ssa->fft_x, ws, ws, n);
-
-#ifdef SSA_USE_MKL
+        ssa_opt_complex_mul(ssa->fft_x, ws, ws, n); // fft_x precomputed in init()
         DftiComputeBackward(ssa->fft_handle, ws);
-#else
-        ssa_opt_fft_builtin(ws, n, 1);
-#endif
 
-#ifdef SSA_USE_MKL
+        // Extract result from convolution: conv[K-1 : K-1+L]
+        // cblas_dcopy with incx=2 extracts real parts from interleaved complex
         cblas_dcopy(L, ws + 2 * (K - 1), 2, y, 1);
-#else
-        for (int i = 0; i < L; i++)
-        {
-            y[i] = ws[2 * (K - 1 + i)];
-        }
-#endif
     }
 
-    static void ssa_opt_hankel_matvec_T(
-        SSA_Opt *ssa,
-        const double *u, // Input: length L
-        double *y        // Output: length K
-    )
+    /**
+     * @brief Compute y = Hᵀ @ u via FFT convolution.
+     *
+     * Hankel transpose matvec: y[j] = Σᵢ x[i+j] × u[i] for j=0..K-1, i=0..L-1
+     * Same convolution structure with dimensions swapped.
+     *
+     * @param u  Input vector of length L (left singular vector direction)
+     * @param y  Output vector of length K (right singular vector direction)
+     */
+    static void ssa_opt_hankel_matvec_T(SSA_Opt *ssa, const double *u, double *y)
     {
         int K = ssa->K;
         int L = ssa->L;
         int n = ssa->fft_len;
         double *ws = ssa->ws_fft1;
 
+        // Pack reversed u into interleaved complex format
         ssa_opt_zero(ws, 2 * n);
         for (int i = 0; i < L; i++)
         {
             ws[2 * i] = u[L - 1 - i];
         }
 
-#ifdef SSA_USE_MKL
+        // Convolution via FFT
         DftiComputeForward(ssa->fft_handle, ws);
-#else
-        ssa_opt_fft_builtin(ws, n, -1);
-#endif
-
         ssa_opt_complex_mul(ssa->fft_x, ws, ws, n);
-
-#ifdef SSA_USE_MKL
         DftiComputeBackward(ssa->fft_handle, ws);
-#else
-        ssa_opt_fft_builtin(ws, n, 1);
-#endif
 
-#ifdef SSA_USE_MKL
+        // Extract result: conv[L-1 : L-1+K]
         cblas_dcopy(K, ws + 2 * (L - 1), 2, y, 1);
-#else
-        for (int j = 0; j < K; j++)
-        {
-            y[j] = ws[2 * (L - 1 + j)];
-        }
-#endif
     }
 
-    // ============================================================================
-    // BATCHED HANKEL MATRIX-VECTOR PRODUCTS
-    // ============================================================================
+    // ----------------------------------------------------------------------------
+    // Batched Hankel Matrix-Vector Products
+    //
+    // Process multiple vectors simultaneously using MKL's batched FFT.
+    // For block_size vectors, this is ~3x faster than sequential calls due to:
+    //   1. Amortized FFT descriptor overhead
+    //   2. Better cache utilization
+    //   3. Cross-transform SIMD parallelism in MKL
+    // ----------------------------------------------------------------------------
 
-#ifdef SSA_USE_MKL
-
-    static void ssa_opt_hankel_matvec_block(
-        SSA_Opt *ssa,
-        const double *V_block,
-        double *Y_block,
-        int b)
+    /**
+     * @brief Batched Hankel matvec: Y = H @ V where V and Y are column-major matrices.
+     *
+     * Computes b matrix-vector products simultaneously using MKL batched FFT.
+     * Falls back to sequential for small batches (< BATCH_THRESHOLD).
+     *
+     * @param V_block  Input matrix, K × b, column-major (b right singular vectors)
+     * @param Y_block  Output matrix, L × b, column-major (b left singular vectors)
+     * @param b        Number of vectors to process
+     */
+    static void ssa_opt_hankel_matvec_block(SSA_Opt *ssa, const double *V_block, double *Y_block, int b)
     {
         int K = ssa->K;
         int L = ssa->L;
         int n = ssa->fft_len;
-        size_t stride = 2 * n;
+        size_t stride = 2 * n; // Stride between transforms in complex array
 
         double *ws_in = ssa->ws_batch_u;
         double *ws_out = ssa->ws_batch_out;
 
-        // Threshold for using batched FFT vs sequential
-        // Below this, sequential FFT avoids computing unused transforms
+        // Threshold for using batched vs sequential FFT
+        // Below this, sequential avoids computing unused transforms
         const int BATCH_THRESHOLD = SSA_BATCH_SIZE / 4;
 
         int col = 0;
@@ -854,9 +750,7 @@ extern "C"
         {
             int batch_count = (b - col < SSA_BATCH_SIZE) ? (b - col) : SSA_BATCH_SIZE;
 
-            // OPTIMIZATION: Fall back to sequential FFT for small batches
-            // MKL batch descriptor always computes SSA_BATCH_SIZE transforms,
-            // so for small batches, sequential is more efficient
+            // Fall back to sequential for small batches
             if (batch_count < BATCH_THRESHOLD)
             {
                 for (int i = 0; i < batch_count; i++)
@@ -867,29 +761,24 @@ extern "C"
                 continue;
             }
 
-            // OPTIMIZATION: Single memset for entire workspace
-            // Replaces per-vector memset + trailing padding memset
+            // Zero entire workspace (single memset vs per-vector)
             memset(ws_in, 0, SSA_BATCH_SIZE * stride * sizeof(double));
 
-            // Pack reversed vectors into workspace in interleaved complex format
-            // Each transform occupies 'stride' doubles: [re₀,im₀,re₁,im₁,...]
+            // Pack reversed vectors into batch workspace
             for (int i = 0; i < batch_count; i++)
             {
-                const double *v = &V_block[(col + i) * K]; // Column i of V_block
+                const double *v = &V_block[(col + i) * K];
                 double *dst = ws_in + i * stride;
-
-                // Only write non-zero values (buffer already zeroed)
                 for (int j = 0; j < K; j++)
                 {
-                    dst[2 * j] = v[K - 1 - j]; // Pack reversed v into real parts
+                    dst[2 * j] = v[K - 1 - j];
                 }
             }
 
             // Batched forward FFT: ws_in → ws_out (NOT_INPLACE is faster)
             DftiComputeForward(ssa->fft_batch_c2c, ws_in, ws_out);
 
-            // Element-wise complex multiply: FFT(vᵢ) ⊙ FFT(x) for each vector
-            // vzMul is MKL's vectorized complex multiply
+            // Element-wise complex multiply with precomputed FFT(x)
             for (int i = 0; i < batch_count; i++)
             {
                 double *fft_v = ws_out + i * stride;
@@ -897,27 +786,31 @@ extern "C"
                       (MKL_Complex16 *)fft_v);
             }
 
-            // Batched inverse FFT: ws_out → ws_in
+            // Batched inverse FFT
             DftiComputeBackward(ssa->fft_batch_c2c, ws_out, ws_in);
 
-            // Extract results from convolution output
-            // cblas_dcopy with incx=2 extracts real parts from interleaved complex
+            // Extract results from convolutions
             for (int i = 0; i < batch_count; i++)
             {
                 double *conv = ws_in + i * stride;
                 double *y = &Y_block[(col + i) * L];
-                cblas_dcopy(L, conv + 2 * (K - 1), 2, y, 1); // Stride-2 extracts reals
+                cblas_dcopy(L, conv + 2 * (K - 1), 2, y, 1); // Extract real parts
             }
 
             col += batch_count;
         }
     }
 
-    static void ssa_opt_hankel_matvec_T_block(
-        SSA_Opt *ssa,
-        const double *U_block,
-        double *Y_block,
-        int b)
+    /**
+     * @brief Batched Hankel transpose matvec: Y = Hᵀ @ U where U and Y are column-major.
+     *
+     * Transpose version of ssa_opt_hankel_matvec_block(). Uses same batching strategy.
+     *
+     * @param U_block  Input matrix, L × b, column-major (b left singular vectors)
+     * @param Y_block  Output matrix, K × b, column-major (b right singular vectors)
+     * @param b        Number of vectors to process
+     */
+    static void ssa_opt_hankel_matvec_T_block(SSA_Opt *ssa, const double *U_block, double *Y_block, int b)
     {
         int K = ssa->K;
         int L = ssa->L;
@@ -927,7 +820,6 @@ extern "C"
         double *ws_in = ssa->ws_batch_u;
         double *ws_out = ssa->ws_batch_out;
 
-        // Threshold for using batched FFT vs sequential
         const int BATCH_THRESHOLD = SSA_BATCH_SIZE / 4;
 
         int col = 0;
@@ -935,7 +827,7 @@ extern "C"
         {
             int batch_count = (b - col < SSA_BATCH_SIZE) ? (b - col) : SSA_BATCH_SIZE;
 
-            // OPTIMIZATION: Fall back to sequential FFT for small batches
+            // Fall back to sequential for small batches
             if (batch_count < BATCH_THRESHOLD)
             {
                 for (int i = 0; i < batch_count; i++)
@@ -946,25 +838,22 @@ extern "C"
                 continue;
             }
 
-            // OPTIMIZATION: Single memset for entire workspace
+            // Zero workspace and pack reversed u vectors
             memset(ws_in, 0, SSA_BATCH_SIZE * stride * sizeof(double));
 
-            // Pack reversed u vectors (buffer already zeroed)
             for (int i = 0; i < batch_count; i++)
             {
                 const double *u = &U_block[(col + i) * L];
                 double *dst = ws_in + i * stride;
-
                 for (int j = 0; j < L; j++)
                 {
                     dst[2 * j] = u[L - 1 - j];
                 }
             }
 
-            // Batch forward FFT (NOT_INPLACE)
+            // Batched FFT → multiply → IFFT
             DftiComputeForward(ssa->fft_batch_c2c, ws_in, ws_out);
 
-            // Complex multiply with FFT(x)
             for (int i = 0; i < batch_count; i++)
             {
                 double *fft_u = ws_out + i * stride;
@@ -972,7 +861,6 @@ extern "C"
                       (MKL_Complex16 *)fft_u);
             }
 
-            // Batch inverse FFT (NOT_INPLACE)
             DftiComputeBackward(ssa->fft_batch_c2c, ws_out, ws_in);
 
             // Extract results: conv[L-1 : L-1+K]
@@ -987,11 +875,9 @@ extern "C"
         }
     }
 
-#endif // SSA_USE_MKL
-
-    // ----------------------------------------------------------------------------
-    // Core API
-    // ----------------------------------------------------------------------------
+    // ============================================================================
+    // INITIALIZATION
+    // ============================================================================
 
     int ssa_opt_init(SSA_Opt *ssa, const double *x, int N, int L)
     {
@@ -1002,56 +888,56 @@ extern "C"
 
         memset(ssa, 0, sizeof(SSA_Opt));
 
+        // Store dimensions
         ssa->N = N;
         ssa->L = L;
-        ssa->K = N - L + 1;
+        ssa->K = N - L + 1; // Number of lagged vectors in trajectory matrix
 
+        // FFT length: next power of 2 ≥ convolution length
         int conv_len = N + ssa->K - 1;
         int fft_n = ssa_opt_next_pow2(conv_len);
         ssa->fft_len = fft_n;
 
-        size_t fft_size = 2 * fft_n * sizeof(double);
+        // -------------------------------------------------------------------------
+        // Allocate workspace buffers (all allocations done here, none in hot paths)
+        // -------------------------------------------------------------------------
+        size_t fft_size = 2 * fft_n * sizeof(double); // Interleaved complex
         size_t vec_size = ssa_opt_max(L, ssa->K) * sizeof(double);
 
-        ssa->fft_x = (double *)ssa_opt_alloc(fft_size);
-        ssa->ws_fft1 = (double *)ssa_opt_alloc(fft_size);
-        ssa->ws_fft2 = (double *)ssa_opt_alloc(fft_size);
+        ssa->fft_x = (double *)ssa_opt_alloc(fft_size);                 // Precomputed FFT(x)
+        ssa->ws_fft1 = (double *)ssa_opt_alloc(fft_size);               // FFT workspace 1
+        ssa->ws_fft2 = (double *)ssa_opt_alloc(fft_size);               // FFT workspace 2
+        ssa->ws_real = (double *)ssa_opt_alloc(fft_n * sizeof(double)); // Real scratch
+        ssa->ws_v = (double *)ssa_opt_alloc(vec_size);                  // Vector scratch (v)
+        ssa->ws_u = (double *)ssa_opt_alloc(vec_size);                  // Vector scratch (u)
 
-        if (!ssa->fft_x || !ssa->ws_fft1 || !ssa->ws_fft2)
-        {
-            ssa_opt_free(ssa);
-            return -1;
-        }
-
-#ifdef SSA_USE_MKL
-        ssa->ws_real = (double *)ssa_opt_alloc(fft_n * sizeof(double));
-        ssa->ws_v = (double *)ssa_opt_alloc(vec_size);
-        ssa->ws_u = (double *)ssa_opt_alloc(vec_size);
-
+        // Batch workspace for block methods (SSA_BATCH_SIZE simultaneous transforms)
         size_t batch_size = 2 * fft_n * SSA_BATCH_SIZE * sizeof(double);
-
         ssa->ws_batch_u = (double *)ssa_opt_alloc(batch_size);
         ssa->ws_batch_v = (double *)ssa_opt_alloc(batch_size);
-        ssa->ws_batch_out = (double *)ssa_opt_alloc(batch_size);
+        ssa->ws_batch_out = (double *)ssa_opt_alloc(batch_size); // For NOT_INPLACE FFT
 
-        if (!ssa->ws_batch_u || !ssa->ws_batch_v || !ssa->ws_batch_out)
+        if (!ssa->fft_x || !ssa->ws_fft1 || !ssa->ws_fft2 || !ssa->ws_real ||
+            !ssa->ws_v || !ssa->ws_u || !ssa->ws_batch_u || !ssa->ws_batch_v || !ssa->ws_batch_out)
         {
             ssa_opt_free(ssa);
             return -1;
         }
 
+        // -------------------------------------------------------------------------
+        // Create MKL FFT descriptors
+        // -------------------------------------------------------------------------
         MKL_LONG status;
 
+        // Single FFT descriptor (in-place, for sequential matvec)
         status = DftiCreateDescriptor(&ssa->fft_handle, DFTI_DOUBLE, DFTI_COMPLEX, 1, fft_n);
         if (status != 0)
         {
             ssa_opt_free(ssa);
             return -1;
         }
-
         DftiSetValue(ssa->fft_handle, DFTI_PLACEMENT, DFTI_INPLACE);
-        DftiSetValue(ssa->fft_handle, DFTI_BACKWARD_SCALE, 1.0 / fft_n);
-
+        DftiSetValue(ssa->fft_handle, DFTI_BACKWARD_SCALE, 1.0 / fft_n); // Auto-scale IFFT
         status = DftiCommitDescriptor(ssa->fft_handle);
         if (status != 0)
         {
@@ -1059,19 +945,18 @@ extern "C"
             return -1;
         }
 
+        // Batched FFT descriptor (NOT_INPLACE - faster for block operations)
         status = DftiCreateDescriptor(&ssa->fft_batch_c2c, DFTI_DOUBLE, DFTI_COMPLEX, 1, fft_n);
         if (status != 0)
         {
             ssa_opt_free(ssa);
             return -1;
         }
-
         DftiSetValue(ssa->fft_batch_c2c, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
         DftiSetValue(ssa->fft_batch_c2c, DFTI_BACKWARD_SCALE, 1.0 / fft_n);
         DftiSetValue(ssa->fft_batch_c2c, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)SSA_BATCH_SIZE);
-        DftiSetValue(ssa->fft_batch_c2c, DFTI_INPUT_DISTANCE, (MKL_LONG)fft_n);
-        DftiSetValue(ssa->fft_batch_c2c, DFTI_OUTPUT_DISTANCE, (MKL_LONG)fft_n);
-
+        DftiSetValue(ssa->fft_batch_c2c, DFTI_INPUT_DISTANCE, (MKL_LONG)fft_n);  // Stride between inputs
+        DftiSetValue(ssa->fft_batch_c2c, DFTI_OUTPUT_DISTANCE, (MKL_LONG)fft_n); // Stride between outputs
         status = DftiCommitDescriptor(ssa->fft_batch_c2c);
         if (status != 0)
         {
@@ -1079,19 +964,18 @@ extern "C"
             return -1;
         }
 
+        // Batched FFT descriptor (INPLACE - for reconstruction)
         status = DftiCreateDescriptor(&ssa->fft_batch_inplace, DFTI_DOUBLE, DFTI_COMPLEX, 1, fft_n);
         if (status != 0)
         {
             ssa_opt_free(ssa);
             return -1;
         }
-
         DftiSetValue(ssa->fft_batch_inplace, DFTI_PLACEMENT, DFTI_INPLACE);
         DftiSetValue(ssa->fft_batch_inplace, DFTI_BACKWARD_SCALE, 1.0 / fft_n);
         DftiSetValue(ssa->fft_batch_inplace, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)SSA_BATCH_SIZE);
         DftiSetValue(ssa->fft_batch_inplace, DFTI_INPUT_DISTANCE, (MKL_LONG)fft_n);
         DftiSetValue(ssa->fft_batch_inplace, DFTI_OUTPUT_DISTANCE, (MKL_LONG)fft_n);
-
         status = DftiCommitDescriptor(ssa->fft_batch_inplace);
         if (status != 0)
         {
@@ -1099,20 +983,18 @@ extern "C"
             return -1;
         }
 
+        // RNG
         status = vslNewStream(&ssa->rng, VSL_BRNG_MT2203, 42);
         if (status != VSL_STATUS_OK)
         {
             ssa_opt_free(ssa);
             return -1;
         }
-#endif
 
-        // Precompute FFT(x) — reused by all matvec and reconstruction operations
+        // Precompute FFT(x)
         ssa_opt_fft_r2c(ssa, x, N, ssa->fft_x);
 
-        // Precompute inverse diagonal counts for reconstruction
-        // count[t] = number of matrix elements on anti-diagonal t
-        // Precomputing 1/count avoids division in reconstruct hot path
+        // Precompute inverse diagonal counts
         ssa->inv_diag_count = (double *)ssa_opt_alloc(N * sizeof(double));
         if (!ssa->inv_diag_count)
         {
@@ -1131,6 +1013,15 @@ extern "C"
 
     // ============================================================================
     // SEQUENTIAL POWER ITERATION DECOMPOSITION
+    //
+    // Algorithm: Compute k singular triplets one at a time using power iteration
+    // with deflation. For each component i:
+    //   1. Initialize v randomly, orthogonalize against v₀..vᵢ₋₁
+    //   2. Iterate: u = H@v, orthog against u₀..uᵢ₋₁, v = Hᵀ@u, orthog, normalize
+    //   3. Converged when |vₙₑᵥ - vₒₗₐ| < tol
+    //   4. Extract σᵢ = ‖H@v‖, store uᵢ, vᵢ
+    //
+    // Complexity: O(k × max_iter × N log N)
     // ============================================================================
 
     int ssa_opt_decompose(SSA_Opt *ssa, int k, int max_iter)
@@ -1146,12 +1037,13 @@ extern "C"
         int L = ssa->L;
         int K = ssa->K;
 
-        k = ssa_opt_min(k, ssa_opt_min(L, K));
+        k = ssa_opt_min(k, ssa_opt_min(L, K)); // Can't compute more than rank
 
-        ssa->U = (double *)ssa_opt_alloc(L * k * sizeof(double));
-        ssa->V = (double *)ssa_opt_alloc(K * k * sizeof(double));
-        ssa->sigma = (double *)ssa_opt_alloc(k * sizeof(double));
-        ssa->eigenvalues = (double *)ssa_opt_alloc(k * sizeof(double));
+        // Allocate result storage
+        ssa->U = (double *)ssa_opt_alloc(L * k * sizeof(double));       // Left singular vectors
+        ssa->V = (double *)ssa_opt_alloc(K * k * sizeof(double));       // Right singular vectors
+        ssa->sigma = (double *)ssa_opt_alloc(k * sizeof(double));       // Singular values
+        ssa->eigenvalues = (double *)ssa_opt_alloc(k * sizeof(double)); // σ² values
 
         if (!ssa->U || !ssa->V || !ssa->sigma || !ssa->eigenvalues)
         {
@@ -1160,100 +1052,61 @@ extern "C"
 
         ssa->n_components = k;
 
-#ifdef SSA_USE_MKL
+        // Use preallocated workspace for iteration
         double *u = ssa->ws_u;
         double *v = ssa->ws_v;
         double *v_new = (double *)ssa_opt_alloc(K * sizeof(double));
 
+        // Projection coefficients for GEMM-based orthogonalization
         ssa->ws_proj = (double *)ssa_opt_alloc(k * sizeof(double));
         if (!ssa->ws_proj || !v_new)
         {
             ssa_opt_free_ptr(v_new);
             return -1;
         }
-#else
-        double *u = (double *)ssa_opt_alloc(L * sizeof(double));
-        double *v = (double *)ssa_opt_alloc(K * sizeof(double));
-        double *v_new = (double *)ssa_opt_alloc(K * sizeof(double));
-#endif
-
-        if (!v_new)
-            return -1;
-
-#ifndef SSA_USE_MKL
-        unsigned int seed = 42;
-#endif
 
         ssa->total_variance = 0.0;
 
+        // -------------------------------------------------------------------------
+        // Main loop: compute one singular triplet per iteration
+        // -------------------------------------------------------------------------
         for (int comp = 0; comp < k; comp++)
         {
-#ifdef SSA_USE_MKL
+            // Random initialization using MKL RNG
             vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, ssa->rng, K, v, -0.5, 0.5);
-#else
-            for (int i = 0; i < K; i++)
-            {
-                seed = seed * 1103515245 + 12345;
-                v[i] = (double)((seed >> 16) & 0x7fff) / 32768.0 - 0.5;
-            }
-#endif
 
+            // Orthogonalize against previous V's using GEMM
+            // v = v - V_prev @ (V_prevᵀ @ v)
             if (comp > 0)
             {
-#ifdef SSA_USE_MKL
                 cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                             1.0, ssa->V, K, v, 1, 0.0, ssa->ws_proj, 1);
                 cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                             -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v, 1);
-#else
-                for (int j = 0; j < comp; j++)
-                {
-                    double *v_j = &ssa->V[j * K];
-                    double dot = ssa_opt_dot(v, v_j, K);
-                    ssa_opt_axpy(v, v_j, -dot, K);
-                }
-#endif
             }
             ssa_opt_normalize(v, K);
 
+            // Power iteration
             for (int iter = 0; iter < max_iter; iter++)
             {
                 ssa_opt_hankel_matvec(ssa, v, u);
 
                 if (comp > 0)
                 {
-#ifdef SSA_USE_MKL
                     cblas_dgemv(CblasColMajor, CblasTrans, L, comp,
                                 1.0, ssa->U, L, u, 1, 0.0, ssa->ws_proj, 1);
                     cblas_dgemv(CblasColMajor, CblasNoTrans, L, comp,
                                 -1.0, ssa->U, L, ssa->ws_proj, 1, 1.0, u, 1);
-#else
-                    for (int j = 0; j < comp; j++)
-                    {
-                        double *u_j = &ssa->U[j * L];
-                        double dot = ssa_opt_dot(u, u_j, L);
-                        ssa_opt_axpy(u, u_j, -dot, L);
-                    }
-#endif
                 }
 
                 ssa_opt_hankel_matvec_T(ssa, u, v_new);
 
                 if (comp > 0)
                 {
-#ifdef SSA_USE_MKL
                     cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                                 1.0, ssa->V, K, v_new, 1, 0.0, ssa->ws_proj, 1);
                     cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                                 -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v_new, 1);
-#else
-                    for (int j = 0; j < comp; j++)
-                    {
-                        double *v_j = &ssa->V[j * K];
-                        double dot = ssa_opt_dot(v_new, v_j, K);
-                        ssa_opt_axpy(v_new, v_j, -dot, K);
-                    }
-#endif
                 }
 
                 ssa_opt_normalize(v_new, K);
@@ -1271,22 +1124,13 @@ extern "C"
                     break;
             }
 
-            // Final orthogonalization and SVD consistency
+            // Final orthogonalization
             if (comp > 0)
             {
-#ifdef SSA_USE_MKL
                 cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                             1.0, ssa->V, K, v, 1, 0.0, ssa->ws_proj, 1);
                 cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                             -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v, 1);
-#else
-                for (int j = 0; j < comp; j++)
-                {
-                    double *v_j = &ssa->V[j * K];
-                    double dot = ssa_opt_dot(v, v_j, K);
-                    ssa_opt_axpy(v, v_j, -dot, K);
-                }
-#endif
             }
             ssa_opt_normalize(v, K);
 
@@ -1294,19 +1138,10 @@ extern "C"
 
             if (comp > 0)
             {
-#ifdef SSA_USE_MKL
                 cblas_dgemv(CblasColMajor, CblasTrans, L, comp,
                             1.0, ssa->U, L, u, 1, 0.0, ssa->ws_proj, 1);
                 cblas_dgemv(CblasColMajor, CblasNoTrans, L, comp,
                             -1.0, ssa->U, L, ssa->ws_proj, 1, 1.0, u, 1);
-#else
-                for (int j = 0; j < comp; j++)
-                {
-                    double *u_j = &ssa->U[j * L];
-                    double dot = ssa_opt_dot(u, u_j, L);
-                    ssa_opt_axpy(u, u_j, -dot, L);
-                }
-#endif
             }
 
             double sigma = ssa_opt_normalize(u, L);
@@ -1315,19 +1150,10 @@ extern "C"
 
             if (comp > 0)
             {
-#ifdef SSA_USE_MKL
                 cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                             1.0, ssa->V, K, v, 1, 0.0, ssa->ws_proj, 1);
                 cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                             -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v, 1);
-#else
-                for (int j = 0; j < comp; j++)
-                {
-                    double *v_j = &ssa->V[j * K];
-                    double dot = ssa_opt_dot(v, v_j, K);
-                    ssa_opt_axpy(v, v_j, -dot, K);
-                }
-#endif
             }
 
             if (sigma > 1e-15)
@@ -1357,23 +1183,8 @@ extern "C"
                     ssa->eigenvalues[i] = ssa->eigenvalues[j];
                     ssa->eigenvalues[j] = tmp;
 
-#ifdef SSA_USE_MKL
                     cblas_dswap(L, &ssa->U[i * L], 1, &ssa->U[j * L], 1);
                     cblas_dswap(K, &ssa->V[i * K], 1, &ssa->V[j * K], 1);
-#else
-                    for (int t = 0; t < L; t++)
-                    {
-                        tmp = ssa->U[i * L + t];
-                        ssa->U[i * L + t] = ssa->U[j * L + t];
-                        ssa->U[j * L + t] = tmp;
-                    }
-                    for (int t = 0; t < K; t++)
-                    {
-                        tmp = ssa->V[i * K + t];
-                        ssa->V[i * K + t] = ssa->V[j * K + t];
-                        ssa->V[j * K + t] = tmp;
-                    }
-#endif
                 }
             }
         }
@@ -1392,25 +1203,20 @@ extern "C"
         }
 
         ssa_opt_free_ptr(v_new);
-#ifndef SSA_USE_MKL
-        ssa_opt_free_ptr(u);
-        ssa_opt_free_ptr(v);
-#endif
 
         ssa->decomposed = true;
         return 0;
     }
 
-    // ============================================================================
-    // INCREMENTAL DECOMPOSITION (EXTEND)
-    // ============================================================================
+    // ----------------------------------------------------------------------------
+    // Incremental Decomposition (Extend)
+    // ----------------------------------------------------------------------------
 
     int ssa_opt_extend(SSA_Opt *ssa, int additional_k, int max_iter)
     {
         if (!ssa || !ssa->decomposed || additional_k < 1)
             return -1;
 
-        // Invalidate cached FFTs since we're adding new components
         ssa_opt_free_cached_ffts(ssa);
 
         int L = ssa->L;
@@ -1437,13 +1243,11 @@ extern "C"
             return -1;
         }
 
-        // Copy existing components
         memcpy(U_new, ssa->U, L * old_k * sizeof(double));
         memcpy(V_new, ssa->V, K * old_k * sizeof(double));
         memcpy(sigma_new, ssa->sigma, old_k * sizeof(double));
         memcpy(eigen_new, ssa->eigenvalues, old_k * sizeof(double));
 
-        // Swap pointers
         ssa_opt_free_ptr(ssa->U);
         ssa_opt_free_ptr(ssa->V);
         ssa_opt_free_ptr(ssa->sigma);
@@ -1454,9 +1258,7 @@ extern "C"
         ssa->sigma = sigma_new;
         ssa->eigenvalues = eigen_new;
 
-        // Workspace for iteration
-#ifdef SSA_USE_MKL
-        // Reallocate projection workspace if needed
+        // Reallocate projection workspace
         if (ssa->ws_proj)
         {
             ssa_opt_free_ptr(ssa->ws_proj);
@@ -1467,99 +1269,39 @@ extern "C"
 
         double *u = ssa->ws_u;
         double *v = ssa->ws_v;
-#else
-        double *u = (double *)ssa_opt_alloc(L * sizeof(double));
-        double *v = (double *)ssa_opt_alloc(K * sizeof(double));
-        if (!u || !v)
-        {
-            ssa_opt_free_ptr(u);
-            ssa_opt_free_ptr(v);
-            return -1;
-        }
-#endif
         double *v_new = (double *)ssa_opt_alloc(K * sizeof(double));
         if (!v_new)
-        {
-#ifndef SSA_USE_MKL
-            ssa_opt_free_ptr(u);
-            ssa_opt_free_ptr(v);
-#endif
             return -1;
-        }
 
         // Compute additional components
         for (int comp = old_k; comp < new_k; comp++)
         {
-            // Initialize v randomly
-#ifdef SSA_USE_MKL
             vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, ssa->rng, K, v, -0.5, 0.5);
-#else
-            static unsigned int seed = 12345;
-            for (int i = 0; i < K; i++)
-            {
-                seed = seed * 1103515245 + 12345;
-                v[i] = (double)((seed >> 16) & 0x7fff) / 32768.0 - 0.5;
-            }
-#endif
 
-            // Orthogonalize against ALL existing components (0..comp-1)
-#ifdef SSA_USE_MKL
             cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                         1.0, ssa->V, K, v, 1, 0.0, ssa->ws_proj, 1);
             cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                         -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v, 1);
-#else
-            for (int j = 0; j < comp; j++)
-            {
-                double *v_j = &ssa->V[j * K];
-                double dot = ssa_opt_dot(v, v_j, K);
-                ssa_opt_axpy(v, v_j, -dot, K);
-            }
-#endif
             ssa_opt_normalize(v, K);
 
-            // Power iteration
             for (int iter = 0; iter < max_iter; iter++)
             {
-                // u = H @ v
                 ssa_opt_hankel_matvec(ssa, v, u);
 
-                // Orthogonalize u against all previous u's
-#ifdef SSA_USE_MKL
                 cblas_dgemv(CblasColMajor, CblasTrans, L, comp,
                             1.0, ssa->U, L, u, 1, 0.0, ssa->ws_proj, 1);
                 cblas_dgemv(CblasColMajor, CblasNoTrans, L, comp,
                             -1.0, ssa->U, L, ssa->ws_proj, 1, 1.0, u, 1);
-#else
-                for (int j = 0; j < comp; j++)
-                {
-                    double *u_j = &ssa->U[j * L];
-                    double dot = ssa_opt_dot(u, u_j, L);
-                    ssa_opt_axpy(u, u_j, -dot, L);
-                }
-#endif
                 ssa_opt_normalize(u, L);
 
-                // v_new = H^T @ u
                 ssa_opt_hankel_matvec_T(ssa, u, v_new);
 
-                // Orthogonalize v_new against all previous v's
-#ifdef SSA_USE_MKL
                 cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                             1.0, ssa->V, K, v_new, 1, 0.0, ssa->ws_proj, 1);
                 cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                             -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v_new, 1);
-#else
-                for (int j = 0; j < comp; j++)
-                {
-                    double *v_j = &ssa->V[j * K];
-                    double dot = ssa_opt_dot(v_new, v_j, K);
-                    ssa_opt_axpy(v_new, v_j, -dot, K);
-                }
-#endif
                 ssa_opt_normalize(v_new, K);
 
-                // Convergence check
                 double diff = 0.0;
                 for (int i = 0; i < K; i++)
                 {
@@ -1572,71 +1314,34 @@ extern "C"
                     break;
             }
 
-            // =========================================================
-            // Final orthogonalization and SVD consistency
-            // Same procedure as in ssa_opt_decompose
-            // =========================================================
-
-            // Step 1: Final orthogonalization of v
-#ifdef SSA_USE_MKL
+            // Final orthogonalization
             cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                         1.0, ssa->V, K, v, 1, 0.0, ssa->ws_proj, 1);
             cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                         -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v, 1);
-#else
-            for (int j = 0; j < comp; j++)
-            {
-                double *v_j = &ssa->V[j * K];
-                double dot = ssa_opt_dot(v, v_j, K);
-                ssa_opt_axpy(v, v_j, -dot, K);
-            }
-#endif
             ssa_opt_normalize(v, K);
 
-            // Step 2: Compute u = H @ v
             ssa_opt_hankel_matvec(ssa, v, u);
 
-            // Step 3: Orthogonalize u and extract sigma
-#ifdef SSA_USE_MKL
             cblas_dgemv(CblasColMajor, CblasTrans, L, comp,
                         1.0, ssa->U, L, u, 1, 0.0, ssa->ws_proj, 1);
             cblas_dgemv(CblasColMajor, CblasNoTrans, L, comp,
                         -1.0, ssa->U, L, ssa->ws_proj, 1, 1.0, u, 1);
-#else
-            for (int j = 0; j < comp; j++)
-            {
-                double *u_j = &ssa->U[j * L];
-                double dot = ssa_opt_dot(u, u_j, L);
-                ssa_opt_axpy(u, u_j, -dot, L);
-            }
-#endif
+
             double sigma = ssa_opt_normalize(u, L);
 
-            // Step 4: Recompute v = H^T @ u for SVD consistency
             ssa_opt_hankel_matvec_T(ssa, u, v);
 
-            // Step 5: Orthogonalize v and scale by 1/sigma
-#ifdef SSA_USE_MKL
             cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                         1.0, ssa->V, K, v, 1, 0.0, ssa->ws_proj, 1);
             cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                         -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v, 1);
-#else
-            for (int j = 0; j < comp; j++)
-            {
-                double *v_j = &ssa->V[j * K];
-                double dot = ssa_opt_dot(v, v_j, K);
-                ssa_opt_axpy(v, v_j, -dot, K);
-            }
-#endif
 
-            // Scale v by 1/sigma to maintain SVD relationship
             if (sigma > 1e-15)
             {
                 ssa_opt_scal(v, K, 1.0 / sigma);
             }
 
-            // Store results
             ssa_opt_copy(u, &ssa->U[comp * L], L);
             ssa_opt_copy(v, &ssa->V[comp * K], K);
             ssa->sigma[comp] = sigma;
@@ -1644,11 +1349,7 @@ extern "C"
             ssa->total_variance += sigma * sigma;
         }
 
-        // Sort NEW components by descending singular value
-        // (Keep existing components in place, sort only the new ones among themselves,
-        // then merge into correct positions)
-        // Actually, for simplicity, just re-sort everything - it's O(k^2) but k is small
-
+        // Sort all components
         for (int i = 0; i < new_k - 1; i++)
         {
             for (int j = i + 1; j < new_k; j++)
@@ -1663,23 +1364,8 @@ extern "C"
                     ssa->eigenvalues[i] = ssa->eigenvalues[j];
                     ssa->eigenvalues[j] = tmp;
 
-#ifdef SSA_USE_MKL
                     cblas_dswap(L, &ssa->U[i * L], 1, &ssa->U[j * L], 1);
                     cblas_dswap(K, &ssa->V[i * K], 1, &ssa->V[j * K], 1);
-#else
-                    for (int t = 0; t < L; t++)
-                    {
-                        tmp = ssa->U[i * L + t];
-                        ssa->U[i * L + t] = ssa->U[j * L + t];
-                        ssa->U[j * L + t] = tmp;
-                    }
-                    for (int t = 0; t < K; t++)
-                    {
-                        tmp = ssa->V[i * K + t];
-                        ssa->V[i * K + t] = ssa->V[j * K + t];
-                        ssa->V[j * K + t] = tmp;
-                    }
-#endif
                 }
             }
         }
@@ -1698,72 +1384,26 @@ extern "C"
         }
 
         ssa->n_components = new_k;
-
         ssa_opt_free_ptr(v_new);
-#ifndef SSA_USE_MKL
-        ssa_opt_free_ptr(u);
-        ssa_opt_free_ptr(v);
-#endif
 
         return 0;
     }
 
     // ============================================================================
-    // BLOCK POWER METHOD DECOMPOSITION (Phase 2)
+    // BLOCK POWER METHOD DECOMPOSITION
+    //
+    // Algorithm: Process b vectors simultaneously instead of one at a time.
+    // Key optimizations over sequential method:
+    //   1. Batched FFT operations (amortize descriptor overhead)
+    //   2. GEMM-based orthogonalization (vs loop of dot/axpy)
+    //   3. Periodic QR (every 5 iters vs every iter)
+    //   4. Rayleigh-Ritz refinement for accurate singular values
+    //
+    // Complexity: O(max_iter × N log N) for all k components together
+    // (vs O(k × max_iter × N log N) for sequential)
+    //
+    // Speedup: ~3x faster than sequential for k ≥ block_size
     // ============================================================================
-    //
-    // MATHEMATICAL OPERATION:
-    //   Compute k singular triplets (σᵢ, uᵢ, vᵢ) of the Hankel matrix H.
-    //
-    // TEXTBOOK APPROACH (Sequential Power Iteration):
-    //   for i = 1 to k:
-    //       v = random()
-    //       for iter = 1 to max_iter:
-    //           u = H @ v;  u = u / ‖u‖
-    //           v = Hᵀ @ u; v = v / ‖v‖
-    //       σᵢ = ‖H @ v‖
-    //       deflate H
-    //
-    //   Problem: Each component needs separate iteration to converge.
-    //   For k=32, max_iter=100: 6400 matvec calls.
-    //
-    // THIS IMPLEMENTATION (Block Subspace Iteration):
-    //   Process b vectors simultaneously:
-    //       V = random(K, b)
-    //       for iter = 1 to max_iter:
-    //           U = H @ V;    U = QR(U)
-    //           V = Hᵀ @ U;   V = QR(V)
-    //       [σ, U, V] = Rayleigh-Ritz(U, V)
-    //
-    //   For k=32, b=32: All components converge together in ~100 iterations.
-    //   Matvec calls: 200 batched operations (each processes 32 vectors).
-    //
-    // KEY OPTIMIZATIONS:
-    //
-    //   [1] BATCHED FFT (see ssa_opt_hankel_matvec_block)
-    //       Instead of 32 individual FFT calls, one batched MKL call.
-    //       Amortizes descriptor overhead, enables cross-transform SIMD.
-    //
-    //   [2] PERIODIC QR (every 5 iterations instead of every iteration)
-    //       QR factorization is O(n × b²), expensive for large n.
-    //       Subspace angles drift slowly for well-separated singular values.
-    //       Doing QR every 5 iterations reduces QR cost by 5x with <0.1% accuracy loss.
-    //       Math: drift bounded by (σ_{b+1}/σ_b)^interval, negligible for decaying spectrum.
-    //
-    //   [3] GEMM-BASED ORTHOGONALIZATION (instead of Gram-Schmidt loops)
-    //       Deflation requires orthogonalizing against previous components.
-    //       Textbook: loop of dot products and axpy operations.
-    //       Optimized: proj = V_prevᵀ @ V_block (one GEMM), V -= V_prev @ proj (one GEMM).
-    //       GEMM is cache-optimized and SIMD-vectorized by MKL.
-    //
-    //   [4] RAYLEIGH-RITZ REFINEMENT (instead of reporting ‖Av‖ as σ)
-    //       After iteration, form M = Uᵀ @ H @ V (small b×b matrix).
-    //       SVD of M gives accurate σ even for clustered/repeated singular values.
-    //       Textbook power iteration fails for repeated eigenvalues; Rayleigh-Ritz handles them.
-    //
-    // ============================================================================
-
-#ifdef SSA_USE_MKL
 
     int ssa_opt_decompose_block(SSA_Opt *ssa, int k, int block_size, int max_iter)
     {
@@ -1772,7 +1412,6 @@ extern "C"
             return -1;
         }
 
-        // Invalidate any cached FFTs from previous decomposition
         ssa_opt_free_cached_ffts(ssa);
 
         int L = ssa->L;
@@ -1786,7 +1425,7 @@ extern "C"
         int b = ssa_opt_min(block_size, ssa_opt_min(k, ssa_opt_min(L, K)));
         k = ssa_opt_min(k, ssa_opt_min(L, K));
 
-        // Allocate results
+        // Allocate result storage
         ssa->U = (double *)ssa_opt_alloc(L * k * sizeof(double));
         ssa->V = (double *)ssa_opt_alloc(K * k * sizeof(double));
         ssa->sigma = (double *)ssa_opt_alloc(k * sizeof(double));
@@ -1800,21 +1439,23 @@ extern "C"
         ssa->n_components = k;
         ssa->total_variance = 0.0;
 
-        // Block workspace
-        double *V_block = (double *)ssa_opt_alloc(K * b * sizeof(double));
-        double *U_block = (double *)ssa_opt_alloc(L * b * sizeof(double));
+        // -------------------------------------------------------------------------
+        // Allocate block workspace
+        // -------------------------------------------------------------------------
+        double *V_block = (double *)ssa_opt_alloc(K * b * sizeof(double));  // Right subspace
+        double *U_block = (double *)ssa_opt_alloc(L * b * sizeof(double));  // Left subspace
         double *U_block2 = (double *)ssa_opt_alloc(L * b * sizeof(double)); // For Rayleigh-Ritz
-        double *tau_u = (double *)ssa_opt_alloc(b * sizeof(double));        // Householder coefficients for QR
+        double *tau_u = (double *)ssa_opt_alloc(b * sizeof(double));        // QR Householder coeffs
         double *tau_v = (double *)ssa_opt_alloc(b * sizeof(double));
 
-        // Rayleigh-Ritz workspace: M = Uᵀ @ H @ V is b×b
+        // Rayleigh-Ritz workspace: M = Uᵀ @ H @ V is b×b dense matrix
         double *M = (double *)ssa_opt_alloc(b * b * sizeof(double));
         double *U_small = (double *)ssa_opt_alloc(b * b * sizeof(double));  // SVD left vectors
-        double *Vt_small = (double *)ssa_opt_alloc(b * b * sizeof(double)); // SVD right vectors (transposed)
+        double *Vt_small = (double *)ssa_opt_alloc(b * b * sizeof(double)); // SVD right vectors
         double *S_small = (double *)ssa_opt_alloc(b * sizeof(double));      // SVD singular values
         double *superb = (double *)ssa_opt_alloc(b * sizeof(double));       // LAPACK workspace
 
-        // Workspace for GEMM-based orthogonalization
+        // GEMM workspace for deflation orthogonalization
         double *work = (double *)ssa_opt_alloc(ssa_opt_max(L, K) * b * sizeof(double));
 
         if (!V_block || !U_block || !U_block2 || !tau_u || !tau_v ||
@@ -1834,47 +1475,38 @@ extern "C"
             return -1;
         }
 
-        int comp = 0; // Components computed so far
+        int comp = 0;
 
         while (comp < k)
         {
-            int cur_b = ssa_opt_min(b, k - comp); // Last block may be smaller
+            int cur_b = ssa_opt_min(b, k - comp);
 
-            // Initialize V_block with random values (MKL VSL)
+            // Initialize V_block randomly
             vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, ssa->rng, K * cur_b, V_block, -0.5, 0.5);
 
-            // OPTIMIZATION [3]: GEMM-based orthogonalization against previous V's
-            // Textbook would use a loop: for each prev vector, subtract projection
-            // GEMM does it all at once: V_block -= V_prev @ (V_prevᵀ @ V_block)
+            // GEMM-based orthogonalization
             if (comp > 0)
             {
-                // proj = V_prevᵀ @ V_block  (comp × cur_b matrix)
                 cblas_dgemm(CblasColMajor, CblasTrans, CblasNoTrans,
                             comp, cur_b, K,
                             1.0, ssa->V, K, V_block, K,
                             0.0, work, comp);
-                // V_block = V_block - V_prev @ proj
                 cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
                             K, cur_b, comp,
                             -1.0, ssa->V, K, work, comp,
                             1.0, V_block, K);
             }
 
-            // Initial QR to get orthonormal starting basis
+            // Initial QR
             LAPACKE_dgeqrf(LAPACK_COL_MAJOR, K, cur_b, V_block, K, tau_v);
             LAPACKE_dorgqr(LAPACK_COL_MAJOR, K, cur_b, cur_b, V_block, K, tau_v);
 
-            // OPTIMIZATION [2]: Periodic QR instead of every-iteration QR
-            // Subspace drift is bounded by (σ_{next}/σ_current)^interval
-            // For SSA with decaying spectrum, this is negligible over 5 iterations
             const int QR_INTERVAL = 5;
 
             for (int iter = 0; iter < max_iter; iter++)
             {
-                // U_block = X @ V_block
                 ssa_opt_hankel_matvec_block(ssa, V_block, U_block, cur_b);
 
-                // Orthogonalize U against previously computed U's
                 if (comp > 0)
                 {
                     cblas_dgemm(CblasColMajor, CblasTrans, CblasNoTrans,
@@ -1887,17 +1519,14 @@ extern "C"
                                 1.0, U_block, L);
                 }
 
-                // Periodic QR for U_block
                 if ((iter % QR_INTERVAL == 0) || (iter == max_iter - 1))
                 {
                     LAPACKE_dgeqrf(LAPACK_COL_MAJOR, L, cur_b, U_block, L, tau_u);
                     LAPACKE_dorgqr(LAPACK_COL_MAJOR, L, cur_b, cur_b, U_block, L, tau_u);
                 }
 
-                // V_block = X^T @ U_block
                 ssa_opt_hankel_matvec_T_block(ssa, U_block, V_block, cur_b);
 
-                // Orthogonalize V against previously computed V's
                 if (comp > 0)
                 {
                     cblas_dgemm(CblasColMajor, CblasTrans, CblasNoTrans,
@@ -1910,10 +1539,6 @@ extern "C"
                                 1.0, V_block, K);
                 }
 
-                // Periodic QR for V_block
-                // Skip iter=0: initial QR already orthonormalized V_block, and we just
-                // recomputed it. The iter=0 U_block QR ensures U is orthonormal, so
-                // V_block = H^T @ U_block is reasonably well-conditioned for iter 1-4.
                 if ((iter > 0 && iter % QR_INTERVAL == 0) || (iter == max_iter - 1))
                 {
                     LAPACKE_dgeqrf(LAPACK_COL_MAJOR, K, cur_b, V_block, K, tau_v);
@@ -1921,24 +1546,9 @@ extern "C"
                 }
             }
 
-            // Final QR to ensure clean orthogonality before Rayleigh-Ritz
-            // (Already done as iter == max_iter - 1 triggers QR above)
-
-            // =====================================================================
-            // Rayleigh-Ritz: Extract singular values and refine singular vectors
-            //
-            // After convergence, U_block and V_block span the dominant subspaces.
-            // The optimal singular triplets within these subspaces are found by:
-            //   1. Compute M = U_block^T @ (X @ V_block)  (cur_b × cur_b)
-            //   2. SVD(M) = U_small @ Σ @ Vt_small
-            //   3. Rotate: U_final = U_block @ U_small
-            //              V_final = V_block @ V_small  (V_small = Vt_small^T)
-            // =====================================================================
-
-            // Step 1: U_block2 = X @ V_block
+            // Rayleigh-Ritz refinement
             ssa_opt_hankel_matvec_block(ssa, V_block, U_block2, cur_b);
 
-            // Orthogonalize U_block2 against previous U's (for numerical stability)
             if (comp > 0)
             {
                 cblas_dgemm(CblasColMajor, CblasTrans, CblasNoTrans,
@@ -1951,26 +1561,21 @@ extern "C"
                             1.0, U_block2, L);
             }
 
-            // Step 2: M = U_block^T @ U_block2  (cur_b × cur_b)
             cblas_dgemm(CblasColMajor, CblasTrans, CblasNoTrans,
                         cur_b, cur_b, L,
                         1.0, U_block, L, U_block2, L,
                         0.0, M, cur_b);
 
-            // Step 3: SVD of M → U_small, S_small, Vt_small
-            // M = U_small @ diag(S_small) @ Vt_small
             int svd_info = LAPACKE_dgesvd(LAPACK_COL_MAJOR, 'A', 'A',
                                           cur_b, cur_b, M, cur_b,
                                           S_small, U_small, cur_b, Vt_small, cur_b,
                                           superb);
             if (svd_info != 0)
             {
-                // SVD failed - fall back to column norm extraction
                 for (int i = 0; i < cur_b; i++)
                 {
                     S_small[i] = cblas_dnrm2(L, &U_block2[i * L], 1);
                 }
-                // Set U_small and Vt_small to identity
                 memset(U_small, 0, cur_b * cur_b * sizeof(double));
                 memset(Vt_small, 0, cur_b * cur_b * sizeof(double));
                 for (int i = 0; i < cur_b; i++)
@@ -1980,23 +1585,19 @@ extern "C"
                 }
             }
 
-            // Step 4: Rotate U_block by U_small
-            // U_rotated = U_block @ U_small  (L × cur_b)
-            // Store in U_block2 temporarily
+            // Rotate U_block by U_small
             cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
                         L, cur_b, cur_b,
                         1.0, U_block, L, U_small, cur_b,
                         0.0, U_block2, L);
 
-            // Step 5: Rotate V_block by V_small = Vt_small^T
-            // V_rotated = V_block @ Vt_small^T  (K × cur_b)
-            // Store in work temporarily (need K × cur_b space)
+            // Rotate V_block by V_small = Vt_small^T
             cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans,
                         K, cur_b, cur_b,
                         1.0, V_block, K, Vt_small, cur_b,
                         0.0, work, K);
 
-            // Copy rotated vectors to final results
+            // Copy to results
             for (int i = 0; i < cur_b; i++)
             {
                 double sigma = S_small[i];
@@ -2005,45 +1606,30 @@ extern "C"
                 ssa->eigenvalues[comp + i] = sigma * sigma;
                 ssa->total_variance += sigma * sigma;
 
-                // Copy U (already normalized by Rayleigh-Ritz)
                 cblas_dcopy(L, &U_block2[i * L], 1, &ssa->U[(comp + i) * L], 1);
-
-                // Copy V (already normalized by Rayleigh-Ritz)
                 cblas_dcopy(K, &work[i * K], 1, &ssa->V[(comp + i) * K], 1);
             }
 
-            // =====================================================================
-            // Final V refinement: Recompute V = (1/σ) * X^T @ U for SVD consistency
-            // Use batched GEMM for orthogonalization instead of per-vector GEMV
-            // =====================================================================
-
-            // Compute V_block = X^T @ U_block (for all cur_b vectors at once)
-            // U vectors are now in ssa->U[(comp)..(comp+cur_b)]
-            // First, pack them into U_block for batched operation
+            // Final V refinement
             for (int i = 0; i < cur_b; i++)
             {
                 cblas_dcopy(L, &ssa->U[(comp + i) * L], 1, &U_block[i * L], 1);
             }
 
-            // V_block = X^T @ U_block
             ssa_opt_hankel_matvec_T_block(ssa, U_block, V_block, cur_b);
 
-            // Orthogonalize all V_block columns against previous V's using GEMM
             if (comp > 0)
             {
-                // proj = V_prev^T @ V_block  (comp × cur_b)
                 cblas_dgemm(CblasColMajor, CblasTrans, CblasNoTrans,
                             comp, cur_b, K,
                             1.0, ssa->V, K, V_block, K,
                             0.0, work, comp);
-                // V_block = V_block - V_prev @ proj
                 cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
                             K, cur_b, comp,
                             -1.0, ssa->V, K, work, comp,
                             1.0, V_block, K);
             }
 
-            // Scale each V column by 1/σ and copy to results
             for (int i = 0; i < cur_b; i++)
             {
                 double sigma = ssa->sigma[comp + i];
@@ -2067,7 +1653,6 @@ extern "C"
             {
                 if (ssa->sigma[j] > ssa->sigma[i])
                 {
-                    // Swap scalars
                     double tmp = ssa->sigma[i];
                     ssa->sigma[i] = ssa->sigma[j];
                     ssa->sigma[j] = tmp;
@@ -2076,14 +1661,13 @@ extern "C"
                     ssa->eigenvalues[i] = ssa->eigenvalues[j];
                     ssa->eigenvalues[j] = tmp;
 
-                    // Swap vectors
                     cblas_dswap(L, &ssa->U[i * L], 1, &ssa->U[j * L], 1);
                     cblas_dswap(K, &ssa->V[i * K], 1, &ssa->V[j * K], 1);
                 }
             }
         }
 
-        // Fix sign convention: make sum(U) positive
+        // Fix sign convention
         for (int i = 0; i < k; i++)
         {
             double sum = 0;
@@ -2096,7 +1680,6 @@ extern "C"
             }
         }
 
-        // Cleanup
         ssa_opt_free_ptr(V_block);
         ssa_opt_free_ptr(U_block);
         ssa_opt_free_ptr(U_block2);
@@ -2114,50 +1697,25 @@ extern "C"
     }
 
     // ============================================================================
-    // RANDOMIZED SVD DECOMPOSITION (Phase 3)
-    // ============================================================================
+    // RANDOMIZED SVD DECOMPOSITION (Halko-Martinsson-Tropp)
     //
-    // MATHEMATICAL OPERATION:
-    //   Compute k singular triplets (σᵢ, uᵢ, vᵢ) of the Hankel matrix H.
+    // Algorithm: Only 2 passes over the data using random projection.
+    //   Pass 1 (Range Finding):
+    //     Ω = randn(K, k+p)      — Gaussian random test matrix
+    //     Y = H × Ω              — Sample column space (batched matvec)
+    //     Q = orth(Y)            — Orthonormal basis via QR
     //
-    // TEXTBOOK APPROACH (Power Iteration):
-    //   - Iterate many times until convergence
-    //   - For k=32, max_iter=100: ~6400 matvec calls
+    //   Pass 2 (Projection):
+    //     B = Hᵀ × Q             — Project onto basis (batched matvec transpose)
+    //     SVD(B) → Ũ, Σ, Ṽ      — Small dense SVD (MKL dgesdd)
+    //     U = Q × Ṽ, V = Ũ       — Recover full vectors
     //
-    // THIS IMPLEMENTATION (Halko-Martinsson-Tropp Randomized SVD):
-    //   Only TWO passes over the data:
+    // Complexity: O(2 × (k+p) × N log N) for all k components
+    // Speedup: ~15-25x faster than sequential method
     //
-    //   Pass 1: Range finding
-    //       Ω = randn(K, k+p)         — Gaussian random test matrix
-    //       Y = H @ Ω                 — Sample the range of H
-    //       Q = orth(Y)               — Orthonormal basis via QR
-    //
-    //   Pass 2: Projection
-    //       B = Hᵀ @ Q                — Project H onto Q
-    //       [Ũ, Σ, Ṽ] = SVD(B)        — Small dense SVD
-    //       U = Q @ Ṽ, V = Ũ          — Recover full vectors
-    //
-    //   For k=32, p=8: only 80 matvec calls (40 forward + 40 transpose)
-    //
-    // WHY THIS WORKS:
-    //   The random matrix Ω "probes" the column space of H.
-    //   For matrices with decaying singular values (like Hankel from time series),
-    //   Y = H @ Ω captures the dominant singular vectors with high probability.
-    //   Oversampling (p extra columns) provides a safety margin.
-    //
-    //   Theoretical guarantee: With p ≥ 4, the error is bounded by O(σ_{k+1})
-    //   which is the best possible (the next singular value we didn't compute).
-    //
-    // WHY NOT ALWAYS USE THIS?
-    //   - Requires 2 passes (streaming scenarios may prefer 1-pass methods)
-    //   - For very small k, overhead of QR + dense SVD may dominate
-    //   - Accuracy depends on singular value decay; slow decay → use power iteration
-    //
-    // REFERENCE:
-    //   Halko, Martinsson, Tropp. "Finding structure with randomness:
-    //   Probabilistic algorithms for constructing approximate matrix decompositions."
-    //   SIAM Review, 2011. (Algorithm 5.1)
-    //
+    // Reference: Halko, Martinsson, Tropp. "Finding structure with randomness:
+    //            Probabilistic algorithms for constructing approximate matrix
+    //            decompositions." SIAM Review, 2011. (Algorithm 5.1)
     // ============================================================================
 
     int ssa_opt_decompose_randomized(SSA_Opt *ssa, int k, int oversampling)
@@ -2167,21 +1725,20 @@ extern "C"
             return -1;
         }
 
-        // Invalidate any cached FFTs from previous decomposition
         ssa_opt_free_cached_ffts(ssa);
 
         int L = ssa->L;
         int K = ssa->K;
 
         // Oversampling p: extra columns for numerical stability
-        // p=8 is typical; larger p → more accurate but slower
+        // Larger p = more accurate but slower; p=8 is typical
         int p = (oversampling <= 0) ? 8 : oversampling;
         int kp = k + p;
 
         kp = ssa_opt_min(kp, ssa_opt_min(L, K));
         k = ssa_opt_min(k, kp);
 
-        // Allocate results
+        // Allocate result storage
         ssa->U = (double *)ssa_opt_alloc(L * k * sizeof(double));
         ssa->V = (double *)ssa_opt_alloc(K * k * sizeof(double));
         ssa->sigma = (double *)ssa_opt_alloc(k * sizeof(double));
@@ -2195,25 +1752,26 @@ extern "C"
         ssa->n_components = k;
         ssa->total_variance = 0.0;
 
-        // Workspace allocation
+        // -------------------------------------------------------------------------
+        // Allocate workspace for randomized SVD
+        // -------------------------------------------------------------------------
         double *Omega = (double *)ssa_opt_alloc(K * kp * sizeof(double)); // Random test matrix
-        double *Y = (double *)ssa_opt_alloc(L * kp * sizeof(double));     // Y = H @ Ω
+        double *Y = (double *)ssa_opt_alloc(L * kp * sizeof(double));     // Y = H × Ω
         double *Q = (double *)ssa_opt_alloc(L * kp * sizeof(double));     // Orthonormal basis
-        double *B = (double *)ssa_opt_alloc(K * kp * sizeof(double));     // B = Hᵀ @ Q
-        double *tau = (double *)ssa_opt_alloc(kp * sizeof(double));       // Householder coefficients
+        double *B = (double *)ssa_opt_alloc(K * kp * sizeof(double));     // B = Hᵀ × Q
+        double *tau = (double *)ssa_opt_alloc(kp * sizeof(double));       // QR Householder coeffs
 
-        // SVD workspace (divide-and-conquer via dgesdd is faster than dgesvd)
-        double *U_svd = (double *)ssa_opt_alloc(K * kp * sizeof(double));
-        double *Vt_svd = (double *)ssa_opt_alloc(kp * kp * sizeof(double));
-        double *S_svd = (double *)ssa_opt_alloc(kp * sizeof(double));
+        // Dense SVD workspace (divide-and-conquer via dgesdd)
+        double *U_svd = (double *)ssa_opt_alloc(K * kp * sizeof(double));   // SVD left vectors
+        double *Vt_svd = (double *)ssa_opt_alloc(kp * kp * sizeof(double)); // SVD right vectors
+        double *S_svd = (double *)ssa_opt_alloc(kp * sizeof(double));       // Singular values
 
-        // Query optimal LAPACK workspace
+        // Query optimal LAPACK workspace size
         double work_query;
         int *iwork = (int *)ssa_opt_alloc(8 * kp * sizeof(int));
         int lwork = -1;
         int info;
 
-        // Workspace query
         LAPACKE_dgesdd_work(LAPACK_COL_MAJOR, 'S', K, kp, B, K, S_svd,
                             U_svd, K, Vt_svd, kp, &work_query, lwork, iwork);
         lwork = (int)work_query + 1;
@@ -2234,37 +1792,27 @@ extern "C"
             return -1;
         }
 
-        // =========================================================================
-        // Step 1: Generate random Gaussian matrix Ω (K × kp)
-        // =========================================================================
+        // -------------------------------------------------------------------------
+        // Step 1: Generate random Gaussian test matrix Ω
+        // -------------------------------------------------------------------------
         vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, ssa->rng, K * kp, Omega, 0.0, 1.0);
 
-        // =========================================================================
-        // Step 2: Y = X @ Ω (range sampling via batched FFT matvec)
-        // =========================================================================
+        // -------------------------------------------------------------------------
+        // Step 2: Range sampling Y = H × Ω (batched FFT matvec)
+        // -------------------------------------------------------------------------
         ssa_opt_hankel_matvec_block(ssa, Omega, Y, kp);
 
-        // =========================================================================
-        // Step 3: Q = orth(Y) via QR factorization
-        // =========================================================================
-        // Copy Y to Q (dgeqrf overwrites input)
+        // -------------------------------------------------------------------------
+        // Step 3: Orthonormalize Q = orth(Y) via QR factorization
+        // -------------------------------------------------------------------------
         cblas_dcopy(L * kp, Y, 1, Q, 1);
-
-        // QR factorization: Q = Q * R (Q stored in-place, R discarded)
         LAPACKE_dgeqrf(LAPACK_COL_MAJOR, L, kp, Q, L, tau);
-
-        // Extract orthonormal Q by applying Householder reflectors
         LAPACKE_dorgqr(LAPACK_COL_MAJOR, L, kp, kp, Q, L, tau);
 
-        // =========================================================================
-        // Step 4: B = X^T @ Q (projection via batched FFT matvec transpose)
-        // =========================================================================
+        // Step 4: B = H^T @ Q
         ssa_opt_hankel_matvec_T_block(ssa, Q, B, kp);
 
-        // =========================================================================
-        // Step 5: SVD of small matrix B (K × kp)
-        // B = U_svd @ diag(S_svd) @ Vt_svd
-        // =========================================================================
+        // Step 5: SVD of B
         info = LAPACKE_dgesdd_work(LAPACK_COL_MAJOR, 'S', K, kp, B, K, S_svd,
                                    U_svd, K, Vt_svd, kp, work, lwork, iwork);
 
@@ -2283,34 +1831,27 @@ extern "C"
             return -1;
         }
 
-        // =========================================================================
-        // Step 6: Recover U and V
+        // -------------------------------------------------------------------------
+        // Step 6: Recover U and V from SVD of B
         //
-        // From B = U_svd @ Σ @ Vt_svd and B = X^T @ Q:
-        //   X^T @ Q = U_svd @ Σ @ Vt_svd
-        //   X ≈ Q @ V_svd @ Σ @ U_svd^T
+        // From B = U_svd × Σ × Vt_svd and B = Hᵀ × Q:
+        //   H ≈ Q × Vt_svdᵀ × Σ × U_svdᵀ
         //
-        // So: U_final = Q @ V_svd = Q @ Vt_svd^T
-        //     V_final = U_svd
-        //     σ_final = S_svd
-        // =========================================================================
-
-        // U = Q @ Vt_svd^T (only first k columns)
-        // Q is L × kp, Vt_svd is kp × kp, we want L × k
-        // Vt_svd^T[:, :k] = first k rows of Vt_svd transposed = first k columns of V_svd
+        // So: U_final = Q × Vt_svdᵀ (first k columns)
+        //     V_final = U_svd (first k columns)
+        //     σ_final = S_svd (first k values)
+        // -------------------------------------------------------------------------
         cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans,
                     L, k, kp,
                     1.0, Q, L, Vt_svd, kp,
                     0.0, ssa->U, L);
 
-        // V = U_svd[:, :k]
-        // U_svd is K × kp, we want K × k
         for (int i = 0; i < k; i++)
         {
             cblas_dcopy(K, &U_svd[i * K], 1, &ssa->V[i * K], 1);
         }
 
-        // Copy singular values and compute eigenvalues
+        // Copy singular values and compute eigenvalues (σ²)
         for (int i = 0; i < k; i++)
         {
             ssa->sigma[i] = S_svd[i];
@@ -2318,9 +1859,7 @@ extern "C"
             ssa->total_variance += ssa->eigenvalues[i];
         }
 
-        // =========================================================================
-        // Fix sign convention: make sum(U) positive
-        // =========================================================================
+        // Fix sign convention: make sum(U) positive for reproducibility
         for (int i = 0; i < k; i++)
         {
             double sum = 0;
@@ -2333,9 +1872,7 @@ extern "C"
             }
         }
 
-        // =========================================================================
-        // Cleanup
-        // =========================================================================
+        // Cleanup workspace
         ssa_opt_free_ptr(Omega);
         ssa_opt_free_ptr(Y);
         ssa_opt_free_ptr(Q);
@@ -2351,23 +1888,12 @@ extern "C"
         return 0;
     }
 
-#else
-    // Non-MKL fallback: use sequential decomposition
-    int ssa_opt_decompose_block(SSA_Opt *ssa, int k, int block_size, int max_iter)
-    {
-        (void)block_size; // Unused
-        return ssa_opt_decompose(ssa, k, max_iter);
-    }
-
-    int ssa_opt_decompose_randomized(SSA_Opt *ssa, int k, int oversampling)
-    {
-        (void)oversampling;                    // Unused
-        return ssa_opt_decompose(ssa, k, 200); // Fall back to power iteration
-    }
-#endif // SSA_USE_MKL
-
     // ============================================================================
-    // FFT CACHING FOR RECONSTRUCTION
+    // FFT CACHING FOR RECONSTRUCTION ACCELERATION
+    //
+    // Precomputes FFT(σᵢ × uᵢ) and FFT(vᵢ) for all components. Subsequent
+    // reconstruct() calls skip forward FFT step, saving 2k FFT operations.
+    // Typical speedup: 2-3x for workflows with multiple reconstructions.
     // ============================================================================
 
     void ssa_opt_free_cached_ffts(SSA_Opt *ssa)
@@ -2388,16 +1914,14 @@ extern "C"
             return -1;
         }
 
-        // Free any existing cached FFTs
         ssa_opt_free_cached_ffts(ssa);
 
         int L = ssa->L;
         int K = ssa->K;
         int fft_n = ssa->fft_len;
         int k = ssa->n_components;
-        size_t fft_size = 2 * fft_n; // Interleaved complex
+        size_t fft_size = 2 * fft_n;
 
-        // Allocate FFT cache
         ssa->U_fft = (double *)ssa_opt_alloc(fft_size * k * sizeof(double));
         ssa->V_fft = (double *)ssa_opt_alloc(fft_size * k * sizeof(double));
 
@@ -2407,43 +1931,6 @@ extern "C"
             return -1;
         }
 
-#ifdef SSA_USE_MKL
-        // Compute and cache FFT of each u_i (with sigma pre-scaling)
-        for (int i = 0; i < k; i++)
-        {
-            double sigma = ssa->sigma[i];
-            const double *u_vec = &ssa->U[i * L];
-            double *dst = &ssa->U_fft[i * fft_size];
-
-            // Zero-pad and pack into complex format
-            memset(dst, 0, fft_size * sizeof(double));
-            for (int j = 0; j < L; j++)
-            {
-                dst[2 * j] = sigma * u_vec[j]; // Pre-scale by sigma
-            }
-
-            // In-place FFT
-            DftiComputeForward(ssa->fft_handle, dst);
-        }
-
-        // Compute and cache FFT of each v_i
-        for (int i = 0; i < k; i++)
-        {
-            const double *v_vec = &ssa->V[i * K];
-            double *dst = &ssa->V_fft[i * fft_size];
-
-            // Zero-pad and pack into complex format
-            memset(dst, 0, fft_size * sizeof(double));
-            for (int j = 0; j < K; j++)
-            {
-                dst[2 * j] = v_vec[j];
-            }
-
-            // In-place FFT
-            DftiComputeForward(ssa->fft_handle, dst);
-        }
-#else
-        // Non-MKL fallback
         for (int i = 0; i < k; i++)
         {
             double sigma = ssa->sigma[i];
@@ -2455,7 +1942,7 @@ extern "C"
             {
                 dst[2 * j] = sigma * u_vec[j];
             }
-            ssa_opt_fft_builtin(dst, fft_n, -1);
+            DftiComputeForward(ssa->fft_handle, dst);
         }
 
         for (int i = 0; i < k; i++)
@@ -2468,9 +1955,8 @@ extern "C"
             {
                 dst[2 * j] = v_vec[j];
             }
-            ssa_opt_fft_builtin(dst, fft_n, -1);
+            DftiComputeForward(ssa->fft_handle, dst);
         }
-#endif
 
         ssa->fft_cached = true;
         return 0;
@@ -2478,6 +1964,21 @@ extern "C"
 
     // ============================================================================
     // SIGNAL RECONSTRUCTION
+    //
+    // Reconstructs time series from selected SSA components. Each component i
+    // contributes σᵢ × (uᵢ ⊗ vᵢ) where ⊗ is outer product forming an L×K matrix.
+    // The sum is converted back to a 1D signal via diagonal averaging (Hankelization).
+    //
+    // Key insight: The outer product uᵢ ⊗ vᵢ is equivalent to convolution:
+    //   (u ⊗ v)[row i, col j] = u[i] × v[j]
+    //   Diagonal sum: Σ u[i] × v[t-i] = conv(u, v)[t]
+    //
+    // This allows O(N log N) reconstruction per component via FFT, avoiding
+    // the O(L×K) explicit matrix formation.
+    //
+    // Two paths:
+    //   1. Fast path: If FFTs cached, skip forward FFT (saves 2k FFTs)
+    //   2. Standard path: Compute FFT(σu), FFT(v), multiply, IFFT
     // ============================================================================
 
     int ssa_opt_reconstruct(const SSA_Opt *ssa, const int *group, int n_group, double *output)
@@ -2491,24 +1992,25 @@ extern "C"
         int L = ssa->L;
         int K = ssa->K;
         int fft_n = ssa->fft_len;
-        size_t fft_size = 2 * fft_n;
+        size_t fft_size = 2 * fft_n; // Interleaved complex
 
         ssa_opt_zero(output, N);
 
-#ifdef SSA_USE_MKL
-        double *ws_u = ssa->ws_batch_u;
-        double *ws_v = ssa->ws_batch_v;
+        // Cast away const for workspace access (workspace not logically part of result)
+        SSA_Opt *ssa_mut = (SSA_Opt *)ssa;
+        double *ws_u = ssa_mut->ws_batch_u;
+        double *ws_v = ssa_mut->ws_batch_v;
         size_t stride = fft_size;
 
-        // Check if we can use cached FFTs
         if (ssa->fft_cached && ssa->U_fft && ssa->V_fft)
         {
-            // =========================================================
-            // FAST PATH: Use cached FFTs (skip forward FFT entirely)
-            // =========================================================
+            // =====================================================================
+            // FAST PATH: Use precomputed FFTs (skip forward FFT entirely)
+            // =====================================================================
             int g = 0;
             while (g < n_group)
             {
+                // Gather batch of valid component indices
                 int batch_count = 0;
                 int batch_indices[SSA_BATCH_SIZE];
 
@@ -2525,7 +2027,7 @@ extern "C"
                 if (batch_count == 0)
                     continue;
 
-                // Copy cached FFTs to workspace and multiply
+                // Element-wise complex multiply cached FFTs
                 for (int b = 0; b < batch_count; b++)
                 {
                     int idx = batch_indices[b];
@@ -2533,23 +2035,19 @@ extern "C"
                     const double *v_fft_cached = &ssa->V_fft[idx * fft_size];
                     double *dst = ws_u + b * stride;
 
-                    // Element-wise complex multiply directly into workspace
                     vzMul(fft_n, (const MKL_Complex16 *)u_fft_cached,
                           (const MKL_Complex16 *)v_fft_cached,
                           (MKL_Complex16 *)dst);
                 }
 
-                // Zero unused slots for batched IFFT
                 if (batch_count < SSA_BATCH_SIZE)
                 {
                     memset(ws_u + batch_count * stride, 0,
                            (SSA_BATCH_SIZE - batch_count) * stride * sizeof(double));
                 }
 
-                // Batched inverse FFT
-                DftiComputeBackward(ssa->fft_batch_inplace, ws_u);
+                DftiComputeBackward(ssa_mut->fft_batch_inplace, ws_u);
 
-                // Accumulate results
                 for (int b = 0; b < batch_count; b++)
                 {
                     double *conv = ws_u + b * stride;
@@ -2559,9 +2057,7 @@ extern "C"
         }
         else
         {
-            // =========================================================
-            // STANDARD PATH: Compute FFTs on the fly
-            // =========================================================
+            // Standard path
             int g = 0;
             while (g < n_group)
             {
@@ -2581,11 +2077,9 @@ extern "C"
                 if (batch_count == 0)
                     continue;
 
-                // Single memset for entire workspace
                 memset(ws_u, 0, SSA_BATCH_SIZE * stride * sizeof(double));
                 memset(ws_v, 0, SSA_BATCH_SIZE * stride * sizeof(double));
 
-                // Pack u vectors with σ pre-scaling
                 for (int b = 0; b < batch_count; b++)
                 {
                     int idx = batch_indices[b];
@@ -2599,7 +2093,6 @@ extern "C"
                     }
                 }
 
-                // Pack v vectors
                 for (int b = 0; b < batch_count; b++)
                 {
                     int idx = batch_indices[b];
@@ -2612,11 +2105,9 @@ extern "C"
                     }
                 }
 
-                // Batched forward FFT
-                DftiComputeForward(ssa->fft_batch_inplace, ws_u);
-                DftiComputeForward(ssa->fft_batch_inplace, ws_v);
+                DftiComputeForward(ssa_mut->fft_batch_inplace, ws_u);
+                DftiComputeForward(ssa_mut->fft_batch_inplace, ws_v);
 
-                // Element-wise complex multiply
                 for (int b = 0; b < batch_count; b++)
                 {
                     double *u_fft = ws_u + b * stride;
@@ -2625,10 +2116,8 @@ extern "C"
                           (MKL_Complex16 *)u_fft);
                 }
 
-                // Batched inverse FFT
-                DftiComputeBackward(ssa->fft_batch_inplace, ws_u);
+                DftiComputeBackward(ssa_mut->fft_batch_inplace, ws_u);
 
-                // Accumulate results
                 for (int b = 0; b < batch_count; b++)
                 {
                     double *conv = ws_u + b * stride;
@@ -2637,84 +2126,24 @@ extern "C"
             }
         }
 
-#else
-        // Non-MKL path
-        double *ws1 = ssa->ws_fft1;
-        double *ws2 = ssa->ws_fft2;
-
-        if (ssa->fft_cached && ssa->U_fft && ssa->V_fft)
-        {
-            // FAST PATH: Use cached FFTs
-            for (int g = 0; g < n_group; g++)
-            {
-                int idx = group[g];
-                if (idx < 0 || idx >= ssa->n_components)
-                    continue;
-
-                const double *u_fft_cached = &ssa->U_fft[idx * fft_size];
-                const double *v_fft_cached = &ssa->V_fft[idx * fft_size];
-
-                // Copy and multiply
-                ssa_opt_complex_mul(u_fft_cached, v_fft_cached, ws1, fft_n);
-                ssa_opt_fft_builtin(ws1, fft_n, 1);
-
-                for (int t = 0; t < N; t++)
-                {
-                    output[t] += ws1[2 * t];
-                }
-            }
-        }
-        else
-        {
-            // STANDARD PATH: Compute FFTs on the fly
-            for (int g = 0; g < n_group; g++)
-            {
-                int idx = group[g];
-                if (idx < 0 || idx >= ssa->n_components)
-                    continue;
-
-                double sigma = ssa->sigma[idx];
-                const double *u_vec = &ssa->U[idx * L];
-                const double *v_vec = &ssa->V[idx * K];
-
-                ssa_opt_zero(ws1, 2 * fft_n);
-                for (int i = 0; i < L; i++)
-                    ws1[2 * i] = sigma * u_vec[i];
-                ssa_opt_fft_builtin(ws1, fft_n, -1);
-
-                ssa_opt_zero(ws2, 2 * fft_n);
-                for (int i = 0; i < K; i++)
-                    ws2[2 * i] = v_vec[i];
-                ssa_opt_fft_builtin(ws2, fft_n, -1);
-
-                ssa_opt_complex_mul(ws1, ws2, ws1, fft_n);
-                ssa_opt_fft_builtin(ws1, fft_n, 1);
-
-                for (int t = 0; t < N; t++)
-                {
-                    output[t] += ws1[2 * t];
-                }
-            }
-        }
-#endif
-
-        // Diagonal averaging using precomputed inverse weights
-        // Uses multiplication instead of division (10-20x faster per element)
-#ifdef SSA_USE_MKL
-        // Vectorized multiply: output[t] *= inv_diag_count[t]
+        // Diagonal averaging
+        // Apply diagonal averaging weights using precomputed 1/count
         vdMul(N, output, ssa->inv_diag_count, output);
-#else
-        for (int t = 0; t < N; t++)
-        {
-            output[t] *= ssa->inv_diag_count[t];
-        }
-#endif
 
         return 0;
     }
 
     // ============================================================================
-    // W-CORRELATION
+    // W-CORRELATION ANALYSIS
+    //
+    // W-correlation measures similarity between reconstructed SSA components
+    // using the diagonal averaging weights. High |ρ_W(i,j)| indicates components
+    // i and j belong together (e.g., sine/cosine pairs for periodic signals).
+    //
+    // Formula: ρ_W(i,j) = <Xᵢ, Xⱼ>_W / (‖Xᵢ‖_W × ‖Xⱼ‖_W)
+    // where the weighted inner product uses w[t] = min(t+1, L, K, N-t)
+    //
+    // Usage: Identify which components to group for reconstruction
     // ============================================================================
 
     int ssa_opt_wcorr_matrix(const SSA_Opt *ssa, double *W)
@@ -2727,7 +2156,7 @@ extern "C"
         int K = ssa->K;
         int n = ssa->n_components;
 
-        // Precompute weights
+        // Compute diagonal averaging weights
         double *weights = (double *)ssa_opt_alloc(N * sizeof(double));
         if (!weights)
             return -1;
@@ -2738,7 +2167,6 @@ extern "C"
                                              ssa_opt_min(K, N - t));
         }
 
-        // Reconstruct all components
         double *reconstructed = (double *)ssa_opt_alloc(N * n * sizeof(double));
         if (!reconstructed)
         {
@@ -2752,7 +2180,6 @@ extern "C"
             ssa_opt_reconstruct(ssa, group, 1, &reconstructed[i * N]);
         }
 
-        // Compute weighted norms
         double *norms = (double *)ssa_opt_alloc(n * sizeof(double));
         if (!norms)
         {
@@ -2772,7 +2199,6 @@ extern "C"
             norms[i] = sqrt(sum);
         }
 
-        // Compute W-correlation matrix
         for (int i = 0; i < n; i++)
         {
             double *x_i = &reconstructed[i * N];
@@ -2846,9 +2272,9 @@ extern "C"
         return (denom > 1e-15) ? inner / denom : 0.0;
     }
 
-    // ============================================================================
-    // COMPONENT STATISTICS
-    // ============================================================================
+    // ----------------------------------------------------------------------------
+    // Component Statistics
+    // ----------------------------------------------------------------------------
 
     int ssa_opt_component_stats(const SSA_Opt *ssa, SSA_ComponentStats *stats)
     {
@@ -2875,14 +2301,12 @@ extern "C"
             return -1;
         }
 
-        // Copy singular values and compute log
         for (int i = 0; i < n; i++)
         {
             stats->singular_values[i] = ssa->sigma[i];
             stats->log_sv[i] = log(ssa->sigma[i] + 1e-300);
         }
 
-        // Compute gap ratios
         double max_gap = 0.0;
         int max_gap_idx = 0;
 
@@ -2898,7 +2322,6 @@ extern "C"
             }
         }
 
-        // Cumulative explained variance
         double cumsum = 0.0;
         for (int i = 0; i < n; i++)
         {
@@ -2906,7 +2329,6 @@ extern "C"
             stats->cumulative_var[i] = cumsum / ssa->total_variance;
         }
 
-        // Second differences for elbow detection
         stats->second_diff[0] = 0.0;
         stats->second_diff[n - 1] = 0.0;
 
@@ -2964,17 +2386,14 @@ extern "C"
                 if (used[j])
                     continue;
 
-                // Check singular value similarity
                 double sv_ratio = ssa->sigma[j] / (ssa->sigma[i] + 1e-300);
                 if (fabs(1.0 - sv_ratio) > sv_tol)
                     continue;
 
-                // Check W-correlation
                 double wcorr = fabs(ssa_opt_wcorr_pair(ssa, i, j));
                 if (wcorr < wcorr_thresh)
                     continue;
 
-                // Found a pair
                 pairs[2 * n_pairs] = i;
                 pairs[2 * n_pairs + 1] = j;
                 used[i] = true;
@@ -2988,16 +2407,15 @@ extern "C"
         return n_pairs;
     }
 
-    // ============================================================================
-    // CONVENIENCE FUNCTIONS
-    // ============================================================================
+    // ----------------------------------------------------------------------------
+    // Convenience Functions
+    // ----------------------------------------------------------------------------
 
     void ssa_opt_free(SSA_Opt *ssa)
     {
         if (!ssa)
             return;
 
-#ifdef SSA_USE_MKL
         if (ssa->fft_handle)
             DftiFreeDescriptor(&ssa->fft_handle);
         if (ssa->fft_batch_c2c)
@@ -3006,6 +2424,10 @@ extern "C"
             DftiFreeDescriptor(&ssa->fft_batch_inplace);
         if (ssa->rng)
             vslDeleteStream(&ssa->rng);
+
+        ssa_opt_free_ptr(ssa->fft_x);
+        ssa_opt_free_ptr(ssa->ws_fft1);
+        ssa_opt_free_ptr(ssa->ws_fft2);
         ssa_opt_free_ptr(ssa->ws_real);
         ssa_opt_free_ptr(ssa->ws_v);
         ssa_opt_free_ptr(ssa->ws_u);
@@ -3013,17 +2435,10 @@ extern "C"
         ssa_opt_free_ptr(ssa->ws_batch_u);
         ssa_opt_free_ptr(ssa->ws_batch_v);
         ssa_opt_free_ptr(ssa->ws_batch_out);
-#endif
-
-        ssa_opt_free_ptr(ssa->fft_x);
-        ssa_opt_free_ptr(ssa->ws_fft1);
-        ssa_opt_free_ptr(ssa->ws_fft2);
         ssa_opt_free_ptr(ssa->U);
         ssa_opt_free_ptr(ssa->V);
         ssa_opt_free_ptr(ssa->sigma);
         ssa_opt_free_ptr(ssa->eigenvalues);
-
-        // Free reconstruction optimization buffers
         ssa_opt_free_ptr(ssa->inv_diag_count);
         ssa_opt_free_ptr(ssa->U_fft);
         ssa_opt_free_ptr(ssa->V_fft);
