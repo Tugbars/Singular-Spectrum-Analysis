@@ -168,6 +168,23 @@ extern "C"
         double gap_threshold;    ///< Gap ratio at the suggested cutoff point
     } SSA_ComponentStats;
 
+    /**
+     * @brief Linear Recurrence Formula coefficients for SSA forecasting.
+     *
+     * The LRF encodes the recurrence relation that SSA signal components satisfy:
+     *   x̃[t] = R[0]·x̃[t-L+1] + R[1]·x̃[t-L+2] + ... + R[L-2]·x̃[t-1]
+     *
+     * This enables extrapolation of the signal beyond the observed data.
+     * Computed from the left singular vectors of the selected component group.
+     */
+    typedef struct
+    {
+        double *R;          ///< Recurrence coefficients, length L-1
+        int L;              ///< Window length (determines forecast horizon)
+        double verticality; ///< ν² = ‖π‖² where π is last row of U. Must be < 1 for valid forecast.
+        bool valid;         ///< True if verticality < 1 (forecast is possible)
+    } SSA_LRF;
+
     // ============================================================================
     // Public API
     // ============================================================================
@@ -437,6 +454,112 @@ extern "C"
      */
     int ssa_opt_find_periodic_pairs(const SSA_Opt *ssa, int *pairs, int max_pairs,
                                     double sv_tol, double wcorr_thresh);
+
+    // ============================================================================
+    // Forecasting API (Linear Recurrence Formula)
+    // ============================================================================
+
+    /**
+     * @brief Compute Linear Recurrence Formula coefficients for forecasting.
+     *
+     * The LRF exploits the fact that SSA signal components satisfy a linear recurrence:
+     *   x̃[t] = Σⱼ R[j] × x̃[t-L+1+j]  for j = 0..L-2
+     *
+     * This function computes the recurrence coefficients R from the left singular
+     * vectors of the selected component group. Use ssa_opt_forecast_with_lrf() to
+     * apply the LRF for forecasting.
+     *
+     * @param[in]  ssa      Decomposed SSA context
+     * @param[in]  group    Array of component indices to include in forecast
+     * @param[in]  n_group  Number of components in group
+     * @param[out] lrf      Output LRF structure (caller allocates struct,
+     *                      function allocates internal arrays)
+     * @return              0 on success, -1 on error or if forecast not possible
+     *
+     * @note Forecast is only possible when verticality (ν²) < 1. If ν² ≥ 1,
+     *       returns -1 and sets lrf->valid = false.
+     * @note Call ssa_opt_lrf_free() to release the LRF structure.
+     *
+     * @see ssa_opt_forecast() for a simpler one-shot forecasting interface
+     */
+    int ssa_opt_compute_lrf(const SSA_Opt *ssa, const int *group, int n_group, SSA_LRF *lrf);
+
+    /**
+     * @brief Free memory allocated inside SSA_LRF structure.
+     *
+     * @param[in,out] lrf  LRF structure to free (zeroed after call)
+     */
+    void ssa_opt_lrf_free(SSA_LRF *lrf);
+
+    /**
+     * @brief Forecast signal using SSA Linear Recurrence Formula.
+     *
+     * Extrapolates the reconstructed signal into the future using the LRF derived
+     * from the left singular vectors. This is the primary function for SSA-based
+     * time series forecasting.
+     *
+     * Algorithm:
+     *   1. Reconstruct signal from selected components: x̃[0..N-1]
+     *   2. Compute LRF coefficients R[0..L-2] from U vectors
+     *   3. Apply recurrence: x̃[t] = Σⱼ R[j]·x̃[t-L+1+j] for t = N..N+n_forecast-1
+     *
+     * @param[in]  ssa         Decomposed SSA context
+     * @param[in]  group       Array of component indices to forecast
+     * @param[in]  n_group     Number of components in group
+     * @param[in]  n_forecast  Number of future points to forecast
+     * @param[out] output      Output buffer of length n_forecast (forecasted values only)
+     * @return                 0 on success, -1 on error
+     *
+     * @note For repeated forecasting with same components, precompute LRF with
+     *       ssa_opt_compute_lrf() and use ssa_opt_forecast_with_lrf().
+     *
+     * @example
+     *   // Forecast trend 20 steps ahead
+     *   int trend[] = {0};
+     *   double forecast[20];
+     *   ssa_opt_forecast(&ssa, trend, 1, 20, forecast);
+     *
+     *   // Forecast trend + first periodic pair
+     *   int signal[] = {0, 1, 2};
+     *   ssa_opt_forecast(&ssa, signal, 3, 20, forecast);
+     */
+    int ssa_opt_forecast(const SSA_Opt *ssa, const int *group, int n_group,
+                         int n_forecast, double *output);
+
+    /**
+     * @brief Forecast with reconstruction: output = reconstruction + forecast.
+     *
+     * Same as ssa_opt_forecast() but outputs the full series: reconstructed signal
+     * followed by the forecasted values. Useful for plotting and analysis.
+     *
+     * @param[in]  ssa         Decomposed SSA context
+     * @param[in]  group       Array of component indices to forecast
+     * @param[in]  n_group     Number of components in group
+     * @param[in]  n_forecast  Number of future points to forecast
+     * @param[out] output      Output buffer of length N + n_forecast
+     *                         output[0..N-1] = reconstruction
+     *                         output[N..N+n_forecast-1] = forecast
+     * @return                 0 on success, -1 on error
+     */
+    int ssa_opt_forecast_full(const SSA_Opt *ssa, const int *group, int n_group,
+                              int n_forecast, double *output);
+
+    /**
+     * @brief Apply precomputed LRF to forecast from a base signal.
+     *
+     * For scenarios where the same component group is used repeatedly (e.g.,
+     * rolling forecasts), precomputing the LRF avoids redundant coefficient
+     * calculation.
+     *
+     * @param[in]  lrf          Precomputed LRF structure (from ssa_opt_compute_lrf)
+     * @param[in]  base_signal  Base signal to forecast from (reconstructed components)
+     * @param[in]  base_len     Length of base signal (must be ≥ L-1)
+     * @param[in]  n_forecast   Number of future points to forecast
+     * @param[out] output       Output buffer of length n_forecast
+     * @return                  0 on success, -1 on error
+     */
+    int ssa_opt_forecast_with_lrf(const SSA_LRF *lrf, const double *base_signal, int base_len,
+                                  int n_forecast, double *output);
 
     // ============================================================================
     // Convenience Functions
@@ -2564,6 +2687,252 @@ extern "C"
 
         free(used);
         return n_pairs;
+    }
+
+    // ============================================================================
+    // SSA FORECASTING (Linear Recurrence Formula)
+    //
+    // The key insight is that SSA signal components satisfy a linear recurrence:
+    //   x̃[t] = R[0]·x̃[t-L+1] + R[1]·x̃[t-L+2] + ... + R[L-2]·x̃[t-1]
+    //
+    // The recurrence coefficients R are derived from the left singular vectors:
+    //   Let π = [U₁[L-1], U₂[L-1], ...] be the last row of U for selected components
+    //   Let U∇ = U without last row (first L-1 rows)
+    //   ν² = ‖π‖² (verticality coefficient, must be < 1)
+    //   R = U∇ × πᵀ / (1 - ν²)
+    //
+    // This enables extrapolation beyond the observed data for forecasting.
+    //
+    // Reference: Golyandina, N., & Zhigljavsky, A. (2013). Singular Spectrum
+    //            Analysis for Time Series. Springer. Chapter 3.
+    // ============================================================================
+
+    void ssa_opt_lrf_free(SSA_LRF *lrf)
+    {
+        if (!lrf)
+            return;
+        ssa_opt_free_ptr(lrf->R);
+        memset(lrf, 0, sizeof(SSA_LRF));
+    }
+
+    int ssa_opt_compute_lrf(const SSA_Opt *ssa, const int *group, int n_group, SSA_LRF *lrf)
+    {
+        if (!ssa || !ssa->decomposed || !group || !lrf || n_group < 1)
+            return -1;
+
+        int L = ssa->L;
+
+        memset(lrf, 0, sizeof(SSA_LRF));
+        lrf->L = L;
+        lrf->valid = false;
+
+        // =========================================================================
+        // Step 1: Extract π = last row of U for selected components
+        //
+        // π[i] = U[group[i]][L-1] for each component in the group
+        // This encodes the "vertical" component that drives the recurrence
+        // =========================================================================
+        double *pi = (double *)ssa_opt_alloc(n_group * sizeof(double));
+        if (!pi)
+            return -1;
+
+        double nu_sq = 0.0;
+        for (int g = 0; g < n_group; g++)
+        {
+            int idx = group[g];
+            if (idx < 0 || idx >= ssa->n_components)
+            {
+                ssa_opt_free_ptr(pi);
+                return -1;
+            }
+            // U is stored column-major: U[row + col*L]
+            pi[g] = ssa->U[idx * L + (L - 1)];
+            nu_sq += pi[g] * pi[g];
+        }
+
+        lrf->verticality = nu_sq;
+
+        // =========================================================================
+        // Step 2: Check verticality condition
+        //
+        // For the LRF to be valid, we need ν² < 1. If ν² ≥ 1, the recurrence
+        // is unstable and forecasting is not possible. This happens when the
+        // signal has a strong component in the "vertical" direction.
+        // =========================================================================
+        if (nu_sq >= 1.0 - 1e-10)
+        {
+            ssa_opt_free_ptr(pi);
+            lrf->valid = false;
+            return -1; // Cannot forecast - verticality too high
+        }
+
+        // =========================================================================
+        // Step 3: Compute recurrence coefficients
+        //
+        // R[j] = Σᵢ (π[i] × U[group[i]][j]) / (1 - ν²)  for j = 0..L-2
+        //
+        // This is equivalent to R = U∇ × πᵀ / (1 - ν²) where U∇ is U without
+        // the last row. The coefficients define the linear recurrence.
+        // =========================================================================
+        lrf->R = (double *)ssa_opt_alloc((L - 1) * sizeof(double));
+        if (!lrf->R)
+        {
+            ssa_opt_free_ptr(pi);
+            return -1;
+        }
+
+        double scale = 1.0 / (1.0 - nu_sq);
+
+        for (int j = 0; j < L - 1; j++)
+        {
+            double sum = 0.0;
+            for (int g = 0; g < n_group; g++)
+            {
+                int idx = group[g];
+                // U[row j, column idx] = U[idx * L + j]
+                sum += pi[g] * ssa->U[idx * L + j];
+            }
+            lrf->R[j] = sum * scale;
+        }
+
+        ssa_opt_free_ptr(pi);
+        lrf->valid = true;
+
+        return 0;
+    }
+
+    int ssa_opt_forecast_with_lrf(const SSA_LRF *lrf, const double *base_signal, int base_len,
+                                  int n_forecast, double *output)
+    {
+        if (!lrf || !lrf->valid || !lrf->R || !base_signal || !output)
+            return -1;
+
+        int L = lrf->L;
+
+        // Need at least L-1 points to start the recurrence
+        if (base_len < L - 1 || n_forecast < 1)
+            return -1;
+
+        // =========================================================================
+        // Apply the linear recurrence to forecast
+        //
+        // x̃[t] = Σⱼ R[j] × x̃[t-L+1+j]  for j = 0..L-2
+        //
+        // We need to maintain a sliding window of the last L-1 values.
+        // Initially, this comes from the end of base_signal.
+        // As we forecast, new predictions enter the window.
+        // =========================================================================
+
+        // Create a working buffer with base signal tail + space for forecasts
+        int window_size = L - 1;
+        double *buffer = (double *)ssa_opt_alloc((window_size + n_forecast) * sizeof(double));
+        if (!buffer)
+            return -1;
+
+        // Copy the last L-1 points of base_signal into buffer
+        for (int i = 0; i < window_size; i++)
+        {
+            buffer[i] = base_signal[base_len - window_size + i];
+        }
+
+        // Apply recurrence to generate forecasts
+        for (int h = 0; h < n_forecast; h++)
+        {
+            double forecast = 0.0;
+
+            // x̃[t] = R[0]·x̃[t-L+1] + R[1]·x̃[t-L+2] + ... + R[L-2]·x̃[t-1]
+            // In buffer coordinates: buffer[h + j] for j = 0..L-2
+            for (int j = 0; j < window_size; j++)
+            {
+                forecast += lrf->R[j] * buffer[h + j];
+            }
+
+            buffer[window_size + h] = forecast;
+            output[h] = forecast;
+        }
+
+        ssa_opt_free_ptr(buffer);
+        return 0;
+    }
+
+    int ssa_opt_forecast(const SSA_Opt *ssa, const int *group, int n_group,
+                         int n_forecast, double *output)
+    {
+        if (!ssa || !ssa->decomposed || !group || !output || n_group < 1 || n_forecast < 1)
+            return -1;
+
+        int N = ssa->N;
+
+        // =========================================================================
+        // Step 1: Compute LRF coefficients from selected components
+        // =========================================================================
+        SSA_LRF lrf = {0};
+        if (ssa_opt_compute_lrf(ssa, group, n_group, &lrf) != 0)
+        {
+            return -1;
+        }
+
+        // =========================================================================
+        // Step 2: Reconstruct signal from selected components
+        // =========================================================================
+        double *reconstructed = (double *)ssa_opt_alloc(N * sizeof(double));
+        if (!reconstructed)
+        {
+            ssa_opt_lrf_free(&lrf);
+            return -1;
+        }
+
+        if (ssa_opt_reconstruct(ssa, group, n_group, reconstructed) != 0)
+        {
+            ssa_opt_free_ptr(reconstructed);
+            ssa_opt_lrf_free(&lrf);
+            return -1;
+        }
+
+        // =========================================================================
+        // Step 3: Apply LRF to forecast
+        // =========================================================================
+        int result = ssa_opt_forecast_with_lrf(&lrf, reconstructed, N, n_forecast, output);
+
+        ssa_opt_free_ptr(reconstructed);
+        ssa_opt_lrf_free(&lrf);
+
+        return result;
+    }
+
+    int ssa_opt_forecast_full(const SSA_Opt *ssa, const int *group, int n_group,
+                              int n_forecast, double *output)
+    {
+        if (!ssa || !ssa->decomposed || !group || !output || n_group < 1 || n_forecast < 1)
+            return -1;
+
+        int N = ssa->N;
+
+        // =========================================================================
+        // Step 1: Compute LRF coefficients
+        // =========================================================================
+        SSA_LRF lrf = {0};
+        if (ssa_opt_compute_lrf(ssa, group, n_group, &lrf) != 0)
+        {
+            return -1;
+        }
+
+        // =========================================================================
+        // Step 2: Reconstruct signal into output[0..N-1]
+        // =========================================================================
+        if (ssa_opt_reconstruct(ssa, group, n_group, output) != 0)
+        {
+            ssa_opt_lrf_free(&lrf);
+            return -1;
+        }
+
+        // =========================================================================
+        // Step 3: Forecast into output[N..N+n_forecast-1]
+        // =========================================================================
+        int result = ssa_opt_forecast_with_lrf(&lrf, output, N, n_forecast, output + N);
+
+        ssa_opt_lrf_free(&lrf);
+        return result;
     }
 
     // ----------------------------------------------------------------------------
