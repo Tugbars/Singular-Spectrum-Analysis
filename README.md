@@ -3,7 +3,6 @@
 A fast, header-only C library for Singular Spectrum Analysis (SSA) with FFT-accelerated matrix operations and optional Intel MKL optimization.
 
 ## What is SSA?
-<img width="2779" height="1576" alt="ssa_denoising_best" src="https://github.com/user-attachments/assets/cd117e35-473b-4250-acc8-bb70b8fc5748" />
 
 Singular Spectrum Analysis is a powerful technique for time series decomposition. It extracts:
 
@@ -13,10 +12,33 @@ Singular Spectrum Analysis is a powerful technique for time series decomposition
 
 Unlike Fourier analysis, SSA is non-parametric and handles non-stationary signals well. Applications include financial data analysis, climate science, biomedical signal processing, and anywhere you need to separate signal from noise.
 
+## Results
+
+### Signal Denoising: 159× Noise Reduction
+
+<img width="2779" height="1576" alt="ssa_denoising_best" src="https://github.com/user-attachments/assets/980caf63-7c12-4a8c-86ed-35a6e237bbc2" />
+
+*SSA recovers clean signal from heavy noise (SNR: 4.1 → 26.1 dB). Top-left: noisy input. Top-right: noise removal transformation. Bottom-left: accuracy comparison. Bottom-right: zoomed detail.*
+
+### Trend Extraction: Bitcoin Price Analysis
+
+<img width="3173" height="1966" alt="linkedin_btc_max_accuracy" src="https://github.com/user-attachments/assets/5eead1c6-248b-4feb-b327-b993efeee711" />
+
+*Ensemble SSA extracts smooth trend from volatile Bitcoin prices (r = 0.987). Automatically separates trend from market cycles without parameter tuning.*
+
+### Forecasting: Airline Passengers
+
+<img width="2303" height="1077" alt="linkedin_forecast" src="https://github.com/user-attachments/assets/6a6400ae-c5f3-41b1-ba8f-ea8ce8193a49" />
+
+*2-year ahead forecast on classic airline passengers dataset (RMSE: 47.5). SSA captures both trend and 12-month seasonality.*
+
 ## Features
 
 - **FFT-accelerated Hankel matrix-vector products** - O(N log N) instead of O(N²)
 - **Block power method** - Process multiple singular vectors simultaneously
+- **Forecasting (LRF)** - Linear Recurrent Formula for time series prediction
+- **MSSA** - Multivariate SSA for analyzing multiple correlated series
+- **Python bindings** - Full-featured ctypes wrapper with NumPy integration
 - **Two backends**:
   - Reference implementation (portable C)
   - MKL-optimized (Intel processors, 2-3x faster)
@@ -93,6 +115,25 @@ For each time point t = 0, 1, ..., N-1:
 ```
 
 This "hankelization" projects the rank-1 matrix back to a valid trajectory matrix structure.
+
+### Step 5: Forecasting (LRF)
+
+The Linear Recurrent Formula extracts forecast coefficients from singular vectors:
+
+```
+x[n+1] = Σᵢ aᵢ · x[n-i+1]    for i = 1, ..., L-1
+```
+
+Where coefficients `a` are derived from the last row of left singular vectors. This extends the signal by iteratively applying the recurrence.
+
+### Step 6: MSSA (Multivariate SSA)
+
+For M time series of length N:
+1. Stack trajectory matrices vertically: (M·L) × K
+2. SVD extracts common patterns across all series
+3. Reconstruct each series separately
+
+This enables common factor extraction, e.g., market-wide trends from multiple stock prices.
 
 ## Optimizations
 
@@ -238,55 +279,6 @@ QR factorizations: ceil(k/b) × (max_iter/5) × 2 = 1 × 20 × 2 = 40 QR calls
 Orthogonalization: GEMM operations (much faster than GEMV)
 ```
 
-## API Reference
-
-### Initialization
-
-```c
-int ssa_opt_init(SSA_Opt* ssa, const double* data, int N, int L);
-```
-- `ssa` - Pointer to SSA_Opt structure
-- `data` - Input time series (copied internally)
-- `N` - Signal length
-- `L` - Window length (embedding dimension). Typical choice: N/3 to N/2
-
-Returns 0 on success, -1 on failure.
-
-### Decomposition
-
-```c
-// Sequential power iteration (one component at a time)
-int ssa_opt_decompose(SSA_Opt* ssa, int k, int max_iter);
-
-// Block power iteration (multiple components simultaneously)  
-int ssa_opt_decompose_block(SSA_Opt* ssa, int k, int block_size, int max_iter);
-```
-- `k` - Number of singular triplets to compute
-- `block_size` - Block size for batched computation (use 32 for MKL, or 0 for auto)
-- `max_iter` - Maximum power iterations (50-100 typically sufficient)
-
-After decomposition, access results via:
-- `ssa->sigma[i]` - Singular values (descending order)
-- `ssa->eigenvalues[i]` - Squared singular values (variance explained)
-- `ssa->total_variance` - Sum of all eigenvalues
-- `ssa->U[i * L]` - Left singular vector i (length L)
-- `ssa->V[i * K]` - Right singular vector i (length K)
-
-### Reconstruction
-
-```c
-int ssa_opt_reconstruct(SSA_Opt* ssa, const int* group, int group_size, double* result);
-```
-- `group` - Array of component indices to include
-- `group_size` - Number of components in group
-- `result` - Output buffer (length N, caller-allocated)
-
-### Cleanup
-
-```c
-void ssa_opt_free(SSA_Opt* ssa);
-```
-
 ## Choosing Parameters
 
 ### Window Length (L)
@@ -345,7 +337,16 @@ cmake .. -DSSA_USE_MKL=ON
 cmake --build . --config Release
 ```
 
-#### Step 3: Handle DLL Dependencies (Important!)
+#### Step 3: Build Python Bindings (Optional)
+
+```powershell
+cmake .. -DSSA_USE_MKL=ON -DSSA_BUILD_PYTHON=ON
+cmake --build . --config Release
+```
+
+This creates `ssa.dll` (or `libssa.so` on Linux) for use with `ssa_wrapper.py`.
+
+#### Step 4: Handle DLL Dependencies (Important!)
 
 The executable needs MKL DLLs at runtime. **Easiest method - copy DLLs to your build folder:**
 
@@ -410,17 +411,20 @@ Note: Reference implementation is significantly slower for large signals.
 
 ## Future Work
 
+- [x] Forecasting/prediction API (LRF)
+- [x] MSSA for multivariate analysis
+- [x] Python bindings
 - [ ] Real-to-complex FFT (r2c/c2r) for 2x FFT speedup
 - [ ] Convergence detection for early termination
 - [ ] Multi-threaded diagonal averaging
 - [ ] GPU acceleration (cuFFT)
-- [ ] Forecasting/prediction API
 
 ## References
 
 1. Golyandina, N., & Zhigljavsky, A. (2013). *Singular Spectrum Analysis for Time Series*. Springer.
-2. Korobeynikov, A. (2010). Computation- and space-efficient implementation of SSA. *Statistics and Its Interface*, 3(3), 357-368.
-3. Intel oneAPI Math Kernel Library Documentation: https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-c/
+2. Golyandina, N., & Korobeynikov, A. (2014). Basic Singular Spectrum Analysis and Forecasting with R. *Computational Statistics & Data Analysis*.
+3. Korobeynikov, A. (2010). Computation- and space-efficient implementation of SSA. *Statistics and Its Interface*, 3(3), 357-368.
+4. Intel oneAPI Math Kernel Library Documentation: https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-c/
 
 ## License
 
