@@ -3,6 +3,7 @@
 A fast, header-only C library for Singular Spectrum Analysis (SSA) with FFT-accelerated matrix operations and optional Intel MKL optimization.
 
 ## What is SSA?
+<img width="2779" height="1576" alt="ssa_denoising_best" src="https://github.com/user-attachments/assets/cd117e35-473b-4250-acc8-bb70b8fc5748" />
 
 Singular Spectrum Analysis is a powerful technique for time series decomposition. It extracts:
 
