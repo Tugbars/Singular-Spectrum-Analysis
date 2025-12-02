@@ -50,6 +50,15 @@ else()
     message(STATUS "Building without MKL (built-in FFT)")
 endif()
 
+# OpenMP support
+find_package(OpenMP)
+if(OpenMP_C_FOUND)
+    foreach(target ${TEST_TARGETS})
+        target_link_libraries(${target} PRIVATE OpenMP::OpenMP_C)
+    endforeach()
+    message(STATUS "OpenMP found: ${OpenMP_C_VERSION}")
+endif()
+
 if(MSVC)
     foreach(target ${TEST_TARGETS})
         target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2 /fp:fast> /W3)
