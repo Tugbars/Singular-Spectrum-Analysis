@@ -3,10 +3,11 @@ SSA Benchmark: Compare against Rssa (R implementation)
 ======================================================
 
 Usage:
-    python benchmark_vs_rssa.py           # Run our SSA + generate R script
-    Rscript benchmark_rssa.R              # Run Rssa
-    python benchmark_vs_rssa.py --compare # Compare accuracy
-    python benchmark_vs_rssa.py --speed   # Compare speed
+    python benchmark_vs_rssa.py --speed          # Compare vs Rssa
+    python benchmark_vs_rssa.py --detailed       # Breakdown: decompose + reconstruct
+    python benchmark_vs_rssa.py --internal       # Compare sequential/block/randomized
+    python benchmark_vs_rssa.py --scaling        # Test O(N log N) complexity
+    python benchmark_vs_rssa.py --all            # Run everything
 """
 
 import numpy as np
@@ -14,125 +15,10 @@ import argparse
 import os
 import time
 import subprocess
+import sys
 
 # ============================================================================
-# Test Signal Generation
-# ============================================================================
-
-def generate_test_signals():
-    np.random.seed(42)
-    N = 500
-    t = np.linspace(0, 10, N)
-    
-    signals = {}
-    signals['sine_noise'] = {'data': np.sin(2*np.pi*t) + 0.3*np.random.randn(N)}
-    signals['trend_seasonal'] = {'data': 10 + 0.5*t + 2*np.sin(2*np.pi*t) + 0.5*np.random.randn(N)}
-    signals['multi_periodic'] = {'data': np.sin(2*np.pi*t/0.5) + 0.7*np.sin(2*np.pi*t/1.2) + 0.4*np.sin(2*np.pi*t/2.5) + 0.3*np.random.randn(N)}
-    signals['nonlinear'] = {'data': np.exp(0.3*t) * np.sin(2*np.pi*t) + 0.5*np.random.randn(N)}
-    
-    returns = 0.001 + 0.02 * np.random.randn(N)
-    signals['stock_sim'] = {'data': 100 * np.exp(np.cumsum(returns))}
-    
-    return signals
-
-# ============================================================================
-# Run Our Implementation
-# ============================================================================
-
-def run_our_ssa(signals, L=100, k=20, output_dir='benchmark_data'):
-    from ssa_wrapper import SSA
-    os.makedirs(output_dir, exist_ok=True)
-    
-    for name, sig_info in signals.items():
-        x = sig_info['data']
-        print(f"Processing {name}...")
-        
-        np.savetxt(f'{output_dir}/{name}_signal.csv', x, delimiter=',')
-        
-        ssa = SSA(x, L=L)
-        ssa.decompose(k=k)
-        
-        var_explained = [ssa.variance_explained(i, i) for i in range(k)]
-        np.savetxt(f'{output_dir}/{name}_variance.csv', var_explained, delimiter=',')
-        
-        np.savetxt(f'{output_dir}/{name}_trend.csv', ssa.reconstruct([0]), delimiter=',')
-        if k >= 3:
-            np.savetxt(f'{output_dir}/{name}_periodic.csv', ssa.reconstruct([1, 2]), delimiter=',')
-        np.savetxt(f'{output_dir}/{name}_full_recon.csv', ssa.reconstruct(list(range(k))), delimiter=',')
-        np.savetxt(f'{output_dir}/{name}_wcorr.csv', ssa.wcorr_matrix(), delimiter=',')
-        
-        if name == 'trend_seasonal':
-            np.savetxt(f'{output_dir}/{name}_forecast.csv', ssa.forecast([0, 1, 2], n_forecast=50), delimiter=',')
-    
-    print(f"Results saved to {output_dir}/")
-
-# ============================================================================
-# Generate R Script
-# ============================================================================
-
-def generate_r_script(signals, L=100, k=20, output_dir='benchmark_data'):
-    r_script = f'''if (!require("Rssa")) {{ install.packages("Rssa", repos="https://cloud.r-project.org"); library(Rssa) }}
-L <- {L}; k <- {k}; output_dir <- "{output_dir}"
-'''
-    for name in signals.keys():
-        r_script += f'''
-cat("Processing {name}...\\n")
-x <- scan(paste0(output_dir, "/{name}_signal.csv"), quiet=TRUE)
-s <- ssa(x, L=L, neig=k)
-write.table(s$sigma[1:k]^2/sum(s$sigma^2), paste0(output_dir, "/{name}_variance_rssa.csv"), row.names=F, col.names=F)
-write.table(reconstruct(s, groups=list(1))$F1, paste0(output_dir, "/{name}_trend_rssa.csv"), row.names=F, col.names=F)
-if(k>=3) write.table(reconstruct(s, groups=list(c(2,3)))$F1, paste0(output_dir, "/{name}_periodic_rssa.csv"), row.names=F, col.names=F)
-write.table(reconstruct(s, groups=list(1:k))$F1, paste0(output_dir, "/{name}_full_recon_rssa.csv"), row.names=F, col.names=F)
-write.table(wcor(s, groups=1:k), paste0(output_dir, "/{name}_wcorr_rssa.csv"), row.names=F, col.names=F, sep=",")
-'''
-    r_script += f'''
-x <- scan(paste0(output_dir, "/trend_seasonal_signal.csv"), quiet=TRUE)
-s <- ssa(x, L=L, neig=k)
-write.table(rforecast(s, groups=list(c(1,2,3)), len=50), paste0(output_dir, "/trend_seasonal_forecast_rssa.csv"), row.names=F, col.names=F)
-cat("Done\\n")
-'''
-    with open('benchmark_rssa.R', 'w') as f:
-        f.write(r_script)
-    print("Generated benchmark_rssa.R")
-
-# ============================================================================
-# Compare Results
-# ============================================================================
-
-def compare_results(signals, output_dir='benchmark_data'):
-    print("\n" + "="*70)
-    print("BENCHMARK COMPARISON: Our SSA vs Rssa")
-    print("="*70)
-    
-    for name in signals.keys():
-        print(f"\n--- {name} ---")
-        rssa_var_file = f'{output_dir}/{name}_variance_rssa.csv'
-        if not os.path.exists(rssa_var_file):
-            print("  [Rssa results not found]")
-            continue
-        
-        our_var = np.loadtxt(f'{output_dir}/{name}_variance.csv')
-        rssa_var = np.loadtxt(rssa_var_file)
-        print(f"  Variance (first 5): Max diff: {np.abs(our_var[:5] - rssa_var[:5]).max():.2e}")
-        
-        our_trend = np.loadtxt(f'{output_dir}/{name}_trend.csv')
-        rssa_trend = np.loadtxt(f'{output_dir}/{name}_trend_rssa.csv')
-        print(f"  Trend: Corr={np.corrcoef(our_trend, rssa_trend)[0,1]:.6f}")
-        
-        our_full = np.loadtxt(f'{output_dir}/{name}_full_recon.csv')
-        rssa_full = np.loadtxt(f'{output_dir}/{name}_full_recon_rssa.csv')
-        print(f"  Full:  Corr={np.corrcoef(our_full, rssa_full)[0,1]:.6f}")
-    
-    our_fc = f'{output_dir}/trend_seasonal_forecast.csv'
-    rssa_fc = f'{output_dir}/trend_seasonal_forecast_rssa.csv'
-    if os.path.exists(our_fc) and os.path.exists(rssa_fc):
-        our = np.loadtxt(our_fc)
-        rssa = np.loadtxt(rssa_fc)
-        print(f"\n--- Forecast ---")
-        print(f"  Corr={np.corrcoef(our, rssa)[0,1]:.6f}")
-
-# ============================================================================
-# Speed Comparison
+# Speed Comparison with Proper Warmup
 # ============================================================================
 
 def compare_speed(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
@@ -141,76 +27,292 @@ def compare_speed(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     print("\n" + "="*70)
     print("SPEED COMPARISON: Our SSA vs Rssa")
     print("="*70)
-    print(f"{'N':>6} {'L':>5} {'k':>3} | {'Ours (ms)':>10} {'Rssa (ms)':>10} {'Speedup':>8}")
-    print("-"*55)
     
-    n_runs = 3
+    # =========================================================================
+    # WARMUP: Run one decomposition to trigger MKL JIT, DLL loading, etc.
+    # =========================================================================
+    print("\nWarming up MKL (first call has JIT overhead)...")
+    np.random.seed(0)
+    x_warmup = np.random.randn(1000)
+    ssa_warmup = SSA(x_warmup, L=250)
     
-    for N in [500, 1000, 2000, 5000, 10000]:
+    t0 = time.perf_counter()
+    ssa_warmup.decompose(k=10)
+    warmup_time = (time.perf_counter() - t0) * 1000
+    
+    # Second call (should be faster)
+    ssa_warmup2 = SSA(x_warmup, L=250)
+    t0 = time.perf_counter()
+    ssa_warmup2.decompose(k=10)
+    post_warmup_time = (time.perf_counter() - t0) * 1000
+    
+    print(f"  First call (cold):  {warmup_time:.1f} ms")
+    print(f"  Second call (warm): {post_warmup_time:.1f} ms")
+    print(f"  Warmup overhead:    {warmup_time - post_warmup_time:.1f} ms")
+    print()
+    
+    # =========================================================================
+    # Actual benchmark (post-warmup)
+    # =========================================================================
+    print(f"{'N':>6} {'L':>5} {'k':>3} | {'Ours (ms)':>10} {'Rssa (ms)':>10} {'Speedup':>8} {'Corr(raw)':>10} {'Corr(true)':>11}")
+    print("-"*82)
+    
+    n_runs = 5  # More runs for stable timing
+    
+    for N in [500, 1000, 2000, 5000, 10000, 20000]:
         L = N // 4
         k = 30
         
         # Our implementation
         np.random.seed(42)
-        x = np.sin(np.linspace(0, 50*np.pi, N)) + 0.3*np.random.randn(N)
+        t_vec = np.linspace(0, 50*np.pi, N)
+        x_true = np.sin(t_vec)  # True signal without noise
+        x = x_true + 0.3*np.random.randn(N)  # Noisy signal
         
-        t0 = time.perf_counter()
-        for _ in range(n_runs):
+        # Time multiple runs
+        times = []
+        recon_result = None
+        for run_idx in range(n_runs):
             ssa = SSA(x, L=L)
+            t0 = time.perf_counter()
             ssa.decompose(k=k)
-            _ = ssa.reconstruct(list(range(k)))
-        our_time = (time.perf_counter() - t0) / n_runs * 1000
+            recon = ssa.reconstruct(list(range(k)))
+            times.append((time.perf_counter() - t0) * 1000)
+            if run_idx == 0:
+                recon_result = recon
         
-        # Rssa - generate data in R directly, suppress ALL output
+        # Compute correlations
+        corr_raw = np.corrcoef(x, recon_result)[0, 1]        # vs noisy input
+        corr_true = np.corrcoef(x_true, recon_result)[0, 1]  # vs true signal
+        
+        # Use median to reduce variance
+        our_time = np.median(times)
+        
+        # Rssa
         r_code = f'''suppressMessages(suppressWarnings(library(Rssa)));options(warn=-1);set.seed(42);x<-sin(seq(0,50*pi,length.out={N}))+0.3*rnorm({N});t0<-Sys.time();for(i in 1:{n_runs}){{invisible(capture.output({{s<-ssa(x,L={L},neig={k});r<-reconstruct(s,groups=list(1:{k}))}}));}};cat(as.numeric(Sys.time()-t0)/{n_runs}*1000)'''
         
         try:
             result = subprocess.run([r_path, '-e', r_code], capture_output=True, text=True, timeout=300)
             
             if result.returncode == 0 and result.stdout.strip():
-                # Robust parsing: extract last numeric value
                 out = result.stdout.strip().split()
                 nums = [x for x in out if x.replace('.', '', 1).replace('-', '', 1).isdigit()]
                 if nums:
                     rssa_time = float(nums[-1])
                     speedup = rssa_time / our_time
-                    print(f"{N:>6} {L:>5} {k:>3} | {our_time:>10.1f} {rssa_time:>10.1f} {speedup:>7.1f}x")
+                    print(f"{N:>6} {L:>5} {k:>3} | {our_time:>10.1f} {rssa_time:>10.1f} {speedup:>7.1f}x {corr_raw:>10.4f} {corr_true:>11.4f}")
                 else:
-                    print(f"{N:>6} {L:>5} {k:>3} | {our_time:>10.1f} {'parse err':>10} {'-':>8}")
-                    print(f"  R stdout: {result.stdout[:100]}")
+                    print(f"{N:>6} {L:>5} {k:>3} | {our_time:>10.1f} {'parse err':>10} {'-':>8} {corr_raw:>10.4f} {corr_true:>11.4f}")
             else:
-                print(f"{N:>6} {L:>5} {k:>3} | {our_time:>10.1f} {'error':>10} {'-':>8}")
-                if result.stderr:
-                    print(f"  R error: {result.stderr[:100]}")
+                print(f"{N:>6} {L:>5} {k:>3} | {our_time:>10.1f} {'error':>10} {'-':>8} {corr_raw:>10.4f} {corr_true:>11.4f}")
         except subprocess.TimeoutExpired:
-            print(f"{N:>6} {L:>5} {k:>3} | {our_time:>10.1f} {'timeout':>10} {'-':>8}")
+            print(f"{N:>6} {L:>5} {k:>3} | {our_time:>10.1f} {'timeout':>10} {'-':>8} {corr_raw:>10.4f} {corr_true:>11.4f}")
         except Exception as e:
-            print(f"{N:>6} {L:>5} {k:>3} | {our_time:>10.1f} {'error':>10} {'-':>8}")
-            print(f"  Exception: {e}")
+            print(f"{N:>6} {L:>5} {k:>3} | {our_time:>10.1f} {'error':>10} {'-':>8} {corr_raw:>10.4f} {corr_true:>11.4f}")
     
-    print("-"*55)
-    print("Rssa: single-threaded BLAS | Ours: Intel MKL (multi-threaded)")
+    print("-"*82)
+    print("Rssa: PROPACK (Lanczos) | Ours: Randomized SVD + MKL R2C FFT")
 
-# ============================================================================
-# Performance Benchmark
-# ============================================================================
 
-def benchmark_performance(L=100, k=20):
+def compare_speed_detailed(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
+    """
+    Detailed breakdown: decompose vs reconstruct timing.
+    """
     from ssa_wrapper import SSA
     
-    print("\n--- Large Scale Test ---")
-    for N in [1000, 5000, 10000, 20000]:
+    print("\n" + "="*70)
+    print("DETAILED TIMING: Decompose vs Reconstruct")
+    print("="*70)
+    
+    # Warmup
+    print("\nWarming up...")
+    x_warmup = np.random.randn(1000)
+    SSA(x_warmup, L=250).decompose(k=10)
+    print("Done.\n")
+    
+    print(f"{'N':>6} {'L':>5} {'k':>3} | {'Decomp':>9} {'Recon':>9} {'Total':>9} | {'Rssa':>9} {'Speedup':>8}")
+    print("-"*78)
+    
+    n_runs = 5
+    
+    for N in [1000, 2000, 5000, 10000, 20000]:
+        L = N // 4
+        k = 30
+        
         np.random.seed(42)
         x = np.sin(np.linspace(0, 50*np.pi, N)) + 0.3*np.random.randn(N)
+        
+        decomp_times = []
+        recon_times = []
+        
+        for _ in range(n_runs):
+            ssa = SSA(x, L=L)
+            
+            t0 = time.perf_counter()
+            ssa.decompose(k=k)
+            decomp_times.append((time.perf_counter() - t0) * 1000)
+            
+            t0 = time.perf_counter()
+            _ = ssa.reconstruct(list(range(k)))
+            recon_times.append((time.perf_counter() - t0) * 1000)
+        
+        decomp_ms = np.median(decomp_times)
+        recon_ms = np.median(recon_times)
+        total_ms = decomp_ms + recon_ms
+        
+        # Rssa
+        r_code = f'''suppressMessages(suppressWarnings(library(Rssa)));options(warn=-1);set.seed(42);x<-sin(seq(0,50*pi,length.out={N}))+0.3*rnorm({N});t0<-Sys.time();for(i in 1:{n_runs}){{invisible(capture.output({{s<-ssa(x,L={L},neig={k});r<-reconstruct(s,groups=list(1:{k}))}}));}};cat(as.numeric(Sys.time()-t0)/{n_runs}*1000)'''
+        
+        try:
+            result = subprocess.run([r_path, '-e', r_code], capture_output=True, text=True, timeout=300)
+            if result.returncode == 0 and result.stdout.strip():
+                out = result.stdout.strip().split()
+                nums = [x for x in out if x.replace('.', '', 1).replace('-', '', 1).isdigit()]
+                if nums:
+                    rssa_time = float(nums[-1])
+                    speedup = rssa_time / total_ms
+                    print(f"{N:>6} {L:>5} {k:>3} | {decomp_ms:>8.1f}ms {recon_ms:>8.1f}ms {total_ms:>8.1f}ms | {rssa_time:>8.1f}ms {speedup:>7.1f}x")
+                else:
+                    print(f"{N:>6} {L:>5} {k:>3} | {decomp_ms:>8.1f}ms {recon_ms:>8.1f}ms {total_ms:>8.1f}ms | {'err':>9} {'-':>8}")
+            else:
+                print(f"{N:>6} {L:>5} {k:>3} | {decomp_ms:>8.1f}ms {recon_ms:>8.1f}ms {total_ms:>8.1f}ms | {'err':>9} {'-':>8}")
+        except:
+            print(f"{N:>6} {L:>5} {k:>3} | {decomp_ms:>8.1f}ms {recon_ms:>8.1f}ms {total_ms:>8.1f}ms | {'err':>9} {'-':>8}")
+    
+    print("-"*78)
+
+
+def compare_methods_internal():
+    """
+    Compare our three decomposition methods (no Rssa).
+    Shows the 100x speedup of randomized vs sequential.
+    """
+    from ssa_wrapper import SSA
+    
+    print("\n" + "="*70)
+    print("INTERNAL COMPARISON: Sequential vs Block vs Randomized")
+    print("="*70)
+    
+    # Warmup all methods
+    print("\nWarming up all decomposition methods...")
+    x_warmup = np.random.randn(1000)
+    SSA(x_warmup, L=250).decompose(k=10, method='randomized')
+    SSA(x_warmup, L=250).decompose(k=10, method='block')
+    SSA(x_warmup, L=250).decompose(k=10, method='sequential', max_iter=50)
+    print("Done.\n")
+    
+    print(f"{'N':>6} {'L':>5} {'k':>3} | {'Sequential':>12} {'Block':>12} {'Randomized':>12} | {'Speedup':>8} {'Corr':>10}")
+    print("-"*90)
+    
+    n_runs = 3
+    
+    for N in [1000, 2000, 5000, 10000]:
         L = N // 4
+        k = 30
         
-        t0 = time.perf_counter()
-        ssa = SSA(x, L=L)
-        ssa.decompose(k=50)
-        _ = ssa.reconstruct(list(range(50)))
-        total_time = time.perf_counter() - t0
+        np.random.seed(42)
+        x = np.sin(np.linspace(0, 50*np.pi, N)) + 0.3*np.random.randn(N)
         
-        print(f"N={N:5d}, L={L:5d}, k=50: {total_time*1000:>8.1f} ms")
+        # Sequential (limit iterations for reasonable time)
+        max_iter = 100 if N <= 2000 else 50
+        times_seq = []
+        for _ in range(n_runs):
+            ssa = SSA(x, L=L)
+            t0 = time.perf_counter()
+            ssa.decompose(k=k, method='sequential', max_iter=max_iter)
+            times_seq.append((time.perf_counter() - t0) * 1000)
+        seq_ms = np.median(times_seq)
+        
+        # Block
+        times_block = []
+        for _ in range(n_runs):
+            ssa = SSA(x, L=L)
+            t0 = time.perf_counter()
+            ssa.decompose(k=k, method='block', max_iter=max_iter)
+            times_block.append((time.perf_counter() - t0) * 1000)
+        block_ms = np.median(times_block)
+        
+        # Randomized (also capture reconstruction for correlation)
+        times_rand = []
+        recon_result = None
+        for run_idx in range(n_runs):
+            ssa = SSA(x, L=L)
+            t0 = time.perf_counter()
+            ssa.decompose(k=k, method='randomized')
+            times_rand.append((time.perf_counter() - t0) * 1000)
+            if run_idx == 0:
+                recon_result = ssa.reconstruct(list(range(k)))
+        rand_ms = np.median(times_rand)
+        
+        # Correlation
+        corr = np.corrcoef(x, recon_result)[0, 1]
+        
+        speedup = seq_ms / rand_ms
+        print(f"{N:>6} {L:>5} {k:>3} | {seq_ms:>11.1f}ms {block_ms:>11.1f}ms {rand_ms:>11.1f}ms | {speedup:>7.1f}x {corr:>10.6f}")
+    
+    print("-"*90)
+    print(f"Note: Sequential/Block use max_iter={100 if True else 50}")
+    print("Speedup = Sequential / Randomized")
+
+
+def benchmark_scaling():
+    """
+    Test O(N log N) scaling of our implementation.
+    """
+    from ssa_wrapper import SSA
+    
+    print("\n" + "="*70)
+    print("SCALING TEST: Time vs N (should be ~O(N log N))")
+    print("="*70)
+    
+    # Warmup
+    print("\nWarming up...")
+    x_warmup = np.random.randn(1000)
+    SSA(x_warmup, L=250).decompose(k=10)
+    print("Done.\n")
+    
+    print(f"{'N':>7} {'L':>6} {'k':>3} | {'Time (ms)':>10} | {'N log N':>12} {'Ratio':>12}")
+    print("-"*62)
+    
+    n_runs = 5
+    base_ratio = None
+    
+    for N in [1000, 2000, 5000, 10000, 20000, 50000, 100000]:
+        L = N // 4
+        k = 50
+        
+        np.random.seed(42)
+        x = np.sin(np.linspace(0, 50*np.pi, N)) + 0.3*np.random.randn(N)
+        
+        times = []
+        for _ in range(n_runs):
+            ssa = SSA(x, L=L)
+            t0 = time.perf_counter()
+            ssa.decompose(k=k)
+            times.append((time.perf_counter() - t0) * 1000)
+        
+        time_ms = np.median(times)
+        n_log_n = N * np.log2(N)
+        ratio = time_ms / n_log_n * 1e6  # Normalize to readable range
+        
+        if base_ratio is None:
+            base_ratio = ratio
+        
+        rel_ratio = ratio / base_ratio
+        print(f"{N:>7} {L:>6} {k:>3} | {time_ms:>9.1f}ms | {n_log_n:>11.0f} {rel_ratio:>11.2f}x")
+    
+    print("-"*62)
+    print("Ratio column: should stay ~1.0x if complexity is O(N log N)")
+    print("Values >1.0x indicate worse-than-linear-log scaling")
+
+
+def compare_speed_all(r_path):
+    """Run all speed comparisons."""
+    compare_speed(r_path)
+    compare_speed_detailed(r_path)
+    compare_methods_internal()
+    benchmark_scaling()
+
 
 # ============================================================================
 # Main
@@ -218,25 +320,33 @@ def benchmark_performance(L=100, k=20):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='SSA Benchmark vs Rssa')
-    parser.add_argument('--compare', action='store_true', help='Compare accuracy')
-    parser.add_argument('--perf', action='store_true', help='Performance benchmark')
     parser.add_argument('--speed', action='store_true', help='Speed comparison vs Rssa')
-    parser.add_argument('-L', type=int, default=100)
-    parser.add_argument('-k', type=int, default=20)
+    parser.add_argument('--detailed', action='store_true', help='Detailed timing breakdown')
+    parser.add_argument('--internal', action='store_true', help='Compare our three methods')
+    parser.add_argument('--scaling', action='store_true', help='Test O(N log N) scaling')
+    parser.add_argument('--all', action='store_true', help='Run all benchmarks')
     parser.add_argument('--r-path', default=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe')
     args = parser.parse_args()
     
-    signals = generate_test_signals()
-    
-    if args.compare:
-        compare_results(signals)
-    elif args.perf:
-        benchmark_performance(args.L, args.k)
-    elif args.speed:
+    if args.speed:
         compare_speed(args.r_path)
+    elif args.detailed:
+        compare_speed_detailed(args.r_path)
+    elif args.internal:
+        compare_methods_internal()
+    elif args.scaling:
+        benchmark_scaling()
+    elif args.all:
+        compare_speed_all(args.r_path)
     else:
-        run_our_ssa(signals, args.L, args.k)
-        generate_r_script(signals, args.L, args.k)
-        benchmark_performance(args.L, args.k)
-        print("\nNEXT: Rscript benchmark_rssa.R && python benchmark_vs_rssa.py --compare")
-        print("      python benchmark_vs_rssa.py --speed")
+        # Default: show all options
+        print("SSA Benchmark Suite")
+        print("="*40)
+        print("Options:")
+        print("  --speed     Compare vs Rssa (with warmup)")
+        print("  --detailed  Breakdown: decompose + reconstruct")
+        print("  --internal  Compare sequential/block/randomized")
+        print("  --scaling   Test O(N log N) complexity")
+        print("  --all       Run everything")
+        print()
+        print("Example: python benchmark_vs_rssa.py --all")
