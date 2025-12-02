@@ -1,10 +1,6 @@
 /build
 /MKL/py/.ipynb_checkpoints
 /MKL/py/__pycache__
-MKL/py/ssa_challenging_tests.ipynb
-MKL/py/ssa_demo.ipynb
-MKL/py/ssa_linkedin_showcase.ipynb
-MKL/py/ssa_max_accuracy.ipynb
 MKL/py/mssa_analysis.png
 MKL/py/ssa_denoising.png
 MKL/py/ssa_denoising_best.png
@@ -12,7 +8,6 @@ MKL/py/ssa_denoising_max_accuracy.png
 MKL/py/ssa_forecast.png
 MKL/py/ssa_periodic.png
 MKL/py/ssa_trend.png
-MKL/py/ssa_real_data_tests.ipynb
 MKL/py/linkedin_btc_max_accuracy.png
 MKL/py/linkedin_btc_trend.png
 MKL/py/linkedin_forecast.png
