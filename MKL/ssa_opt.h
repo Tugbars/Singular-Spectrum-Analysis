@@ -2155,27 +2155,26 @@ extern "C"
         // Define: g_i[t] = σ_i × h_i[t] / sqrt(c[t]) / ||X_i||_W
         // Then:   W[i,j] = Σ_t g_i[t] × g_j[t] = G @ Gᵀ  (BLAS dsyrk!)
         //
-        // This avoids n reconstructions inside the n² loop!
+        // OPTIMIZATION: Use cached U_fft/V_fft when available (from ssa_opt_cache_ffts)
+        // This saves 2n forward FFTs - we only need the complex multiply + IFFT.
         // =========================================================================
 
         // Cast away const for workspace access
         SSA_Opt *ssa_mut = (SSA_Opt *)ssa;
 
-        // Step 1: Compute inverse diagonal counts: inv_c[t] = 1 / c[t]
-        double *inv_c = (double *)ssa_opt_alloc(N * sizeof(double));
+        // Check if cached FFTs are available
+        int use_cache = (ssa->U_fft != NULL && ssa->V_fft != NULL);
+
+        // Step 1: Get inverse diagonal counts
+        // Use precomputed inv_diag_count instead of recomputing
+        // We also need sqrt for G normalization
         double *sqrt_inv_c = (double *)ssa_opt_alloc(N * sizeof(double));
-        if (!inv_c || !sqrt_inv_c)
-        {
-            ssa_opt_free_ptr(inv_c);
-            ssa_opt_free_ptr(sqrt_inv_c);
+        if (!sqrt_inv_c)
             return -1;
-        }
 
         for (int t = 0; t < N; t++)
         {
-            int c_t = ssa_opt_min(ssa_opt_min(t + 1, L), ssa_opt_min(K, N - t));
-            inv_c[t] = 1.0 / c_t;
-            sqrt_inv_c[t] = sqrt(inv_c[t]);
+            sqrt_inv_c[t] = sqrt(ssa->inv_diag_count[t]);
         }
 
         // Step 2: Compute h_i = conv(u_i, v_i) for all components via FFT
@@ -2183,18 +2182,24 @@ extern "C"
         double *G = (double *)ssa_opt_alloc(n * N * sizeof(double));
         double *norms = (double *)ssa_opt_alloc(n * sizeof(double));
         double *h_temp = (double *)ssa_opt_alloc(fft_len * sizeof(double));
-        double *u_fft = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
-        double *v_fft = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
 
-        if (!G || !norms || !h_temp || !u_fft || !v_fft)
+        // Only allocate u_fft/v_fft if we don't have cache
+        double *u_fft_local = NULL;
+        double *v_fft_local = NULL;
+        if (!use_cache)
         {
-            ssa_opt_free_ptr(inv_c);
+            u_fft_local = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
+            v_fft_local = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
+        }
+
+        if (!G || !norms || !h_temp || (!use_cache && (!u_fft_local || !v_fft_local)))
+        {
             ssa_opt_free_ptr(sqrt_inv_c);
             ssa_opt_free_ptr(G);
             ssa_opt_free_ptr(norms);
             ssa_opt_free_ptr(h_temp);
-            ssa_opt_free_ptr(u_fft);
-            ssa_opt_free_ptr(v_fft);
+            ssa_opt_free_ptr(u_fft_local);
+            ssa_opt_free_ptr(v_fft_local);
             return -1;
         }
 
@@ -2202,28 +2207,50 @@ extern "C"
         for (int i = 0; i < n; i++)
         {
             double sigma = ssa->sigma[i];
-            const double *u_vec = &ssa->U[i * L];
-            const double *v_vec = &ssa->V[i * K];
+            const double *u_fft_ptr;
+            const double *v_fft_ptr;
 
-            // FFT(u_i)
-            ssa_opt_zero(ssa_mut->ws_real, fft_len);
-            memcpy(ssa_mut->ws_real, u_vec, L * sizeof(double));
-            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, u_fft);
+            if (use_cache)
+            {
+                // ================================================================
+                // FAST PATH: Use cached FFTs
+                // Saves 2 forward FFTs per component = 2n FFTs total!
+                // ================================================================
+                u_fft_ptr = &ssa->U_fft[i * 2 * r2c_len];
+                v_fft_ptr = &ssa->V_fft[i * 2 * r2c_len];
+            }
+            else
+            {
+                // ================================================================
+                // SLOW PATH: Compute FFTs on the fly
+                // ================================================================
+                const double *u_vec = &ssa->U[i * L];
+                const double *v_vec = &ssa->V[i * K];
 
-            // FFT(v_i)
-            ssa_opt_zero(ssa_mut->ws_real, fft_len);
-            memcpy(ssa_mut->ws_real, v_vec, K * sizeof(double));
-            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, v_fft);
+                // FFT(u_i)
+                ssa_opt_zero(ssa_mut->ws_real, fft_len);
+                memcpy(ssa_mut->ws_real, u_vec, L * sizeof(double));
+                DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, u_fft_local);
+
+                // FFT(v_i)
+                ssa_opt_zero(ssa_mut->ws_real, fft_len);
+                memcpy(ssa_mut->ws_real, v_vec, K * sizeof(double));
+                DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, v_fft_local);
+
+                u_fft_ptr = u_fft_local;
+                v_fft_ptr = v_fft_local;
+            }
 
             // h_i = IFFT(FFT(u) × FFT(v)) = conv(u, v)
-            ssa_opt_complex_mul_r2c(u_fft, v_fft, ssa_mut->ws_complex, r2c_len);
+            ssa_opt_complex_mul_r2c(u_fft_ptr, v_fft_ptr, ssa_mut->ws_complex, r2c_len);
             DftiComputeBackward(ssa_mut->fft_c2r, ssa_mut->ws_complex, h_temp);
 
             // Compute ||X_i||_W² = σ² × Σ_t h_i[t]² / c[t]
+            // Use precomputed inv_diag_count
             double norm_sq = 0.0;
             for (int t = 0; t < N; t++)
             {
-                norm_sq += h_temp[t] * h_temp[t] * inv_c[t];
+                norm_sq += h_temp[t] * h_temp[t] * ssa->inv_diag_count[t];
             }
             norm_sq *= sigma * sigma;
             norms[i] = sqrt(norm_sq);
@@ -2256,13 +2283,12 @@ extern "C"
         }
 
         // Cleanup
-        ssa_opt_free_ptr(inv_c);
         ssa_opt_free_ptr(sqrt_inv_c);
         ssa_opt_free_ptr(G);
         ssa_opt_free_ptr(norms);
         ssa_opt_free_ptr(h_temp);
-        ssa_opt_free_ptr(u_fft);
-        ssa_opt_free_ptr(v_fft);
+        ssa_opt_free_ptr(u_fft_local);
+        ssa_opt_free_ptr(v_fft_local);
 
         return 0;
     }
@@ -2270,6 +2296,7 @@ extern "C"
     /**
      * Compute W-correlation between two specific components using direct formula.
      * Uses h_i = conv(u_i, v_i) instead of full reconstruction.
+     * OPTIMIZATION: Uses cached U_fft/V_fft when available.
      */
     double ssa_opt_wcorr_pair(const SSA_Opt *ssa, int i, int j)
     {
@@ -2286,53 +2313,95 @@ extern "C"
 
         SSA_Opt *ssa_mut = (SSA_Opt *)ssa;
 
+        // Check if cached FFTs are available
+        int use_cache = (ssa->U_fft != NULL && ssa->V_fft != NULL);
+
         // Allocate temp buffers for h_i and h_j
         double *h_i = (double *)ssa_opt_alloc(N * sizeof(double));
         double *h_j = (double *)ssa_opt_alloc(N * sizeof(double));
-        double *u_fft = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
-        double *v_fft = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
 
-        if (!h_i || !h_j || !u_fft || !v_fft)
+        // Only allocate u_fft/v_fft if we don't have cache
+        double *u_fft_local = NULL;
+        double *v_fft_local = NULL;
+        if (!use_cache)
+        {
+            u_fft_local = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
+            v_fft_local = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
+        }
+
+        if (!h_i || !h_j || (!use_cache && (!u_fft_local || !v_fft_local)))
         {
             ssa_opt_free_ptr(h_i);
             ssa_opt_free_ptr(h_j);
-            ssa_opt_free_ptr(u_fft);
-            ssa_opt_free_ptr(v_fft);
+            ssa_opt_free_ptr(u_fft_local);
+            ssa_opt_free_ptr(v_fft_local);
             return 0.0;
         }
 
         // Compute h_i = conv(u_i, v_i)
         {
-            const double *u_vec = &ssa->U[i * L];
-            const double *v_vec = &ssa->V[i * K];
+            const double *u_fft_ptr;
+            const double *v_fft_ptr;
 
-            ssa_opt_zero(ssa_mut->ws_real, fft_len);
-            memcpy(ssa_mut->ws_real, u_vec, L * sizeof(double));
-            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, u_fft);
+            if (use_cache)
+            {
+                // FAST PATH: Use cached FFTs
+                u_fft_ptr = &ssa->U_fft[i * 2 * r2c_len];
+                v_fft_ptr = &ssa->V_fft[i * 2 * r2c_len];
+            }
+            else
+            {
+                // SLOW PATH: Compute FFTs on the fly
+                const double *u_vec = &ssa->U[i * L];
+                const double *v_vec = &ssa->V[i * K];
 
-            ssa_opt_zero(ssa_mut->ws_real, fft_len);
-            memcpy(ssa_mut->ws_real, v_vec, K * sizeof(double));
-            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, v_fft);
+                ssa_opt_zero(ssa_mut->ws_real, fft_len);
+                memcpy(ssa_mut->ws_real, u_vec, L * sizeof(double));
+                DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, u_fft_local);
 
-            ssa_opt_complex_mul_r2c(u_fft, v_fft, ssa_mut->ws_complex, r2c_len);
+                ssa_opt_zero(ssa_mut->ws_real, fft_len);
+                memcpy(ssa_mut->ws_real, v_vec, K * sizeof(double));
+                DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, v_fft_local);
+
+                u_fft_ptr = u_fft_local;
+                v_fft_ptr = v_fft_local;
+            }
+
+            ssa_opt_complex_mul_r2c(u_fft_ptr, v_fft_ptr, ssa_mut->ws_complex, r2c_len);
             DftiComputeBackward(ssa_mut->fft_c2r, ssa_mut->ws_complex, ssa_mut->ws_real);
             memcpy(h_i, ssa_mut->ws_real, N * sizeof(double));
         }
 
         // Compute h_j = conv(u_j, v_j)
         {
-            const double *u_vec = &ssa->U[j * L];
-            const double *v_vec = &ssa->V[j * K];
+            const double *u_fft_ptr;
+            const double *v_fft_ptr;
 
-            ssa_opt_zero(ssa_mut->ws_real, fft_len);
-            memcpy(ssa_mut->ws_real, u_vec, L * sizeof(double));
-            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, u_fft);
+            if (use_cache)
+            {
+                // FAST PATH: Use cached FFTs
+                u_fft_ptr = &ssa->U_fft[j * 2 * r2c_len];
+                v_fft_ptr = &ssa->V_fft[j * 2 * r2c_len];
+            }
+            else
+            {
+                // SLOW PATH: Compute FFTs on the fly
+                const double *u_vec = &ssa->U[j * L];
+                const double *v_vec = &ssa->V[j * K];
 
-            ssa_opt_zero(ssa_mut->ws_real, fft_len);
-            memcpy(ssa_mut->ws_real, v_vec, K * sizeof(double));
-            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, v_fft);
+                ssa_opt_zero(ssa_mut->ws_real, fft_len);
+                memcpy(ssa_mut->ws_real, u_vec, L * sizeof(double));
+                DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, u_fft_local);
 
-            ssa_opt_complex_mul_r2c(u_fft, v_fft, ssa_mut->ws_complex, r2c_len);
+                ssa_opt_zero(ssa_mut->ws_real, fft_len);
+                memcpy(ssa_mut->ws_real, v_vec, K * sizeof(double));
+                DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, v_fft_local);
+
+                u_fft_ptr = u_fft_local;
+                v_fft_ptr = v_fft_local;
+            }
+
+            ssa_opt_complex_mul_r2c(u_fft_ptr, v_fft_ptr, ssa_mut->ws_complex, r2c_len);
             DftiComputeBackward(ssa_mut->fft_c2r, ssa_mut->ws_complex, ssa_mut->ws_real);
             memcpy(h_j, ssa_mut->ws_real, N * sizeof(double));
         }
@@ -2340,14 +2409,14 @@ extern "C"
         // Compute W-correlation using direct formula:
         // <X_i, X_j>_W = σ_i × σ_j × Σ_t h_i[t] × h_j[t] / c[t]
         // ||X_i||_W² = σ_i² × Σ_t h_i[t]² / c[t]
+        // Use precomputed inv_diag_count instead of recomputing c_t
         double sigma_i = ssa->sigma[i];
         double sigma_j = ssa->sigma[j];
 
         double inner = 0.0, norm_i_sq = 0.0, norm_j_sq = 0.0;
         for (int t = 0; t < N; t++)
         {
-            int c_t = ssa_opt_min(ssa_opt_min(t + 1, L), ssa_opt_min(K, N - t));
-            double inv_c = 1.0 / c_t;
+            double inv_c = ssa->inv_diag_count[t];
             inner += h_i[t] * h_j[t] * inv_c;
             norm_i_sq += h_i[t] * h_i[t] * inv_c;
             norm_j_sq += h_j[t] * h_j[t] * inv_c;
@@ -2359,8 +2428,8 @@ extern "C"
 
         ssa_opt_free_ptr(h_i);
         ssa_opt_free_ptr(h_j);
-        ssa_opt_free_ptr(u_fft);
-        ssa_opt_free_ptr(v_fft);
+        ssa_opt_free_ptr(u_fft_local);
+        ssa_opt_free_ptr(v_fft_local);
 
         double denom = sqrt(norm_i_sq) * sqrt(norm_j_sq);
         return (denom > 1e-12) ? inner / denom : 0.0;
