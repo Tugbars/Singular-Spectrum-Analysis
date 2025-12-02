@@ -1673,123 +1673,134 @@ extern "C"
         int L = ssa->L;
         int K = ssa->K;
         int n = ssa->n_components;
+        int fft_len = ssa->fft_len;
+        int r2c_len = ssa->r2c_len;
 
         // =========================================================================
-        // STEP 1: Compute diagonal averaging weights
+        // OPTIMIZED W-CORRELATION: O(n × N log N + n² × N) instead of O(n² × N log N)
         //
-        // The weight w[t] counts how many elements contribute to position t in
-        // diagonal averaging. This forms a trapezoid shape:
-        //   - Ramps up from 1 to min(L, K) at the start
-        //   - Flat plateau at min(L, K) in the middle
-        //   - Ramps down symmetrically at the end
+        // Key insight: X_i[t] = σ_i × h_i[t] / c[t]  where h_i = conv(u_i, v_i)
         //
-        // These weights define the W-inner product: <X, Y>_W = Σₜ w[t]·X[t]·Y[t]
+        // <X_i, X_j>_W = σ_i × σ_j × Σ_t h_i[t] × h_j[t] / c[t]
+        //
+        // Define: g_i[t] = σ_i × h_i[t] / sqrt(c[t]) / ||X_i||_W
+        // Then:   W[i,j] = Σ_t g_i[t] × g_j[t] = G @ Gᵀ  (BLAS dsyrk!)
+        //
+        // This avoids n reconstructions inside the n² loop!
         // =========================================================================
-        double *weights = (double *)ssa_opt_alloc(N * sizeof(double));
-        if (!weights)
+
+        // Cast away const for workspace access
+        SSA_Opt *ssa_mut = (SSA_Opt *)ssa;
+
+        // Step 1: Compute inverse diagonal counts: inv_c[t] = 1 / c[t]
+        double *inv_c = (double *)ssa_opt_alloc(N * sizeof(double));
+        double *sqrt_inv_c = (double *)ssa_opt_alloc(N * sizeof(double));
+        if (!inv_c || !sqrt_inv_c)
+        {
+            ssa_opt_free_ptr(inv_c);
+            ssa_opt_free_ptr(sqrt_inv_c);
             return -1;
+        }
 
         for (int t = 0; t < N; t++)
         {
-            // w[t] = min(t+1, L, K, N-t) - the number of anti-diagonal elements at t
-            weights[t] = (double)ssa_opt_min(ssa_opt_min(t + 1, L),
-                                             ssa_opt_min(K, N - t));
+            int c_t = ssa_opt_min(ssa_opt_min(t + 1, L), ssa_opt_min(K, N - t));
+            inv_c[t] = 1.0 / c_t;
+            sqrt_inv_c[t] = sqrt(inv_c[t]);
         }
 
-        // =========================================================================
-        // STEP 2: Reconstruct all individual components
-        //
-        // For W-correlation, we need the reconstructed time series Xᵢ for each
-        // component i. These are stored contiguously: reconstructed[i*N : (i+1)*N]
-        // =========================================================================
-        double *reconstructed = (double *)ssa_opt_alloc(N * n * sizeof(double));
-        if (!reconstructed)
-        {
-            ssa_opt_free_ptr(weights);
-            return -1;
-        }
-
-        // Reconstruct each component individually
-        for (int i = 0; i < n; i++)
-        {
-            int group[] = {i};
-            ssa_opt_reconstruct(ssa, group, 1, &reconstructed[i * N]);
-        }
-
-        // =========================================================================
-        // STEP 3: Compute weighted norms ‖Xᵢ‖_W for normalization
-        //
-        // ‖X‖_W = √(<X, X>_W) = √(Σₜ w[t]·X[t]²)
-        // These are precomputed to avoid redundant calculations in the matrix loop
-        // =========================================================================
+        // Step 2: Compute h_i = conv(u_i, v_i) for all components via FFT
+        // and build G matrix: G[i,t] = σ_i × h_i[t] / sqrt(c[t]) / ||X_i||_W
+        double *G = (double *)ssa_opt_alloc(n * N * sizeof(double));
         double *norms = (double *)ssa_opt_alloc(n * sizeof(double));
-        if (!norms)
+        double *h_temp = (double *)ssa_opt_alloc(fft_len * sizeof(double));
+        double *u_fft = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
+        double *v_fft = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
+
+        if (!G || !norms || !h_temp || !u_fft || !v_fft)
         {
-            ssa_opt_free_ptr(weights);
-            ssa_opt_free_ptr(reconstructed);
+            ssa_opt_free_ptr(inv_c);
+            ssa_opt_free_ptr(sqrt_inv_c);
+            ssa_opt_free_ptr(G);
+            ssa_opt_free_ptr(norms);
+            ssa_opt_free_ptr(h_temp);
+            ssa_opt_free_ptr(u_fft);
+            ssa_opt_free_ptr(v_fft);
             return -1;
         }
 
+        // Compute h_i and norms for each component
         for (int i = 0; i < n; i++)
         {
-            double *x_i = &reconstructed[i * N];
-            double sum = 0.0;
+            double sigma = ssa->sigma[i];
+            const double *u_vec = &ssa->U[i * L];
+            const double *v_vec = &ssa->V[i * K];
+
+            // FFT(u_i)
+            ssa_opt_zero(ssa_mut->ws_real, fft_len);
+            memcpy(ssa_mut->ws_real, u_vec, L * sizeof(double));
+            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, u_fft);
+
+            // FFT(v_i)
+            ssa_opt_zero(ssa_mut->ws_real, fft_len);
+            memcpy(ssa_mut->ws_real, v_vec, K * sizeof(double));
+            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, v_fft);
+
+            // h_i = IFFT(FFT(u) × FFT(v)) = conv(u, v)
+            ssa_opt_complex_mul_r2c(u_fft, v_fft, ssa_mut->ws_complex, r2c_len);
+            DftiComputeBackward(ssa_mut->fft_c2r, ssa_mut->ws_complex, h_temp);
+
+            // Compute ||X_i||_W² = σ² × Σ_t h_i[t]² / c[t]
+            double norm_sq = 0.0;
             for (int t = 0; t < N; t++)
             {
-                sum += weights[t] * x_i[t] * x_i[t];
+                norm_sq += h_temp[t] * h_temp[t] * inv_c[t];
             }
-            norms[i] = sqrt(sum);
+            norm_sq *= sigma * sigma;
+            norms[i] = sqrt(norm_sq);
+
+            // Store scaled h in G: G[i,t] = σ × h[t] / sqrt(c[t]) / ||X_i||_W
+            double scale = (norms[i] > 1e-12) ? sigma / norms[i] : 0.0;
+            double *g_row = &G[i * N];
+            for (int t = 0; t < N; t++)
+            {
+                g_row[t] = scale * h_temp[t] * sqrt_inv_c[t];
+            }
         }
 
-        // =========================================================================
-        // STEP 4: Compute W-correlation matrix
-        //
-        // ρ_W(i,j) = <Xᵢ, Xⱼ>_W / (‖Xᵢ‖_W × ‖Xⱼ‖_W)
-        //
-        // The matrix is symmetric, so we only compute upper triangle and mirror.
-        // Diagonal elements are always 1.0 (component correlated with itself).
-        //
-        // INTERPRETATION:
-        //   - |ρ_W| ≈ 1: Components are highly correlated, should be grouped
-        //   - |ρ_W| ≈ 0: Components are independent, can be separated
-        //   - Periodic signals show high correlation between sine/cosine pairs
-        // =========================================================================
+        // Step 3: W = G @ Gᵀ via BLAS dsyrk (symmetric rank-k update)
+        // G is stored row-major: G[i,t] at G[i*N + t], dimensions n×N
+        // W[i,j] = Σ_t G[i,t] × G[j,t]
+        // dsyrk with RowMajor, NoTrans computes C := α A Aᵀ + β C
+        cblas_dsyrk(CblasRowMajor, CblasUpper, CblasNoTrans,
+                    n, N,       // n×n result from n×N matrix
+                    1.0, G, N,  // α=1, A=G, lda=N (row-major leading dim = num cols)
+                    0.0, W, n); // β=0, C=W, ldc=n
+
+        // Fill lower triangle (dsyrk only fills upper)
         for (int i = 0; i < n; i++)
         {
-            double *x_i = &reconstructed[i * N];
-
-            for (int j = i; j < n; j++)
+            for (int j = i + 1; j < n; j++)
             {
-                double *x_j = &reconstructed[j * N];
-
-                // Weighted inner product: <Xᵢ, Xⱼ>_W = Σₜ w[t]·Xᵢ[t]·Xⱼ[t]
-                double inner = 0.0;
-                for (int t = 0; t < N; t++)
-                {
-                    inner += weights[t] * x_i[t] * x_j[t];
-                }
-
-                // Normalize to get correlation in [-1, 1]
-                double denom = norms[i] * norms[j];
-                double corr = (denom > 1e-12) ? inner / denom : 0.0;
-
-                // Store in both (i,j) and (j,i) for symmetric matrix
-                W[i * n + j] = corr;
-                W[j * n + i] = corr;
+                W[j * n + i] = W[i * n + j];
             }
         }
 
-        // Cleanup temporary allocations
-        ssa_opt_free_ptr(weights);
-        ssa_opt_free_ptr(reconstructed);
+        // Cleanup
+        ssa_opt_free_ptr(inv_c);
+        ssa_opt_free_ptr(sqrt_inv_c);
+        ssa_opt_free_ptr(G);
         ssa_opt_free_ptr(norms);
+        ssa_opt_free_ptr(h_temp);
+        ssa_opt_free_ptr(u_fft);
+        ssa_opt_free_ptr(v_fft);
 
         return 0;
     }
 
     /**
-     * Compute W-correlation between two specific components (more efficient than full matrix).
-     * Same formula as wcorr_matrix but only for one pair.
+     * Compute W-correlation between two specific components using direct formula.
+     * Uses h_i = conv(u_i, v_i) instead of full reconstruction.
      */
     double ssa_opt_wcorr_pair(const SSA_Opt *ssa, int i, int j)
     {
@@ -1801,41 +1812,88 @@ extern "C"
         int N = ssa->N;
         int L = ssa->L;
         int K = ssa->K;
+        int fft_len = ssa->fft_len;
+        int r2c_len = ssa->r2c_len;
 
-        // Reconstruct the two components we're comparing
-        double *x_i = (double *)ssa_opt_alloc(N * sizeof(double));
-        double *x_j = (double *)ssa_opt_alloc(N * sizeof(double));
+        SSA_Opt *ssa_mut = (SSA_Opt *)ssa;
 
-        if (!x_i || !x_j)
+        // Allocate temp buffers for h_i and h_j
+        double *h_i = (double *)ssa_opt_alloc(N * sizeof(double));
+        double *h_j = (double *)ssa_opt_alloc(N * sizeof(double));
+        double *u_fft = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
+        double *v_fft = (double *)ssa_opt_alloc(2 * r2c_len * sizeof(double));
+
+        if (!h_i || !h_j || !u_fft || !v_fft)
         {
-            ssa_opt_free_ptr(x_i);
-            ssa_opt_free_ptr(x_j);
+            ssa_opt_free_ptr(h_i);
+            ssa_opt_free_ptr(h_j);
+            ssa_opt_free_ptr(u_fft);
+            ssa_opt_free_ptr(v_fft);
             return 0.0;
         }
 
-        int group_i[] = {i};
-        int group_j[] = {j};
-        ssa_opt_reconstruct(ssa, group_i, 1, x_i);
-        ssa_opt_reconstruct(ssa, group_j, 1, x_j);
-
-        // Compute weighted inner product and norms in single pass
-        double inner = 0.0, norm_i = 0.0, norm_j = 0.0;
-
-        for (int t = 0; t < N; t++)
+        // Compute h_i = conv(u_i, v_i)
         {
-            // Diagonal averaging weight at position t
-            double w = (double)ssa_opt_min(ssa_opt_min(t + 1, L),
-                                           ssa_opt_min(K, N - t));
-            inner += w * x_i[t] * x_j[t];  // <Xᵢ, Xⱼ>_W
-            norm_i += w * x_i[t] * x_i[t]; // ‖Xᵢ‖²_W
-            norm_j += w * x_j[t] * x_j[t]; // ‖Xⱼ‖²_W
+            const double *u_vec = &ssa->U[i * L];
+            const double *v_vec = &ssa->V[i * K];
+
+            ssa_opt_zero(ssa_mut->ws_real, fft_len);
+            memcpy(ssa_mut->ws_real, u_vec, L * sizeof(double));
+            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, u_fft);
+
+            ssa_opt_zero(ssa_mut->ws_real, fft_len);
+            memcpy(ssa_mut->ws_real, v_vec, K * sizeof(double));
+            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, v_fft);
+
+            ssa_opt_complex_mul_r2c(u_fft, v_fft, ssa_mut->ws_complex, r2c_len);
+            DftiComputeBackward(ssa_mut->fft_c2r, ssa_mut->ws_complex, ssa_mut->ws_real);
+            memcpy(h_i, ssa_mut->ws_real, N * sizeof(double));
         }
 
-        ssa_opt_free_ptr(x_i);
-        ssa_opt_free_ptr(x_j);
+        // Compute h_j = conv(u_j, v_j)
+        {
+            const double *u_vec = &ssa->U[j * L];
+            const double *v_vec = &ssa->V[j * K];
 
-        // ρ_W(i,j) = <Xᵢ, Xⱼ>_W / (‖Xᵢ‖_W × ‖Xⱼ‖_W)
-        double denom = sqrt(norm_i) * sqrt(norm_j);
+            ssa_opt_zero(ssa_mut->ws_real, fft_len);
+            memcpy(ssa_mut->ws_real, u_vec, L * sizeof(double));
+            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, u_fft);
+
+            ssa_opt_zero(ssa_mut->ws_real, fft_len);
+            memcpy(ssa_mut->ws_real, v_vec, K * sizeof(double));
+            DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, v_fft);
+
+            ssa_opt_complex_mul_r2c(u_fft, v_fft, ssa_mut->ws_complex, r2c_len);
+            DftiComputeBackward(ssa_mut->fft_c2r, ssa_mut->ws_complex, ssa_mut->ws_real);
+            memcpy(h_j, ssa_mut->ws_real, N * sizeof(double));
+        }
+
+        // Compute W-correlation using direct formula:
+        // <X_i, X_j>_W = σ_i × σ_j × Σ_t h_i[t] × h_j[t] / c[t]
+        // ||X_i||_W² = σ_i² × Σ_t h_i[t]² / c[t]
+        double sigma_i = ssa->sigma[i];
+        double sigma_j = ssa->sigma[j];
+
+        double inner = 0.0, norm_i_sq = 0.0, norm_j_sq = 0.0;
+        for (int t = 0; t < N; t++)
+        {
+            int c_t = ssa_opt_min(ssa_opt_min(t + 1, L), ssa_opt_min(K, N - t));
+            double inv_c = 1.0 / c_t;
+            inner += h_i[t] * h_j[t] * inv_c;
+            norm_i_sq += h_i[t] * h_i[t] * inv_c;
+            norm_j_sq += h_j[t] * h_j[t] * inv_c;
+        }
+
+        inner *= sigma_i * sigma_j;
+        norm_i_sq *= sigma_i * sigma_i;
+        norm_j_sq *= sigma_j * sigma_j;
+
+        ssa_opt_free_ptr(h_i);
+        ssa_opt_free_ptr(h_j);
+        ssa_opt_free_ptr(u_fft);
+        ssa_opt_free_ptr(v_fft);
+
+        double denom = sqrt(norm_i_sq) * sqrt(norm_j_sq);
         return (denom > 1e-12) ? inner / denom : 0.0;
     }
 
