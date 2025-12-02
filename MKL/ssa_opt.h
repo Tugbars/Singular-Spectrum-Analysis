@@ -1384,9 +1384,21 @@ extern "C"
         int fft_len = ssa->fft_len;
         int r2c_len = ssa->r2c_len;
 
-        ssa_opt_zero(output, N);
-
         SSA_Opt *ssa_mut = (SSA_Opt *)ssa;
+
+        // =========================================================================
+        // FREQUENCY-DOMAIN ACCUMULATION OPTIMIZATION
+        //
+        // Instead of: for each component { complex_mul → IFFT → accumulate real }
+        // We do:      for each component { complex_mul → accumulate complex }
+        //             single IFFT at end
+        //
+        // This reduces n_group IFFTs to just 1 IFFT!
+        // =========================================================================
+
+        // Use ws_batch_complex as frequency accumulator (zero it first)
+        double *freq_accum = ssa_mut->ws_batch_complex;
+        ssa_opt_zero(freq_accum, 2 * r2c_len);
 
         if (ssa->fft_cached && ssa->U_fft && ssa->V_fft)
         {
@@ -1400,21 +1412,20 @@ extern "C"
                 const double *u_fft_cached = &ssa->U_fft[idx * 2 * r2c_len];
                 const double *v_fft_cached = &ssa->V_fft[idx * 2 * r2c_len];
 
-                // Complex multiply - HALF the work compared to C2C!
+                // Complex multiply into temp buffer
                 ssa_opt_complex_mul_r2c(u_fft_cached, v_fft_cached,
                                         ssa_mut->ws_complex, r2c_len);
 
-                // C2R IFFT - direct real output!
-                DftiComputeBackward(ssa_mut->fft_c2r, ssa_mut->ws_complex, ssa_mut->ws_real);
-
-                // Accumulate
-                for (int t = 0; t < N; t++)
-                    output[t] += ssa_mut->ws_real[t];
+                // Accumulate in frequency domain: freq_accum += ws_complex
+                cblas_daxpy(2 * r2c_len, 1.0, ssa_mut->ws_complex, 1, freq_accum, 1);
             }
         }
         else
         {
             // STANDARD PATH: Compute FFTs on-the-fly
+            // Use second slot of ws_batch_complex for temp FFT output
+            double *temp_fft2 = ssa_mut->ws_batch_complex + 2 * r2c_len;
+
             for (int g = 0; g < n_group; g++)
             {
                 int idx = group[g];
@@ -1425,32 +1436,31 @@ extern "C"
                 const double *u_vec = &ssa->U[idx * L];
                 const double *v_vec = &ssa->V[idx * K];
 
-                // Pack σ × u
+                // FFT(σ × u) → ws_complex
                 ssa_opt_zero(ssa_mut->ws_real, fft_len);
                 for (int i = 0; i < L; i++)
                     ssa_mut->ws_real[i] = sigma * u_vec[i];
-
                 DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, ssa_mut->ws_complex);
 
-                // Pack v
+                // FFT(v) → temp_fft2
                 ssa_opt_zero(ssa_mut->ws_real2, fft_len);
                 for (int i = 0; i < K; i++)
                     ssa_mut->ws_real2[i] = v_vec[i];
+                DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real2, temp_fft2);
 
-                double *ws_complex2 = ssa_mut->ws_batch_complex;
-                DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real2, ws_complex2);
+                // Complex multiply: ws_complex = ws_complex ⊙ temp_fft2
+                ssa_opt_complex_mul_r2c(ssa_mut->ws_complex, temp_fft2, ssa_mut->ws_complex, r2c_len);
 
-                // Complex multiply - HALF the work!
-                ssa_opt_complex_mul_r2c(ssa_mut->ws_complex, ws_complex2,
-                                        ssa_mut->ws_complex, r2c_len);
-
-                // C2R IFFT
-                DftiComputeBackward(ssa_mut->fft_c2r, ssa_mut->ws_complex, ssa_mut->ws_real);
-
-                for (int t = 0; t < N; t++)
-                    output[t] += ssa_mut->ws_real[t];
+                // Accumulate in frequency domain: freq_accum += ws_complex
+                cblas_daxpy(2 * r2c_len, 1.0, ssa_mut->ws_complex, 1, freq_accum, 1);
             }
         }
+
+        // Single IFFT at the end
+        DftiComputeBackward(ssa_mut->fft_c2r, freq_accum, ssa_mut->ws_real);
+
+        // Copy result (first N elements)
+        memcpy(output, ssa_mut->ws_real, N * sizeof(double));
 
         // Diagonal averaging
         vdMul(N, output, ssa->inv_diag_count, output);
