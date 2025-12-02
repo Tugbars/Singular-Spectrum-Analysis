@@ -64,6 +64,10 @@
 #include <mkl_vsl.h>
 #include <mkl_lapacke.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -117,6 +121,8 @@ extern "C"
         DFTI_DESCRIPTOR_HANDLE fft_r2c_batch; ///< Batched R2C
         DFTI_DESCRIPTOR_HANDLE fft_c2r_batch; ///< Batched C2R
 
+        DFTI_DESCRIPTOR_HANDLE fft_c2r_wcorr; ///< Batched C2R for wcorr (n_components transforms)
+
         // Random Number Generator
         VSLStreamStatePtr rng;
 
@@ -145,6 +151,11 @@ extern "C"
         double *U_fft;          ///< Cached FFT of scaled U vectors (R2C format)
         double *V_fft;          ///< Cached FFT of V vectors (R2C format)
         bool fft_cached;        ///< True if U_fft/V_fft are populated
+
+        double *wcorr_ws_complex; ///< n * 2 * r2c_len doubles
+        double *wcorr_h;          ///< n * fft_len doubles
+        double *wcorr_G;          ///< n * N doubles
+        double *wcorr_sqrt_inv_c; ///< N doubles (precomputed)
 
         // State
         bool initialized;
@@ -1621,9 +1632,20 @@ extern "C"
             return;
         ssa_opt_free_ptr(ssa->U_fft);
         ssa_opt_free_ptr(ssa->V_fft);
+        if (ssa->fft_c2r_wcorr)
+            DftiFreeDescriptor(&ssa->fft_c2r_wcorr);
         ssa->U_fft = NULL;
         ssa->V_fft = NULL;
         ssa->fft_cached = false;
+
+        ssa_opt_free_ptr(ssa->wcorr_ws_complex);
+        ssa_opt_free_ptr(ssa->wcorr_h);
+        ssa_opt_free_ptr(ssa->wcorr_G);
+        ssa_opt_free_ptr(ssa->wcorr_sqrt_inv_c);
+        ssa->wcorr_ws_complex = NULL;
+        ssa->wcorr_h = NULL;
+        ssa->wcorr_G = NULL;
+        ssa->wcorr_sqrt_inv_c = NULL;
     }
 
     int ssa_opt_cache_ffts(SSA_Opt *ssa)
@@ -1632,7 +1654,8 @@ extern "C"
             return -1;
 
         ssa_opt_free_cached_ffts(ssa);
-
+        
+        int N = ssa->N;        
         int L = ssa->L;
         int K = ssa->K;
         int fft_len = ssa->fft_len;
@@ -1674,6 +1697,53 @@ extern "C"
                 ssa->ws_real[j] = v_vec[j];
 
             DftiComputeForward(ssa->fft_r2c, ssa->ws_real, dst);
+        }
+
+        {
+            MKL_LONG status;
+            double scale = 1.0 / fft_len;
+
+            if (ssa->fft_c2r_wcorr)
+                DftiFreeDescriptor(&ssa->fft_c2r_wcorr);
+
+            // Allocate wcorr workspace buffers
+            ssa->wcorr_ws_complex = (double *)ssa_opt_alloc(k * 2 * r2c_len * sizeof(double));
+            ssa->wcorr_h = (double *)ssa_opt_alloc(k * fft_len * sizeof(double));
+            ssa->wcorr_G = (double *)ssa_opt_alloc(k * N * sizeof(double));
+            ssa->wcorr_sqrt_inv_c = (double *)ssa_opt_alloc(N * sizeof(double));
+
+            if (!ssa->wcorr_ws_complex || !ssa->wcorr_h || !ssa->wcorr_G || !ssa->wcorr_sqrt_inv_c)
+            {
+                ssa_opt_free_cached_ffts(ssa);
+                return -1;
+            }
+
+            // Precompute sqrt_inv_c ONCE (not every wcorr call!)
+            for (int t = 0; t < N; t++)
+            {
+                ssa->wcorr_sqrt_inv_c[t] = sqrt(ssa->inv_diag_count[t]);
+            }
+
+            status = DftiCreateDescriptor(&ssa->fft_c2r_wcorr, DFTI_DOUBLE, DFTI_REAL, 1, fft_len);
+            if (status != 0)
+            {
+                ssa_opt_free_cached_ffts(ssa);
+                return -1;
+            }
+
+            DftiSetValue(ssa->fft_c2r_wcorr, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
+            DftiSetValue(ssa->fft_c2r_wcorr, DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
+            DftiSetValue(ssa->fft_c2r_wcorr, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)k);
+            DftiSetValue(ssa->fft_c2r_wcorr, DFTI_INPUT_DISTANCE, (MKL_LONG)r2c_len);
+            DftiSetValue(ssa->fft_c2r_wcorr, DFTI_OUTPUT_DISTANCE, (MKL_LONG)fft_len);
+            DftiSetValue(ssa->fft_c2r_wcorr, DFTI_BACKWARD_SCALE, scale);
+
+            status = DftiCommitDescriptor(ssa->fft_c2r_wcorr);
+            if (status != 0)
+            {
+                ssa_opt_free_cached_ffts(ssa);
+                return -1;
+            }
         }
 
         ssa->fft_cached = true;
@@ -3618,6 +3688,117 @@ extern "C"
 
         return sum / mssa->total_variance;
     }
+
+    /**
+     * ============================================================================
+     * PARALLELIZED W-CORRELATION MATRIX (Add this to ssa_opt.h)
+     * ============================================================================
+     *
+     * Insert this function inside #ifdef SSA_OPT_IMPLEMENTATION,
+     * after ssa_opt_wcorr_matrix().
+     *
+     * Strategy:
+     *   - OpenMP for non-MKL work (complex multiply, norm computation)
+     *   - Batched IFFT via MKL (n transforms in one call)
+     *   - DSYRK via MKL (threaded internally)
+     *
+     * Expected speedup: 3-6x over sequential version
+     * ============================================================================
+     */
+
+    /**
+     * @brief Compute W-correlation matrix using parallelized batched operations.
+     *
+     * Requires cached FFTs (call ssa_opt_cache_ffts first).
+     * Falls back to sequential version if cache unavailable.
+     *
+     * Optimization approach:
+     *   1. Parallel complex multiply (OpenMP) - n independent operations
+     *   2. Batched IFFT (MKL) - n transforms in single call
+     *   3. Parallel G matrix construction (OpenMP) - n independent rows
+     *   4. DSYRK (MKL) - W = G @ G^T
+     */
+   int ssa_opt_wcorr_matrix_fast(const SSA_Opt *ssa, double *W)
+{
+    int N, n, fft_len, r2c_len;
+    int i, t, k;
+    int ii, jj;
+
+    if (!ssa || !ssa->decomposed || !W)
+        return -1;
+
+    /* Must have cached FFTs and workspace */
+    if (!ssa->fft_cached || !ssa->wcorr_ws_complex)
+        return ssa_opt_wcorr_matrix(ssa, W);
+
+    N = ssa->N;
+    n = ssa->n_components;
+    fft_len = ssa->fft_len;
+    r2c_len = ssa->r2c_len;
+
+    /* Use pre-allocated buffers */
+    double *all_ws_complex = ssa->wcorr_ws_complex;
+    double *all_h = ssa->wcorr_h;
+    double *G = ssa->wcorr_G;
+    double *sqrt_inv_c = ssa->wcorr_sqrt_inv_c;
+
+    /* Step 1: Parallel complex multiply */
+    #pragma omp parallel for private(k)
+    for (i = 0; i < n; i++)
+    {
+        const double *u_fft = &ssa->U_fft[i * 2 * r2c_len];
+        const double *v_fft = &ssa->V_fft[i * 2 * r2c_len];
+        double *ws = &all_ws_complex[i * 2 * r2c_len];
+
+        for (k = 0; k < r2c_len; k++)
+        {
+            double ar = u_fft[2 * k];
+            double ai = u_fft[2 * k + 1];
+            double br = v_fft[2 * k];
+            double bi = v_fft[2 * k + 1];
+            ws[2 * k] = ar * br - ai * bi;
+            ws[2 * k + 1] = ar * bi + ai * br;
+        }
+    }
+
+    /* Step 2: Batched IFFT */
+    {
+        MKL_LONG status = DftiComputeBackward(ssa->fft_c2r_wcorr, all_ws_complex, all_h);
+        if (status != 0)
+            return -1;
+    }
+
+    /* Step 3: Parallel G matrix construction */
+    #pragma omp parallel for private(t)
+    for (i = 0; i < n; i++)
+    {
+        double *h = &all_h[i * fft_len];
+        double sigma = ssa->sigma[i];
+        double norm_sq = 0.0;
+        double norm, scale;
+        double *g_row;
+
+        for (t = 0; t < N; t++)
+            norm_sq += h[t] * h[t] * ssa->inv_diag_count[t];
+        norm_sq *= sigma * sigma;
+        norm = sqrt(norm_sq);
+
+        scale = (norm > 1e-12) ? sigma / norm : 0.0;
+        g_row = &G[i * N];
+        for (t = 0; t < N; t++)
+            g_row[t] = scale * h[t] * sqrt_inv_c[t];
+    }
+
+    /* Step 4: DSYRK */
+    cblas_dsyrk(CblasRowMajor, CblasUpper, CblasNoTrans,
+                n, N, 1.0, G, N, 0.0, W, n);
+
+    for (ii = 0; ii < n; ii++)
+        for (jj = ii + 1; jj < n; jj++)
+            W[jj * n + ii] = W[ii * n + jj];
+
+    return 0;
+}
 
 #endif // SSA_OPT_IMPLEMENTATION
 
