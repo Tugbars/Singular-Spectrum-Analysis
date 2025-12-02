@@ -1,5 +1,6 @@
 LIBRARY ssa
 EXPORTS
+    ; === Original SSA exports (unchanged) ===
     ssa_opt_init
     ssa_opt_decompose
     ssa_opt_decompose_block
@@ -20,6 +21,8 @@ EXPORTS
     ssa_opt_get_noise
     ssa_opt_cache_ffts
     ssa_opt_free
+    
+    ; === Original MSSA exports (unchanged) ===
     mssa_opt_init
     mssa_opt_decompose
     mssa_opt_reconstruct
@@ -27,3 +30,16 @@ EXPORTS
     mssa_opt_series_contributions
     mssa_opt_variance_explained
     mssa_opt_free
+    
+    ; === NEW: Additional SSA functions ===
+    ssa_opt_extend
+    
+    ; === NEW: MKL Configuration Functions ===
+    ssa_mkl_init
+    ssa_mkl_init_14900kf
+    ssa_mkl_init_generic
+    ssa_mkl_set_threads
+    ssa_mkl_get_threads
+    ssa_mkl_get_cpu_info
+    ssa_mkl_set_p_core_affinity
+    ssa_mkl_disable_affinity

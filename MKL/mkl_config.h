@@ -916,11 +916,11 @@ static void mkl_config_14900kf(int verbose)
  *       // ...
  *   }
  */
-static void mkl_config_sssa_full(int verbose)
+static void mkl_config_ssa_full(int verbose)
 {
     // Hardware setup
     mkl_config_set_p_core_affinity();
-    mkl_config_set_instructasasdfaions("AVX2");
+    mkl_config_set_instructions("AVX2");
     mkl_config_init_ex(MKL_CONFIG_P_CORES, verbose);
     
     // Memory allocation hints
