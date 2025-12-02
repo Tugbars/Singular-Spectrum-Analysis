@@ -1,14 +1,11 @@
 /*
- * SSA Optimized Test Suite
+ * SSA Optimized Test Suite (R2C Version)
  *
- * Compares ssa_opt.h (optimized) performance.
- *
- * Compile without MKL:
- *   gcc -O3 -march=native -o ssa_opt_test ssa_opt_test.c -lm
+ * Compares ssa_opt_r2c.h (R2C optimized) performance.
  *
  * Compile with MKL:
  *   source /opt/intel/oneapi/setvars.sh
- *   gcc -O3 -march=native -DSSA_USE_MKL -I${MKLROOT}/include \
+ *   gcc -O3 -march=native -I${MKLROOT}/include \
  *       -o ssa_opt_test ssa_opt_test.c \
  *       -L${MKLROOT}/lib/intel64 -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core \
  *       -liomp5 -lpthread -lm
@@ -71,6 +68,15 @@ static inline double get_time_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+#elif defined(_WIN32)
+#include <windows.h>
+static inline double get_time_ms(void)
+{
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart * 1000.0 / (double)freq.QuadPart;
 }
 #else
 static inline double get_time_ms(void)
@@ -162,7 +168,8 @@ void test_initialization(void)
     ASSERT_EQ(ssa.L, L, "L stored correctly");
     ASSERT_EQ(ssa.K, N - L + 1, "K computed correctly");
     ASSERT_TRUE(ssa.fft_x != NULL, "fft_x allocated");
-    ASSERT_TRUE(ssa.ws_fft1 != NULL, "workspace allocated");
+    ASSERT_TRUE(ssa.ws_real != NULL, "ws_real allocated");      // R2C field name
+    ASSERT_TRUE(ssa.ws_complex != NULL, "ws_complex allocated"); // R2C field name
 
     ssa_opt_free(&ssa);
     free(x);
@@ -191,6 +198,66 @@ void test_decomposition(void)
     }
 
     // Should be sorted descending
+    for (int i = 0; i < k - 1; i++)
+    {
+        ASSERT_GT(ssa.sigma[i] + 1e-10, ssa.sigma[i + 1], "sigma sorted");
+    }
+
+    ssa_opt_free(&ssa);
+    free(x);
+}
+
+void test_decomposition_block(void)
+{
+    int N = 500, L = 100, k = 10;
+    g_seed = 12345;
+
+    double *x = (double *)malloc(N * sizeof(double));
+    generate_signal(x, N);
+
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    int ret = ssa_opt_decompose_block(&ssa, k, 4, 50);
+
+    ASSERT_EQ(ret, 0, "decompose_block returns 0");
+    ASSERT_TRUE(ssa.decomposed, "decomposed flag set");
+    ASSERT_EQ(ssa.n_components, k, "n_components correct");
+
+    // Singular values should be positive and sorted
+    for (int i = 0; i < k; i++)
+    {
+        ASSERT_GT(ssa.sigma[i] + 1e-10, 0, "sigma positive");
+    }
+    for (int i = 0; i < k - 1; i++)
+    {
+        ASSERT_GT(ssa.sigma[i] + 1e-10, ssa.sigma[i + 1], "sigma sorted");
+    }
+
+    ssa_opt_free(&ssa);
+    free(x);
+}
+
+void test_decomposition_randomized(void)
+{
+    int N = 500, L = 100, k = 10;
+    g_seed = 12345;
+
+    double *x = (double *)malloc(N * sizeof(double));
+    generate_signal(x, N);
+
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    int ret = ssa_opt_decompose_randomized(&ssa, k, 8);
+
+    ASSERT_EQ(ret, 0, "decompose_randomized returns 0");
+    ASSERT_TRUE(ssa.decomposed, "decomposed flag set");
+    ASSERT_EQ(ssa.n_components, k, "n_components correct");
+
+    // Singular values should be positive and sorted
+    for (int i = 0; i < k; i++)
+    {
+        ASSERT_GT(ssa.sigma[i] + 1e-10, 0, "sigma positive");
+    }
     for (int i = 0; i < k - 1; i++)
     {
         ASSERT_GT(ssa.sigma[i] + 1e-10, ssa.sigma[i + 1], "sigma sorted");
@@ -316,17 +383,187 @@ void test_no_allocation_in_matvec(void)
     SSA_Opt ssa;
     ssa_opt_init(&ssa, x, N, L);
 
-    // Store workspace pointer
-    double *ws_before = ssa.ws_fft1;
+    // Store workspace pointer (R2C uses ws_real instead of ws_fft1)
+    double *ws_before = ssa.ws_real;
 
     // Do decomposition (many matvec calls)
     ssa_opt_decompose(&ssa, 20, 100);
 
     // Workspace pointer should be same (reused, not reallocated)
-    ASSERT_TRUE(ssa.ws_fft1 == ws_before, "workspace reused (no reallocation)");
+    ASSERT_TRUE(ssa.ws_real == ws_before, "workspace reused (no reallocation)");
 
     ssa_opt_free(&ssa);
     free(x);
+}
+
+void test_wcorr_matrix(void)
+{
+    int N = 500, L = 100, k = 6;
+    g_seed = 55555;
+
+    // Create signal with clear periodic component
+    double *x = (double *)malloc(N * sizeof(double));
+    for (int i = 0; i < N; i++)
+    {
+        x[i] = sin(0.1 * i) + 0.1 * randn();
+    }
+
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    ssa_opt_decompose(&ssa, k, 100);
+
+    double *W = (double *)malloc(k * k * sizeof(double));
+    int ret = ssa_opt_wcorr_matrix(&ssa, W);
+
+    ASSERT_EQ(ret, 0, "wcorr_matrix returns 0");
+
+    // Diagonal should be 1.0
+    for (int i = 0; i < k; i++)
+    {
+        ASSERT_LT(fabs(W[i * k + i] - 1.0), 0.01, "diagonal is 1.0");
+    }
+
+    // Matrix should be symmetric
+    for (int i = 0; i < k; i++)
+    {
+        for (int j = i + 1; j < k; j++)
+        {
+            ASSERT_LT(fabs(W[i * k + j] - W[j * k + i]), 1e-10, "matrix symmetric");
+        }
+    }
+
+    // First two components (sin/cos pair) should be highly correlated
+    double wcorr_01 = fabs(W[0 * k + 1]);
+    ASSERT_GT(wcorr_01, 0.5, "sin/cos pair has high W-correlation");
+
+    ssa_opt_free(&ssa);
+    free(x);
+    free(W);
+}
+
+void test_component_stats(void)
+{
+    int N = 500, L = 100, k = 10;
+    g_seed = 66666;
+
+    double *x = (double *)malloc(N * sizeof(double));
+    generate_signal(x, N);
+
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    ssa_opt_decompose(&ssa, k, 100);
+
+    SSA_ComponentStats stats;
+    int ret = ssa_opt_component_stats(&ssa, &stats);
+
+    ASSERT_EQ(ret, 0, "component_stats returns 0");
+    ASSERT_EQ(stats.n, k, "stats.n matches k");
+    ASSERT_TRUE(stats.singular_values != NULL, "singular_values allocated");
+    ASSERT_TRUE(stats.cumulative_var != NULL, "cumulative_var allocated");
+    ASSERT_TRUE(stats.gaps != NULL, "gaps allocated");
+
+    // Cumulative variance should be monotonically increasing
+    for (int i = 1; i < k; i++)
+    {
+        ASSERT_GT(stats.cumulative_var[i] + 1e-10, stats.cumulative_var[i - 1],
+                  "cumulative_var increasing");
+    }
+
+    // Last cumulative variance should be close to 1.0
+    ASSERT_LT(fabs(stats.cumulative_var[k - 1] - 1.0), 0.01,
+              "cumulative_var ends near 1.0");
+
+    ssa_opt_component_stats_free(&stats);
+    ssa_opt_free(&ssa);
+    free(x);
+}
+
+void test_forecasting(void)
+{
+    int N = 500, L = 100;
+    g_seed = 77777;
+
+    // Create predictable signal: trend + periodic
+    double *x = (double *)malloc(N * sizeof(double));
+    for (int i = 0; i < N; i++)
+    {
+        x[i] = 0.01 * i + 10.0 * sin(2.0 * M_PI * i / 50.0);
+    }
+
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    ssa_opt_decompose(&ssa, 10, 100);
+
+    // Forecast using first 3 components (trend + periodic pair)
+    int group[] = {0, 1, 2};
+    int n_forecast = 50;
+    double *forecast = (double *)malloc(n_forecast * sizeof(double));
+
+    int ret = ssa_opt_forecast(&ssa, group, 3, n_forecast, forecast);
+    ASSERT_EQ(ret, 0, "forecast returns 0");
+
+    // Generate true future values
+    double *true_future = (double *)malloc(n_forecast * sizeof(double));
+    for (int i = 0; i < n_forecast; i++)
+    {
+        true_future[i] = 0.01 * (N + i) + 10.0 * sin(2.0 * M_PI * (N + i) / 50.0);
+    }
+
+    // Correlation should be high for short-term forecast
+    double corr = fabs(correlation(forecast, true_future, n_forecast));
+    ASSERT_GT(corr, 0.8, "forecast correlation > 0.8");
+
+    ssa_opt_free(&ssa);
+    free(x);
+    free(forecast);
+    free(true_future);
+}
+
+void test_mssa_basic(void)
+{
+    int M = 3;   // 3 series
+    int N = 300; // Length of each
+    int L = 75;
+    int k = 6;
+    g_seed = 88888;
+
+    // Create M correlated series
+    double *X = (double *)malloc(M * N * sizeof(double));
+    for (int m = 0; m < M; m++)
+    {
+        for (int i = 0; i < N; i++)
+        {
+            // Common trend + series-specific periodic + noise
+            double common = 0.01 * i;
+            double periodic = 5.0 * sin(2.0 * M_PI * i / 50.0 + m * 0.5);
+            double noise = 0.5 * randn();
+            X[m * N + i] = common + periodic + noise;
+        }
+    }
+
+    MSSA_Opt mssa;
+    int ret = mssa_opt_init(&mssa, X, M, N, L);
+    ASSERT_EQ(ret, 0, "mssa_opt_init returns 0");
+    ASSERT_TRUE(mssa.initialized, "mssa initialized flag set");
+
+    ret = mssa_opt_decompose(&mssa, k, 8);
+    ASSERT_EQ(ret, 0, "mssa_opt_decompose returns 0");
+    ASSERT_TRUE(mssa.decomposed, "mssa decomposed flag set");
+    ASSERT_EQ(mssa.n_components, k, "mssa n_components correct");
+
+    // Reconstruct first series
+    int group[] = {0, 1, 2};
+    double *output = (double *)malloc(N * sizeof(double));
+    ret = mssa_opt_reconstruct(&mssa, 0, group, 3, output);
+    ASSERT_EQ(ret, 0, "mssa_opt_reconstruct returns 0");
+
+    // Should correlate with original
+    double corr = fabs(correlation(output, X, N));
+    ASSERT_GT(corr, 0.8, "MSSA reconstruction correlation > 0.8");
+
+    mssa_opt_free(&mssa);
+    free(X);
+    free(output);
 }
 
 // ============================================================================
@@ -338,13 +575,8 @@ void benchmark_decomposition(void)
     if (!g_benchmarks)
         return;
 
-    printf("\n  === Decomposition Benchmark ===\n");
-
-#ifdef SSA_USE_MKL
-    printf("  Backend: Intel MKL (optimized)\n\n");
-#else
-    printf("  Backend: Built-in FFT (optimized)\n\n");
-#endif
+    printf("\n  === Decomposition Benchmark (R2C Optimized) ===\n");
+    printf("  Backend: Intel MKL with R2C FFT\n\n");
 
     int sizes[] = {1000, 5000, 10000, 50000, 100000};
     int n_sizes = sizeof(sizes) / sizeof(sizes[0]);
@@ -398,7 +630,7 @@ void benchmark_matvec_throughput(void)
     if (!g_benchmarks)
         return;
 
-    printf("\n  === Hankel Matvec Throughput ===\n");
+    printf("\n  === Hankel Matvec Throughput (R2C) ===\n");
 
     int N = 10000;
     int L = 2500;
@@ -436,8 +668,9 @@ void benchmark_matvec_throughput(void)
     printf("  N=%d, L=%d, K=%d\n", N, L, K);
     printf("  %d iterations in %.1f ms\n", iterations, t1 - t0);
     printf("  %.3f ms/op (%.0f ops/sec)\n", ms_per_op, ops_per_sec);
-    printf("  Equivalent FLOPS: %.2f GFLOPS\n",
-           (2.0 * N * log2(N) * ops_per_sec) / 1e9);
+    printf("  R2C FFT size: %d (r2c_len=%d)\n", ssa.fft_len, ssa.r2c_len);
+    printf("  Memory savings: ~%.0f%% vs C2C\n",
+           100.0 * (1.0 - (double)ssa.r2c_len / ssa.fft_len));
 
     ssa_opt_free(&ssa);
     free(x);
@@ -450,23 +683,28 @@ void benchmark_memory_efficiency(void)
     if (!g_benchmarks)
         return;
 
-    printf("\n  === Memory Efficiency ===\n");
+    printf("\n  === Memory Efficiency (R2C vs C2C) ===\n");
 
     int N = 100000;
     int L = N / 4;
     int fft_n = 1;
     while (fft_n < N)
         fft_n <<= 1;
+    int r2c_len = fft_n / 2 + 1;
 
-    // Calculate memory usage
-    size_t fft_mem = 2 * fft_n * sizeof(double) * 3;                 // fft_x, ws_fft1, ws_fft2
-    size_t vec_mem = ssa_opt_max(L, N - L + 1) * sizeof(double) * 2; // u, v workspace
-    size_t total_workspace = fft_mem + vec_mem;
+    // C2C memory (old)
+    size_t c2c_fft_mem = 2 * fft_n * sizeof(double) * 3; // Complex interleaved
 
-    printf("  N=%d, L=%d, FFT_N=%d\n", N, L, fft_n);
-    printf("  FFT buffers: %.2f MB\n", fft_mem / 1e6);
-    printf("  Vector workspace: %.2f MB\n", vec_mem / 1e6);
-    printf("  Total workspace: %.2f MB\n", total_workspace / 1e6);
+    // R2C memory (new)
+    size_t r2c_fft_mem = fft_n * sizeof(double) +           // ws_real
+                         2 * r2c_len * sizeof(double) +     // ws_complex
+                         2 * r2c_len * sizeof(double);      // fft_x
+
+    printf("  N=%d, L=%d, FFT_N=%d, R2C_LEN=%d\n", N, L, fft_n, r2c_len);
+    printf("  C2C buffers: %.2f MB (old)\n", c2c_fft_mem / 1e6);
+    printf("  R2C buffers: %.2f MB (new)\n", r2c_fft_mem / 1e6);
+    printf("  Memory reduction: %.1f%%\n",
+           100.0 * (1.0 - (double)r2c_fft_mem / c2c_fft_mem));
     printf("  (No additional allocations during decomposition)\n");
 }
 
@@ -486,7 +724,7 @@ void benchmark_reconstruction_scaling(void)
 
     SSA_Opt ssa;
     ssa_opt_init(&ssa, x, N, L);
-    ssa_opt_decompose(&ssa, 64, 100); // Decompose with max k we'll test
+    ssa_opt_decompose(&ssa, 64, 100);
 
     printf("  N=%d, L=%d\n\n", N, L);
     printf("  %-8s  %-12s  %-12s\n", "k", "Time (ms)", "ms/component");
@@ -528,6 +766,64 @@ void benchmark_reconstruction_scaling(void)
     free(group);
 }
 
+void benchmark_decomposition_methods(void)
+{
+    if (!g_benchmarks)
+        return;
+
+    printf("\n  === Decomposition Method Comparison ===\n");
+
+    int N = 10000;
+    int L = N / 4;
+    int k = 20;
+
+    g_seed = 11111;
+    double *x = (double *)malloc(N * sizeof(double));
+    generate_signal(x, N);
+
+    printf("  N=%d, L=%d, k=%d\n\n", N, L, k);
+    printf("  %-20s  %-12s  %-15s\n", "Method", "Time (ms)", "Var Explained");
+    printf("  %-20s  %-12s  %-15s\n", "------", "---------", "-------------");
+
+    // Sequential power iteration
+    {
+        SSA_Opt ssa;
+        ssa_opt_init(&ssa, x, N, L);
+        double t0 = get_time_ms();
+        ssa_opt_decompose(&ssa, k, 100);
+        double t1 = get_time_ms();
+        double var = ssa_opt_variance_explained(&ssa, 0, k - 1);
+        printf("  %-20s  %-12.1f  %-15.4f\n", "Sequential", t1 - t0, var);
+        ssa_opt_free(&ssa);
+    }
+
+    // Block power iteration
+    {
+        SSA_Opt ssa;
+        ssa_opt_init(&ssa, x, N, L);
+        double t0 = get_time_ms();
+        ssa_opt_decompose_block(&ssa, k, 8, 50);
+        double t1 = get_time_ms();
+        double var = ssa_opt_variance_explained(&ssa, 0, k - 1);
+        printf("  %-20s  %-12.1f  %-15.4f\n", "Block (b=8)", t1 - t0, var);
+        ssa_opt_free(&ssa);
+    }
+
+    // Randomized SVD
+    {
+        SSA_Opt ssa;
+        ssa_opt_init(&ssa, x, N, L);
+        double t0 = get_time_ms();
+        ssa_opt_decompose_randomized(&ssa, k, 8);
+        double t1 = get_time_ms();
+        double var = ssa_opt_variance_explained(&ssa, 0, k - 1);
+        printf("  %-20s  %-12.1f  %-15.4f\n", "Randomized (p=8)", t1 - t0, var);
+        ssa_opt_free(&ssa);
+    }
+
+    free(x);
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -543,27 +839,30 @@ int main(int argc, char **argv)
     }
 
     printf("==========================================\n");
-#ifdef SSA_USE_MKL
-    printf("   SSA Optimized Test (Intel MKL)\n");
-#else
-    printf("   SSA Optimized Test (Built-in FFT)\n");
-#endif
+    printf("   SSA R2C Optimized Test (Intel MKL)\n");
     printf("==========================================\n");
 
     // Functional tests
     RUN_TEST(test_initialization);
     RUN_TEST(test_decomposition);
+    RUN_TEST(test_decomposition_block);
+    RUN_TEST(test_decomposition_randomized);
     RUN_TEST(test_trend_extraction);
     RUN_TEST(test_cycle_detection);
     RUN_TEST(test_reconstruction);
     RUN_TEST(test_variance_explained);
     RUN_TEST(test_no_allocation_in_matvec);
+    RUN_TEST(test_wcorr_matrix);
+    RUN_TEST(test_component_stats);
+    RUN_TEST(test_forecasting);
+    RUN_TEST(test_mssa_basic);
 
     // Benchmarks
     if (g_benchmarks)
     {
         printf("\n=== Benchmarks ===");
         benchmark_decomposition();
+        benchmark_decomposition_methods();
         benchmark_matvec_throughput();
         benchmark_reconstruction_scaling();
         benchmark_memory_efficiency();
@@ -575,11 +874,10 @@ int main(int argc, char **argv)
         printf(" (%d FAILED)", g_failed);
     printf("\n==========================================\n");
 
-    #ifdef _WIN32
+#ifdef _WIN32
     printf("\nPress Enter to exit...\n");
     getchar();
 #endif
 
     return g_failed > 0 ? 1 : 0;
-    
 }
