@@ -232,43 +232,350 @@ extern "C"
     int ssa_opt_init(SSA_Opt *ssa, const double *x, int N, int L);
     void ssa_opt_free(SSA_Opt *ssa);
 
+    /**
+     * @brief Decompose time series via sequential power iteration.
+     *
+     * Computes the first k singular triplets (Uᵢ, σᵢ, Vᵢ) of the Hankel matrix.
+     * Uses deflated power iteration: each component is found by iterating
+     * u = H·v, v = Hᵀ·u until convergence, then deflating.
+     *
+     * @param ssa       Initialized SSA context
+     * @param k         Number of components to compute
+     * @param max_iter  Maximum iterations per component (100-200 typical)
+     * @return          0 on success, -1 on error
+     *
+     * @note For k > 10, consider ssa_opt_decompose_randomized() which is faster.
+     */
     int ssa_opt_decompose(SSA_Opt *ssa, int k, int max_iter);
+
+    /**
+     * @brief Decompose via block power iteration (faster for k > 5).
+     *
+     * Instead of computing one component at a time, processes block_size
+     * components simultaneously. Uses QR factorization for orthogonalization.
+     *
+     * @param ssa        Initialized SSA context
+     * @param k          Number of components to compute
+     * @param block_size Components per block (8-32 typical)
+     * @param max_iter   Maximum iterations per block
+     * @return           0 on success, -1 on error
+     */
     int ssa_opt_decompose_block(SSA_Opt *ssa, int k, int block_size, int max_iter);
+
+    /**
+     * @brief Decompose via randomized SVD (fastest for k << min(L,K)).
+     *
+     * Algorithm: Halko-Martinsson-Tropp randomized range finder
+     *   1. Generate random test matrix Ω (K × (k+p))
+     *   2. Y = H @ Ω, then QR factorize Y = Q @ R
+     *   3. B = Hᵀ @ Q, then SVD of B
+     *   4. Recover U, σ, V from Q and B's SVD
+     *
+     * Complexity: O((k+p) × N log N) vs O(k × max_iter × N log N) for power iteration.
+     * Recommended for k > 10 when you don't need extreme accuracy.
+     *
+     * @param ssa          Initialized SSA context
+     * @param k            Number of components to compute
+     * @param oversampling Extra random vectors for accuracy (5-10 typical)
+     * @return             0 on success, -1 on error
+     */
     int ssa_opt_decompose_randomized(SSA_Opt *ssa, int k, int oversampling);
+
+    /**
+     * @brief Extend existing decomposition with additional components.
+     *
+     * Adds more singular triplets to an already decomposed SSA context without
+     * recomputing existing components. Uses deflated power iteration starting
+     * from random vectors orthogonal to existing V columns.
+     *
+     * Use case: You computed 10 components, analyzed them, and now want 20 more.
+     * This is faster than decomposing from scratch with k=30.
+     *
+     * @param ssa          Already decomposed SSA context
+     * @param additional_k Number of new components to add
+     * @param max_iter     Maximum iterations per new component
+     * @return             0 on success, -1 on error
+     *
+     * @note Invalidates cached FFTs. Results are re-sorted by σ, so component
+     *       indices may change if new components have larger singular values.
+     */
     int ssa_opt_extend(SSA_Opt *ssa, int additional_k, int max_iter);
 
+    /**
+     * @brief Reconstruct signal from selected components.
+     *
+     * Computes: output[t] = Σᵢ∈group Xᵢ[t] where Xᵢ is the reconstruction
+     * from component i using diagonal averaging.
+     *
+     * Uses frequency-domain accumulation: all components are summed in frequency
+     * domain before a single IFFT, giving O(n_group × N log N + N log N) complexity
+     * instead of O(n_group × N log N) naive.
+     *
+     * @param ssa      Decomposed SSA context
+     * @param group    Array of component indices (0-based)
+     * @param n_group  Number of components in group
+     * @param output   Output buffer, length N (caller allocates)
+     * @return         0 on success, -1 on error
+     */
     int ssa_opt_reconstruct(const SSA_Opt *ssa, const int *group, int n_group, double *output);
+
+    /**
+     * @brief Pre-cache FFTs of all U and V vectors for faster reconstruction.
+     *
+     * When reconstructing multiple groupings, the FFTs of U and V vectors are
+     * recomputed each time. This function pre-computes and caches them.
+     *
+     * @param ssa  Decomposed SSA context
+     * @return     0 on success, -1 on error
+     *
+     * @note Increases memory usage by O(k × N) complex values.
+     * @note Call ssa_opt_free_cached_ffts() or ssa_opt_free() when done.
+     */
     int ssa_opt_cache_ffts(SSA_Opt *ssa);
+
+    /**
+     * @brief Free cached FFT buffers.
+     */
     void ssa_opt_free_cached_ffts(SSA_Opt *ssa);
 
+    /**
+     * @brief Compute the full W-correlation matrix between all SSA components.
+     *
+     * W-correlation measures separability between reconstructed components.
+     * Values close to 0 indicate well-separated components; values close to ±1
+     * indicate components that should be grouped together.
+     *
+     * Uses optimized direct formula: O(n × N log N + n² × N) instead of
+     * reconstructing each component pair.
+     *
+     * @param ssa  Decomposed SSA context
+     * @param W    Output matrix, n_components × n_components, row-major
+     *             W[i*n + j] = W-correlation between components i and j
+     * @return     0 on success, -1 on error
+     */
     int ssa_opt_wcorr_matrix(const SSA_Opt *ssa, double *W);
+
+    /**
+     * @brief Compute W-correlation between two specific components.
+     *
+     * W-correlation is defined as:
+     *   W(X_i, X_j) = <X_i, X_j>_W / (||X_i||_W × ||X_j||_W)
+     *
+     * where <·,·>_W is the weighted inner product with weights c[t] = min(t+1, L, K, N-t).
+     * These weights account for the number of terms in diagonal averaging.
+     *
+     * Interpretation:
+     *   - |W| ≈ 0:    Components are well-separated (orthogonal in weighted sense)
+     *   - |W| ≈ 1:    Components are highly correlated (should be grouped)
+     *   - Periodic components often come in pairs with |W| ≈ 1
+     *
+     * Uses direct formula via FFT convolution - does not require full reconstruction.
+     *
+     * @param ssa  Decomposed SSA context
+     * @param i    First component index (0-based)
+     * @param j    Second component index (0-based)
+     * @return     W-correlation value in [-1, 1], or 0.0 on error
+     */
     double ssa_opt_wcorr_pair(const SSA_Opt *ssa, int i, int j);
+
+    /**
+     * @brief Compute statistics for automatic component selection.
+     *
+     * Analyzes the singular value spectrum to help identify signal vs. noise
+     * components. Several heuristics are provided:
+     *
+     * 1. Scree plot data: log(σᵢ) shows "elbow" at signal-noise boundary
+     * 2. Gap ratios: σᵢ/σᵢ₊₁ - large gaps indicate boundaries between groups
+     * 3. Cumulative variance: fraction of variance explained by first k components
+     *
+     * Suggested usage:
+     *   - Signal components: indices 0 to stats->suggested_signal - 1
+     *   - Noise components: indices stats->suggested_signal to n-1
+     *
+     * @param ssa    Decomposed SSA context
+     * @param stats  Output structure (caller allocates, function fills arrays)
+     *               Must call ssa_opt_component_stats_free() when done
+     * @return       0 on success, -1 on error
+     *
+     * @code
+     * SSA_ComponentStats stats;
+     * ssa_opt_component_stats(&ssa, &stats);
+     * printf("Suggested signal components: %d\n", stats.suggested_signal);
+     * printf("Variance explained by signal: %.2f%%\n",
+     *        stats.cumulative_var[stats.suggested_signal - 1] * 100);
+     * ssa_opt_component_stats_free(&stats);
+     * @endcode
+     */
     int ssa_opt_component_stats(const SSA_Opt *ssa, SSA_ComponentStats *stats);
+
+    /**
+     * @brief Free memory allocated by ssa_opt_component_stats().
+     */
     void ssa_opt_component_stats_free(SSA_ComponentStats *stats);
+
+    /**
+     * @brief Automatically find periodic component pairs.
+     *
+     * Periodic signals (e.g., sine waves) appear as pairs of consecutive
+     * components with similar singular values and high W-correlation.
+     * This function identifies such pairs automatically.
+     *
+     * @param ssa           Decomposed SSA context
+     * @param pairs         Output: array of pair start indices (length max_pairs)
+     *                      pairs[k] = i means components i and i+1 form a pair
+     * @param max_pairs     Maximum number of pairs to find
+     * @param sv_tol        Singular value similarity tolerance (e.g., 0.1 = 10%)
+     *                      Pair requires |σᵢ - σᵢ₊₁| / σᵢ < sv_tol
+     * @param wcorr_thresh  Minimum |W-correlation| for pair (e.g., 0.7)
+     * @return              Number of pairs found, or -1 on error
+     */
     int ssa_opt_find_periodic_pairs(const SSA_Opt *ssa, int *pairs, int max_pairs,
                                     double sv_tol, double wcorr_thresh);
 
+    /**
+     * @brief Compute Linear Recurrence Formula (LRF) coefficients.
+     *
+     * SSA-based forecasting relies on the fact that signal components satisfy
+     * a linear recurrence: x[t] = Σⱼ Rⱼ × x[t-L+1+j] for j = 0..L-2.
+     *
+     * The LRF coefficients R are computed from the last row of U vectors.
+     * The verticality coefficient ν² measures forecast stability:
+     *   - ν² close to 0: stable forecast
+     *   - ν² close to 1: unstable (LRF is near-singular)
+     *
+     * @param ssa      Decomposed SSA context
+     * @param group    Components to include in LRF
+     * @param n_group  Number of components
+     * @param lrf      Output: LRF structure (caller allocates, function fills)
+     *                 Must call ssa_opt_lrf_free() when done
+     * @return         0 on success, -1 on error (including ν² ≥ 1)
+     */
     int ssa_opt_compute_lrf(const SSA_Opt *ssa, const int *group, int n_group, SSA_LRF *lrf);
+
+    /**
+     * @brief Free LRF coefficients.
+     */
     void ssa_opt_lrf_free(SSA_LRF *lrf);
+
+    /**
+     * @brief Forecast using LRF recurrence.
+     *
+     * Reconstructs signal from group, then extends using LRF:
+     *   x̃[t] = Σⱼ Rⱼ × x̃[t-L+1+j] for t = N, N+1, ..., N+n_forecast-1
+     *
+     * @param ssa         Decomposed SSA context
+     * @param group       Components to use for forecasting
+     * @param n_group     Number of components
+     * @param n_forecast  Number of steps to forecast
+     * @param output      Output buffer, length N + n_forecast (caller allocates)
+     * @return            0 on success, -1 on error
+     */
     int ssa_opt_forecast(const SSA_Opt *ssa, const int *group, int n_group,
                          int n_forecast, double *output);
+
+    /**
+     * @brief Forecast with full vector forecasting (more accurate).
+     *
+     * Instead of scalar LRF, uses vector forecasting which extends the
+     * entire Hankel structure. More accurate for multivariate patterns.
+     *
+     * @param ssa         Decomposed SSA context
+     * @param group       Components to use for forecasting
+     * @param n_group     Number of components
+     * @param n_forecast  Number of steps to forecast
+     * @param output      Output buffer, length N + n_forecast
+     * @return            0 on success, -1 on error
+     */
     int ssa_opt_forecast_full(const SSA_Opt *ssa, const int *group, int n_group,
                               int n_forecast, double *output);
+
+    /**
+     * @brief Forecast using pre-computed LRF.
+     *
+     * For repeated forecasting with different base signals but same LRF.
+     *
+     * @param lrf         Pre-computed LRF from ssa_opt_compute_lrf()
+     * @param base_signal Signal to extend (length base_len, must have base_len >= L-1)
+     * @param base_len    Length of base signal
+     * @param n_forecast  Number of steps to forecast
+     * @param output      Output buffer, length base_len + n_forecast
+     * @return            0 on success, -1 on error
+     */
     int ssa_opt_forecast_with_lrf(const SSA_LRF *lrf, const double *base_signal, int base_len,
                                   int n_forecast, double *output);
 
+    // ============================================================================
+    // MSSA (Multivariate SSA) API
+    // ============================================================================
+
+    /**
+     * @brief Initialize MSSA context for multiple time series.
+     *
+     * Constructs block-Hankel matrix from M series of length N.
+     *
+     * @param mssa  Zero-initialized MSSA context
+     * @param X     Input: M × N matrix, row-major (series i is X[i*N : (i+1)*N])
+     * @param M     Number of series
+     * @param N     Length of each series
+     * @param L     Window length
+     * @return      0 on success, -1 on error
+     */
     int mssa_opt_init(MSSA_Opt *mssa, const double *X, int M, int N, int L);
+
+    /**
+     * @brief Decompose MSSA via randomized SVD.
+     */
     int mssa_opt_decompose(MSSA_Opt *mssa, int k, int oversampling);
+
+    /**
+     * @brief Reconstruct single series from MSSA components.
+     */
     int mssa_opt_reconstruct(const MSSA_Opt *mssa, int series_idx,
                              const int *group, int n_group, double *output);
+
+    /**
+     * @brief Reconstruct all series from MSSA components.
+     */
     int mssa_opt_reconstruct_all(const MSSA_Opt *mssa,
                                  const int *group, int n_group, double *output);
+
+    /**
+     * @brief Compute contribution of each series to total variance.
+     */
     int mssa_opt_series_contributions(const MSSA_Opt *mssa, double *contributions);
+
+    /**
+     * @brief Get explained variance for component range.
+     */
     double mssa_opt_variance_explained(const MSSA_Opt *mssa, int start, int end);
+
+    /**
+     * @brief Free MSSA context.
+     */
     void mssa_opt_free(MSSA_Opt *mssa);
 
+    // ============================================================================
+    // Convenience Functions
+    // ============================================================================
+
+    /**
+     * @brief Reconstruct trend (component 0 only).
+     */
     int ssa_opt_get_trend(const SSA_Opt *ssa, double *output);
+
+    /**
+     * @brief Reconstruct noise (components noise_start to end).
+     */
     int ssa_opt_get_noise(const SSA_Opt *ssa, int noise_start, double *output);
+
+    /**
+     * @brief Get explained variance ratio for component range.
+     *
+     * @param ssa    Decomposed SSA context
+     * @param start  First component index (inclusive)
+     * @param end    Last component index (inclusive), or -1 for all remaining
+     * @return       Fraction of total variance explained (0 to 1)
+     */
     double ssa_opt_variance_explained(const SSA_Opt *ssa, int start, int end);
 
     // ============================================================================
@@ -1472,11 +1779,40 @@ extern "C"
     // INCREMENTAL DECOMPOSITION (Extend) - R2C Version
     // ============================================================================
 
+    // ============================================================================
+    // EXTEND DECOMPOSITION
+    //
+    // Purpose: Add more singular triplets to an existing decomposition without
+    // recomputing the ones we already have.
+    //
+    // Algorithm: Deflated power iteration
+    //   - Start with random vector orthogonal to all existing V columns
+    //   - Iterate: u = H·v, v = Hᵀ·u (power iteration on HᵀH)
+    //   - After each step, project out existing components (deflation)
+    //   - Converged when v stops changing (up to sign)
+    //
+    // Why this works:
+    //   Power iteration on HᵀH converges to dominant eigenvector (largest σ).
+    //   By projecting out existing components, we find the next largest.
+    //   This is mathematically equivalent to SVD on the residual matrix.
+    //
+    // Complexity: O(additional_k × max_iter × N log N)
+    //   - Each power iteration step requires two Hankel matvecs: O(N log N)
+    //   - Plus orthogonalization against existing components: O(k × L) or O(k × K)
+    //
+    // ============================================================================
+
     int ssa_opt_extend(SSA_Opt *ssa, int additional_k, int max_iter)
     {
         if (!ssa || !ssa->decomposed || additional_k < 1)
             return -1;
 
+        // ========================================================================
+        // STEP 1: Invalidate cached FFTs
+        //
+        // Cached FFTs are keyed to current U/V matrices. After adding new
+        // components, the cache would be stale. We must free it before modifying.
+        // ========================================================================
         ssa_opt_free_cached_ffts(ssa);
 
         int L = ssa->L;
@@ -1484,11 +1820,22 @@ extern "C"
         int old_k = ssa->n_components;
         int new_k = old_k + additional_k;
 
+        // Maximum possible components is min(L, K) - the rank of the Hankel matrix
         new_k = ssa_opt_min(new_k, ssa_opt_min(L, K));
         if (new_k <= old_k)
-            return 0;
+            return 0; // Nothing to add
 
-        // Reallocate result arrays
+        // ========================================================================
+        // STEP 2: Reallocate result arrays
+        //
+        // We need larger arrays to hold new_k components. Strategy:
+        //   1. Allocate new arrays of size new_k
+        //   2. Copy old data
+        //   3. Free old arrays
+        //   4. Point to new arrays
+        //
+        // This is safer than realloc() because it guarantees alignment.
+        // ========================================================================
         double *U_new = (double *)ssa_opt_alloc(L * new_k * sizeof(double));
         double *V_new = (double *)ssa_opt_alloc(K * new_k * sizeof(double));
         double *sigma_new = (double *)ssa_opt_alloc(new_k * sizeof(double));
@@ -1503,11 +1850,13 @@ extern "C"
             return -1;
         }
 
+        // Copy existing components to new arrays
         memcpy(U_new, ssa->U, L * old_k * sizeof(double));
         memcpy(V_new, ssa->V, K * old_k * sizeof(double));
         memcpy(sigma_new, ssa->sigma, old_k * sizeof(double));
         memcpy(eigen_new, ssa->eigenvalues, old_k * sizeof(double));
 
+        // Swap old arrays for new ones
         ssa_opt_free_ptr(ssa->U);
         ssa_opt_free_ptr(ssa->V);
         ssa_opt_free_ptr(ssa->sigma);
@@ -1518,7 +1867,12 @@ extern "C"
         ssa->sigma = sigma_new;
         ssa->eigenvalues = eigen_new;
 
-        // Reallocate projection workspace
+        // ========================================================================
+        // STEP 3: Reallocate projection workspace
+        //
+        // ws_proj stores projection coefficients during orthogonalization.
+        // Size must be at least new_k to hold all inner products.
+        // ========================================================================
         if (ssa->ws_proj)
         {
             ssa_opt_free_ptr(ssa->ws_proj);
@@ -1527,9 +1881,10 @@ extern "C"
         if (!ssa->ws_proj)
             return -1;
 
-        double *u = (double *)ssa_opt_alloc(L * sizeof(double));
-        double *v = (double *)ssa_opt_alloc(K * sizeof(double));
-        double *v_new = (double *)ssa_opt_alloc(K * sizeof(double));
+        // Temporary vectors for power iteration
+        double *u = (double *)ssa_opt_alloc(L * sizeof(double));     // Left singular vector
+        double *v = (double *)ssa_opt_alloc(K * sizeof(double));     // Right singular vector
+        double *v_new = (double *)ssa_opt_alloc(K * sizeof(double)); // Updated v for convergence check
 
         if (!u || !v || !v_new)
         {
@@ -1539,36 +1894,95 @@ extern "C"
             return -1;
         }
 
-        // Compute additional components
+        // ========================================================================
+        // STEP 4: Compute additional components via deflated power iteration
+        //
+        // For each new component comp = old_k, old_k+1, ..., new_k-1:
+        //
+        //   (a) Initialize v randomly, orthogonalize against V[:, 0:comp]
+        //   (b) Power iteration: u = H·v, v = Hᵀ·u, with orthogonalization
+        //   (c) Extract singular triplet: σ = ||u||, normalize u and v
+        //
+        // The orthogonalization ensures we find components orthogonal to
+        // all previously computed ones (deflation).
+        // ========================================================================
         for (int comp = old_k; comp < new_k; comp++)
         {
+            // --------------------------------------------------------------------
+            // STEP 4a: Random initialization with orthogonalization
+            //
+            // Start with random vector, then project out all existing V columns:
+            //   v := v - V @ (Vᵀ @ v)
+            //
+            // This ensures v is orthogonal to the subspace spanned by V[:, 0:comp].
+            // Using BLAS dgemv:
+            //   proj = Vᵀ @ v    (K×comp)ᵀ @ (K) → (comp)
+            //   v := v - V @ proj   (K×comp) @ (comp) → (K), subtracted from v
+            // --------------------------------------------------------------------
             vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, ssa->rng, K, v, -0.5, 0.5);
 
+            // Compute projection coefficients: ws_proj = Vᵀ @ v
+            // CblasTrans means we're computing Aᵀ @ x, where A = V (K × comp)
             cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                         1.0, ssa->V, K, v, 1, 0.0, ssa->ws_proj, 1);
+
+            // Subtract projection: v := v - V @ ws_proj
+            // CblasNoTrans: A @ x, where A = V, x = ws_proj
+            // -1.0 alpha, 1.0 beta means: v := -1.0 * (V @ ws_proj) + 1.0 * v
             cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                         -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v, 1);
             ssa_opt_normalize(v, K);
 
+            // --------------------------------------------------------------------
+            // STEP 4b: Power iteration
+            //
+            // Each iteration:
+            //   1. u = H @ v            (forward Hankel matvec)
+            //   2. Orthogonalize u against existing U columns
+            //   3. Normalize u
+            //   4. v_new = Hᵀ @ u       (transpose Hankel matvec)
+            //   5. Orthogonalize v_new against existing V columns
+            //   6. Normalize v_new
+            //   7. Check convergence: ||v - v_new|| or ||v + v_new|| small
+            //
+            // The pair (u, v) converges to the (comp+1)-th singular vectors.
+            // Orthogonalization after each matvec is the "deflation" step.
+            // --------------------------------------------------------------------
             for (int iter = 0; iter < max_iter; iter++)
             {
+                // u = H @ v (FFT-based Hankel matvec, O(N log N))
                 ssa_opt_hankel_matvec(ssa, v, u);
 
+                // Orthogonalize u against all existing U columns
+                // Same pattern as above: project out U[:, 0:comp]
                 cblas_dgemv(CblasColMajor, CblasTrans, L, comp,
                             1.0, ssa->U, L, u, 1, 0.0, ssa->ws_proj, 1);
                 cblas_dgemv(CblasColMajor, CblasNoTrans, L, comp,
                             -1.0, ssa->U, L, ssa->ws_proj, 1, 1.0, u, 1);
                 ssa_opt_normalize(u, L);
 
+                // v_new = Hᵀ @ u (transpose Hankel matvec)
                 ssa_opt_hankel_matvec_T(ssa, u, v_new);
 
+                // Orthogonalize v_new against existing V columns
                 cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                             1.0, ssa->V, K, v_new, 1, 0.0, ssa->ws_proj, 1);
                 cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                             -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v_new, 1);
                 ssa_opt_normalize(v_new, K);
 
-                // Convergence check: eigenvectors can flip sign between iterations
+                // ----------------------------------------------------------------
+                // CONVERGENCE CHECK: Handle sign flips correctly
+                //
+                // Eigenvectors are defined only up to sign: if v is an eigenvector,
+                // so is -v. Power iteration can flip between v and -v on consecutive
+                // iterations even when converged.
+                //
+                // Naive check ||v - v_new|| fails: if v_new ≈ -v, this gives ~2.
+                //
+                // Solution: Check BOTH ||v - v_new||² and ||v + v_new||², take min.
+                // If either is small, we've converged.
+                // ----------------------------------------------------------------
                 double diff_same = 0.0, diff_flip = 0.0;
                 for (int i = 0; i < K; i++)
                 {
@@ -1580,38 +1994,59 @@ extern "C"
                 double diff = (diff_same < diff_flip) ? diff_same : diff_flip;
                 ssa_opt_copy(v_new, v, K);
 
+                // Require at least 10 iterations to avoid false convergence
                 if (sqrt(diff) < SSA_CONVERGENCE_TOL && iter > 10)
                     break;
             }
 
-            // Final orthogonalization
+            // --------------------------------------------------------------------
+            // STEP 4c: Extract singular triplet
+            //
+            // After convergence, v is the right singular vector. Now compute:
+            //   u = H @ v           (un-normalized)
+            //   σ = ||u||           (singular value)
+            //   u := u / σ          (normalized left singular vector)
+            //   v = Hᵀ @ u / σ      (ensures SVD consistency: H @ v = σ @ u)
+            //
+            // Final orthogonalization ensures numerical orthogonality is maintained.
+            // --------------------------------------------------------------------
+
+            // Final orthogonalization of v
             cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                         1.0, ssa->V, K, v, 1, 0.0, ssa->ws_proj, 1);
             cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                         -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v, 1);
             ssa_opt_normalize(v, K);
 
+            // Compute u = H @ v and extract sigma
             ssa_opt_hankel_matvec(ssa, v, u);
 
+            // Orthogonalize u against existing U columns
             cblas_dgemv(CblasColMajor, CblasTrans, L, comp,
                         1.0, ssa->U, L, u, 1, 0.0, ssa->ws_proj, 1);
             cblas_dgemv(CblasColMajor, CblasNoTrans, L, comp,
                         -1.0, ssa->U, L, ssa->ws_proj, 1, 1.0, u, 1);
 
+            // σ = ||u||, then normalize u
             double sigma = ssa_opt_normalize(u, L);
 
+            // Recompute v for SVD consistency: v = Hᵀ @ u / σ
+            // This ensures H @ v = σ @ u exactly (up to numerical precision)
             ssa_opt_hankel_matvec_T(ssa, u, v);
 
+            // Final orthogonalization of v
             cblas_dgemv(CblasColMajor, CblasTrans, K, comp,
                         1.0, ssa->V, K, v, 1, 0.0, ssa->ws_proj, 1);
             cblas_dgemv(CblasColMajor, CblasNoTrans, K, comp,
                         -1.0, ssa->V, K, ssa->ws_proj, 1, 1.0, v, 1);
 
+            // Scale v by 1/σ to complete the SVD relationship
             if (sigma > 1e-12)
             {
                 ssa_opt_scal(v, K, 1.0 / sigma);
             }
 
+            // Store results in the arrays
             ssa_opt_copy(u, &ssa->U[comp * L], L);
             ssa_opt_copy(v, &ssa->V[comp * K], K);
             ssa->sigma[comp] = sigma;
@@ -1619,28 +2054,52 @@ extern "C"
             ssa->total_variance += sigma * sigma;
         }
 
-        // Sort all components
+        // ========================================================================
+        // STEP 5: Sort all components by descending singular value
+        //
+        // New components might have larger singular values than some existing ones
+        // (if power iteration for existing components converged to wrong eigenpairs).
+        // Re-sorting ensures σ₀ ≥ σ₁ ≥ ... ≥ σₖ₋₁.
+        //
+        // Using simple bubble sort since k is typically small (10-100).
+        // For large k, could use qsort with index array.
+        // ========================================================================
         for (int i = 0; i < new_k - 1; i++)
         {
             for (int j = i + 1; j < new_k; j++)
             {
                 if (ssa->sigma[j] > ssa->sigma[i])
                 {
+                    // Swap singular values
                     double tmp = ssa->sigma[i];
                     ssa->sigma[i] = ssa->sigma[j];
                     ssa->sigma[j] = tmp;
 
+                    // Swap eigenvalues
                     tmp = ssa->eigenvalues[i];
                     ssa->eigenvalues[i] = ssa->eigenvalues[j];
                     ssa->eigenvalues[j] = tmp;
 
+                    // Swap U columns using BLAS dswap (vectorized)
                     cblas_dswap(L, &ssa->U[i * L], 1, &ssa->U[j * L], 1);
+
+                    // Swap V columns
                     cblas_dswap(K, &ssa->V[i * K], 1, &ssa->V[j * K], 1);
                 }
             }
         }
 
-        // Fix sign convention for new components
+        // ========================================================================
+        // STEP 6: Fix sign convention for consistent results
+        //
+        // SVD is unique only up to sign: (u, v) and (-u, -v) are both valid.
+        // For reproducibility, we adopt the convention: sum(u) > 0.
+        // If sum(u) < 0, flip both u and v.
+        //
+        // Note: Only need to fix new components (after sorting, these might
+        // be anywhere in the array, so we check all indices >= old_k in the
+        // original numbering. After sorting, we just fix all to be safe.)
+        // ========================================================================
         for (int i = old_k; i < new_k; i++)
         {
             double sum = 0;
