@@ -33,6 +33,9 @@ EXPORTS
     
     ; === NEW: Additional SSA functions ===
     ssa_opt_extend
+    ssa_opt_get_singular_values
+    ssa_opt_get_eigenvalues
+    ssa_opt_get_total_variance
 
     ; === NEW: Malloc-free hot path ===
     ssa_opt_prepare

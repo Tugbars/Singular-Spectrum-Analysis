@@ -155,6 +155,11 @@ extern "C"
     int ssa_opt_get_noise(const SSA_Opt *ssa, int noise_start, double *output);
     double ssa_opt_variance_explained(const SSA_Opt *ssa, int start, int end);
 
+    // Getters for decomposition results
+    int ssa_opt_get_singular_values(const SSA_Opt *ssa, double *output, int max_n);
+    int ssa_opt_get_eigenvalues(const SSA_Opt *ssa, double *output, int max_n);
+    double ssa_opt_get_total_variance(const SSA_Opt *ssa);
+
     // Cadzow iterations - iterative finite-rank signal approximation
     typedef struct
     {
@@ -2076,6 +2081,31 @@ extern "C"
         for (int i = start; i <= end; i++)
             sum += ssa->eigenvalues[i];
         return sum / ssa->total_variance;
+    }
+
+    int ssa_opt_get_singular_values(const SSA_Opt *ssa, double *output, int max_n)
+    {
+        if (!ssa || !ssa->decomposed || !output)
+            return -1;
+        int n = ssa_opt_min(max_n, ssa->n_components);
+        memcpy(output, ssa->sigma, n * sizeof(double));
+        return n;
+    }
+
+    int ssa_opt_get_eigenvalues(const SSA_Opt *ssa, double *output, int max_n)
+    {
+        if (!ssa || !ssa->decomposed || !output)
+            return -1;
+        int n = ssa_opt_min(max_n, ssa->n_components);
+        memcpy(output, ssa->eigenvalues, n * sizeof(double));
+        return n;
+    }
+
+    double ssa_opt_get_total_variance(const SSA_Opt *ssa)
+    {
+        if (!ssa || !ssa->decomposed)
+            return 0.0;
+        return ssa->total_variance;
     }
 
     // ========================================================================

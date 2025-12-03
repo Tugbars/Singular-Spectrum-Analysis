@@ -185,6 +185,21 @@ _lib.ssa_opt_get_trend.restype = ctypes.c_int
 _lib.ssa_opt_get_noise.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, c_double_p]
 _lib.ssa_opt_get_noise.restype = ctypes.c_int
 
+# Getters for decomposition results
+_HAS_GETTERS = False
+try:
+    _lib.ssa_opt_get_singular_values.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p, ctypes.c_int]
+    _lib.ssa_opt_get_singular_values.restype = ctypes.c_int
+    
+    _lib.ssa_opt_get_eigenvalues.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p, ctypes.c_int]
+    _lib.ssa_opt_get_eigenvalues.restype = ctypes.c_int
+    
+    _lib.ssa_opt_get_total_variance.argtypes = [ctypes.POINTER(_SSA_Opt)]
+    _lib.ssa_opt_get_total_variance.restype = ctypes.c_double
+    _HAS_GETTERS = True
+except AttributeError:
+    pass  # DLL doesn't have getters yet
+
 _lib.ssa_opt_free.argtypes = [ctypes.POINTER(_SSA_Opt)]
 _lib.ssa_opt_free.restype = None
 
@@ -602,6 +617,45 @@ class SSA:
         self.n_components = k
         self._decomposed = True
         return self
+    
+    @property
+    def singular_values(self) -> np.ndarray:
+        """Get singular values (σ) from decomposition."""
+        if not self._decomposed:
+            raise RuntimeError("Call decompose() first")
+        if not _HAS_GETTERS:
+            raise RuntimeError("Getters not available - rebuild DLL with updated ssa_opt.h")
+        output = np.zeros(self.n_components, dtype=np.float64)
+        n = _lib.ssa_opt_get_singular_values(
+            ctypes.byref(self._ctx),
+            output.ctypes.data_as(c_double_p),
+            self.n_components
+        )
+        return output[:n]
+    
+    @property
+    def eigenvalues(self) -> np.ndarray:
+        """Get eigenvalues (σ²) from decomposition."""
+        if not self._decomposed:
+            raise RuntimeError("Call decompose() first")
+        if not _HAS_GETTERS:
+            raise RuntimeError("Getters not available - rebuild DLL with updated ssa_opt.h")
+        output = np.zeros(self.n_components, dtype=np.float64)
+        n = _lib.ssa_opt_get_eigenvalues(
+            ctypes.byref(self._ctx),
+            output.ctypes.data_as(c_double_p),
+            self.n_components
+        )
+        return output[:n]
+    
+    @property
+    def total_variance(self) -> float:
+        """Get total variance captured by all computed components."""
+        if not self._decomposed:
+            raise RuntimeError("Call decompose() first")
+        if not _HAS_GETTERS:
+            raise RuntimeError("Getters not available - rebuild DLL with updated ssa_opt.h")
+        return _lib.ssa_opt_get_total_variance(ctypes.byref(self._ctx))
     
     def reconstruct(self, group: List[int]) -> np.ndarray:
         """

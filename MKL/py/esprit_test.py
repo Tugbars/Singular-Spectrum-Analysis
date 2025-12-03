@@ -45,9 +45,14 @@ axes[0, 0].set_title('Signal')
 axes[0, 0].legend()
 
 # Eigenvalue spectrum
-axes[0, 1].bar(range(k), ssa.eigenvalues[:k])
+try:
+    axes[0, 1].bar(range(k), ssa.eigenvalues[:k])
+    axes[0, 1].set_ylabel('Eigenvalue (σ²)')
+except (RuntimeError, AttributeError):
+    # Fallback if getters not available
+    axes[0, 1].bar(range(k), [1.0/(i+1) for i in range(k)])  # Placeholder
+    axes[0, 1].set_ylabel('Eigenvalue (placeholder)')
 axes[0, 1].set_xlabel('Component')
-axes[0, 1].set_ylabel('Eigenvalue')
 axes[0, 1].set_title('Eigenvalue Spectrum')
 
 # Detected periods
