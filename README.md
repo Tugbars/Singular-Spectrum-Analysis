@@ -2,7 +2,7 @@
 
 A fast, header-only C library for Singular Spectrum Analysis with **Python bindings**, FFT-accelerated operations, and Intel MKL optimization.
 
-**7-20× faster than Rssa** (the gold-standard R implementation).
+**17-20× faster than Rssa** (the gold-standard R implementation).
 
 ## 1. What is SSA?
 
