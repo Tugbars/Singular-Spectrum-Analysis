@@ -23,28 +23,43 @@ import ctypes
 # ============================================================================
 
 def compare_speed(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
-    from ssa_wrapper import SSA
+    from ssa_wrapper import SSA, _lib, _SSA_Opt, c_double_p
     
     print("\n" + "="*70)
-    print("SPEED COMPARISON: Our SSA vs Rssa")
+    print("SPEED COMPARISON: Our SSA vs Rssa (Malloc-Free Hot Path)")
     print("="*70)
     
+    # Apply MKL config
+    try:
+        _lib.ssa_mkl_init.argtypes = [ctypes.c_int]
+        _lib.ssa_mkl_init.restype = ctypes.c_int
+        _lib.ssa_opt_prepare.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int]
+        _lib.ssa_opt_prepare.restype = ctypes.c_int
+        _lib.ssa_opt_update_signal.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p]
+        _lib.ssa_opt_update_signal.restype = ctypes.c_int
+        print("\nApplying MKL configuration...")
+        _lib.ssa_mkl_init(1)
+    except Exception as e:
+        print(f"Note: MKL config not available: {e}")
+    
     # =========================================================================
-    # WARMUP: Run one decomposition to trigger MKL JIT, DLL loading, etc.
+    # WARMUP
     # =========================================================================
     print("\nWarming up MKL (first call has JIT overhead)...")
     np.random.seed(0)
     x_warmup = np.random.randn(1000)
     ssa_warmup = SSA(x_warmup, L=250)
+    _lib.ssa_opt_prepare(ctypes.byref(ssa_warmup._ctx), 30, 8)
     
     t0 = time.perf_counter()
     ssa_warmup.decompose(k=10)
     warmup_time = (time.perf_counter() - t0) * 1000
     
-    # Second call (should be faster)
-    ssa_warmup2 = SSA(x_warmup, L=250)
+    # Second call (should be faster - uses prepared workspace)
+    x_warmup[0] += 0.001
+    _lib.ssa_opt_update_signal(ctypes.byref(ssa_warmup._ctx), x_warmup.ctypes.data_as(c_double_p))
     t0 = time.perf_counter()
-    ssa_warmup2.decompose(k=10)
+    ssa_warmup.decompose(k=10)
     post_warmup_time = (time.perf_counter() - t0) * 1000
     
     print(f"  First call (cold):  {warmup_time:.1f} ms")
@@ -53,7 +68,7 @@ def compare_speed(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     print()
     
     # =========================================================================
-    # Actual benchmark (post-warmup)
+    # Actual benchmark (post-warmup, malloc-free hot path)
     # =========================================================================
     print(f"{'N':>6} {'L':>5} {'k':>3} | {'Ours (ms)':>10} {'Rssa (ms)':>10} {'Speedup':>8} {'Corr(raw)':>10} {'Corr(true)':>11}")
     print("-"*82)
@@ -64,17 +79,24 @@ def compare_speed(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
         L = N // 4
         k = 30
         
-        # Our implementation
+        # Our implementation with malloc-free path
         np.random.seed(42)
         t_vec = np.linspace(0, 50*np.pi, N)
         x_true = np.sin(t_vec)  # True signal without noise
         x = x_true + 0.3*np.random.randn(N)  # Noisy signal
         
-        # Time multiple runs
+        # Setup once
+        ssa = SSA(x, L=L)
+        _lib.ssa_opt_prepare(ctypes.byref(ssa._ctx), k, 8)
+        
+        # Time multiple runs using prepared path
         times = []
         recon_result = None
         for run_idx in range(n_runs):
-            ssa = SSA(x, L=L)
+            # Update signal (simulates new data arriving)
+            x[0] += 0.0001  # Tiny perturbation
+            _lib.ssa_opt_update_signal(ctypes.byref(ssa._ctx), x.ctypes.data_as(c_double_p))
+            
             t0 = time.perf_counter()
             ssa.decompose(k=k)
             recon = ssa.reconstruct(list(range(k)))
@@ -112,23 +134,37 @@ def compare_speed(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
             print(f"{N:>6} {L:>5} {k:>3} | {our_time:>10.1f} {'error':>10} {'-':>8} {corr_raw:>10.4f} {corr_true:>11.4f}")
     
     print("-"*82)
-    print("Rssa: PROPACK (Lanczos) | Ours: Randomized SVD + MKL R2C FFT")
+    print("Rssa: PROPACK (Lanczos) | Ours: Randomized SVD + MKL R2C FFT + Malloc-Free Path")
 
 
 def compare_speed_detailed(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     """
-    Detailed breakdown: decompose vs reconstruct timing.
+    Detailed breakdown: decompose vs reconstruct timing (malloc-free path).
     """
-    from ssa_wrapper import SSA
+    from ssa_wrapper import SSA, _lib, _SSA_Opt, c_double_p
     
     print("\n" + "="*70)
-    print("DETAILED TIMING: Decompose vs Reconstruct")
+    print("DETAILED TIMING: Decompose vs Reconstruct (Malloc-Free)")
     print("="*70)
+    
+    # Apply MKL config and setup function signatures
+    try:
+        _lib.ssa_mkl_init.argtypes = [ctypes.c_int]
+        _lib.ssa_mkl_init.restype = ctypes.c_int
+        _lib.ssa_opt_prepare.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int]
+        _lib.ssa_opt_prepare.restype = ctypes.c_int
+        _lib.ssa_opt_update_signal.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p]
+        _lib.ssa_opt_update_signal.restype = ctypes.c_int
+        _lib.ssa_mkl_init(1)
+    except Exception as e:
+        print(f"Note: MKL config not available: {e}")
     
     # Warmup
     print("\nWarming up...")
     x_warmup = np.random.randn(1000)
-    SSA(x_warmup, L=250).decompose(k=10)
+    ssa_warmup = SSA(x_warmup, L=250)
+    _lib.ssa_opt_prepare(ctypes.byref(ssa_warmup._ctx), 30, 8)
+    ssa_warmup.decompose(k=10)
     print("Done.\n")
     
     print(f"{'N':>6} {'L':>5} {'k':>3} | {'Decomp':>9} {'Recon':>9} {'Total':>9} | {'Rssa':>9} {'Speedup':>8}")
@@ -143,11 +179,17 @@ def compare_speed_detailed(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe')
         np.random.seed(42)
         x = np.sin(np.linspace(0, 50*np.pi, N)) + 0.3*np.random.randn(N)
         
+        # Setup once with prepare
+        ssa = SSA(x, L=L)
+        _lib.ssa_opt_prepare(ctypes.byref(ssa._ctx), k, 8)
+        
         decomp_times = []
         recon_times = []
         
-        for _ in range(n_runs):
-            ssa = SSA(x, L=L)
+        for run_idx in range(n_runs):
+            # Update signal
+            x[0] += 0.0001
+            _lib.ssa_opt_update_signal(ctypes.byref(ssa._ctx), x.ctypes.data_as(c_double_p))
             
             t0 = time.perf_counter()
             ssa.decompose(k=k)
@@ -187,17 +229,32 @@ def compare_methods_internal():
     """
     Compare our three decomposition methods (no Rssa).
     Shows the 100x speedup of randomized vs sequential.
+    Uses malloc-free path for randomized method.
     """
-    from ssa_wrapper import SSA
+    from ssa_wrapper import SSA, _lib, _SSA_Opt, c_double_p
     
     print("\n" + "="*70)
     print("INTERNAL COMPARISON: Sequential vs Block vs Randomized")
     print("="*70)
     
+    # Apply MKL config
+    try:
+        _lib.ssa_mkl_init.argtypes = [ctypes.c_int]
+        _lib.ssa_mkl_init.restype = ctypes.c_int
+        _lib.ssa_opt_prepare.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int]
+        _lib.ssa_opt_prepare.restype = ctypes.c_int
+        _lib.ssa_opt_update_signal.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p]
+        _lib.ssa_opt_update_signal.restype = ctypes.c_int
+        _lib.ssa_mkl_init(1)
+    except Exception as e:
+        print(f"Note: MKL config not available: {e}")
+    
     # Warmup all methods
     print("\nWarming up all decomposition methods...")
     x_warmup = np.random.randn(1000)
-    SSA(x_warmup, L=250).decompose(k=10, method='randomized')
+    ssa_warmup = SSA(x_warmup, L=250)
+    _lib.ssa_opt_prepare(ctypes.byref(ssa_warmup._ctx), 30, 8)
+    ssa_warmup.decompose(k=10, method='randomized')
     SSA(x_warmup, L=250).decompose(k=10, method='block')
     SSA(x_warmup, L=250).decompose(k=10, method='sequential', max_iter=50)
     print("Done.\n")
@@ -233,16 +290,21 @@ def compare_methods_internal():
             times_block.append((time.perf_counter() - t0) * 1000)
         block_ms = np.median(times_block)
         
-        # Randomized (also capture reconstruction for correlation)
+        # Randomized with malloc-free path
+        ssa_rand = SSA(x, L=L)
+        _lib.ssa_opt_prepare(ctypes.byref(ssa_rand._ctx), k, 8)
+        
         times_rand = []
         recon_result = None
         for run_idx in range(n_runs):
-            ssa = SSA(x, L=L)
+            x[0] += 0.0001
+            _lib.ssa_opt_update_signal(ctypes.byref(ssa_rand._ctx), x.ctypes.data_as(c_double_p))
+            
             t0 = time.perf_counter()
-            ssa.decompose(k=k, method='randomized')
+            ssa_rand.decompose(k=k, method='randomized')
             times_rand.append((time.perf_counter() - t0) * 1000)
             if run_idx == 0:
-                recon_result = ssa.reconstruct(list(range(k)))
+                recon_result = ssa_rand.reconstruct(list(range(k)))
         rand_ms = np.median(times_rand)
         
         # Correlation
@@ -253,23 +315,37 @@ def compare_methods_internal():
     
     print("-"*90)
     print(f"Note: Sequential/Block use max_iter={100 if True else 50}")
-    print("Speedup = Sequential / Randomized")
+    print("Speedup = Sequential / Randomized (malloc-free)")
 
 
 def benchmark_scaling():
     """
-    Test O(N log N) scaling of our implementation.
+    Test O(N log N) scaling of our implementation (malloc-free path).
     """
-    from ssa_wrapper import SSA
+    from ssa_wrapper import SSA, _lib, _SSA_Opt, c_double_p
     
     print("\n" + "="*70)
-    print("SCALING TEST: Time vs N (should be ~O(N log N))")
+    print("SCALING TEST: Time vs N (should be ~O(N log N)) - Malloc-Free")
     print("="*70)
+    
+    # Apply MKL config
+    try:
+        _lib.ssa_mkl_init.argtypes = [ctypes.c_int]
+        _lib.ssa_mkl_init.restype = ctypes.c_int
+        _lib.ssa_opt_prepare.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int]
+        _lib.ssa_opt_prepare.restype = ctypes.c_int
+        _lib.ssa_opt_update_signal.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p]
+        _lib.ssa_opt_update_signal.restype = ctypes.c_int
+        _lib.ssa_mkl_init(1)
+    except Exception as e:
+        print(f"Note: MKL config not available: {e}")
     
     # Warmup
     print("\nWarming up...")
     x_warmup = np.random.randn(1000)
-    SSA(x_warmup, L=250).decompose(k=10)
+    ssa_warmup = SSA(x_warmup, L=250)
+    _lib.ssa_opt_prepare(ctypes.byref(ssa_warmup._ctx), 50, 8)
+    ssa_warmup.decompose(k=10)
     print("Done.\n")
     
     print(f"{'N':>7} {'L':>6} {'k':>3} | {'Time (ms)':>10} | {'N log N':>12} {'Ratio':>12}")
@@ -285,9 +361,15 @@ def benchmark_scaling():
         np.random.seed(42)
         x = np.sin(np.linspace(0, 50*np.pi, N)) + 0.3*np.random.randn(N)
         
+        # Setup with malloc-free path
+        ssa = SSA(x, L=L)
+        _lib.ssa_opt_prepare(ctypes.byref(ssa._ctx), k, 8)
+        
         times = []
-        for _ in range(n_runs):
-            ssa = SSA(x, L=L)
+        for run_idx in range(n_runs):
+            x[0] += 0.0001
+            _lib.ssa_opt_update_signal(ctypes.byref(ssa._ctx), x.ctypes.data_as(c_double_p))
+            
             t0 = time.perf_counter()
             ssa.decompose(k=k)
             times.append((time.perf_counter() - t0) * 1000)
@@ -315,24 +397,156 @@ def compare_speed_all(r_path):
     benchmark_scaling()
 
 
+def compare_malloc_free(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
+    """
+    Compare malloc-free hot path (with prepare) vs regular path AND Rssa.
+    
+    This tests the new ssa_opt_prepare() / ssa_opt_update_signal() API
+    that eliminates ~1MB malloc/free per decompose call.
+    """
+    from ssa_wrapper import SSA, _lib, _SSA_Opt, c_double_p
+    
+    print("\n" + "="*80)
+    print("MALLOC-FREE HOT PATH BENCHMARK vs Rssa")
+    print("="*80)
+    
+    # Always apply MKL config first
+    try:
+        _lib.ssa_mkl_init.argtypes = [ctypes.c_int]
+        _lib.ssa_mkl_init.restype = ctypes.c_int
+        print("\nApplying MKL configuration...")
+        _lib.ssa_mkl_init(1)  # verbose=1
+    except Exception as e:
+        print(f"Note: MKL config not available: {e}")
+    
+    # Check if new functions are available
+    try:
+        _lib.ssa_opt_prepare.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int]
+        _lib.ssa_opt_prepare.restype = ctypes.c_int
+        _lib.ssa_opt_update_signal.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p]
+        _lib.ssa_opt_update_signal.restype = ctypes.c_int
+        has_prepare = True
+    except Exception as e:
+        print(f"\nERROR: New malloc-free functions not available: {e}")
+        print("Make sure ssa_opt.h has ssa_opt_prepare() and ssa_opt_update_signal()")
+        return
+    
+    print("\nThis benchmark simulates a trading hot loop:")
+    print("  - Regular: init → decompose → reconstruct (malloc every call)")
+    print("  - Prepared: init → prepare → update_signal → decompose → reconstruct (no malloc)")
+    print("  - Rssa: R's standard SSA implementation for comparison")
+    print()
+    
+    test_configs = [
+        (1000, 250, 30, 100),   # N, L, k, iterations
+        (2000, 500, 30, 50),
+        (5000, 1250, 30, 20),
+        (10000, 2500, 50, 10),
+    ]
+    
+    n_runs = 5  # For Rssa timing
+    
+    print(f"{'N':>6} {'L':>5} {'k':>3} {'iters':>6} | {'Regular':>10} {'Prepared':>10} {'Rssa':>10} | {'vs Reg':>8} {'vs Rssa':>8}")
+    print("-"*90)
+    
+    for N, L, k, n_iterations in test_configs:
+        np.random.seed(42)
+        x = np.sin(np.linspace(0, 50*np.pi, N)) + 0.3*np.random.randn(N)
+        output = np.zeros(N)
+        group = list(range(k))
+        
+        # Warmup
+        ssa_warmup = SSA(x, L=L)
+        _lib.ssa_opt_prepare(ctypes.byref(ssa_warmup._ctx), k, 8)
+        ssa_warmup.decompose(k=k)
+        
+        # =====================================================================
+        # TEST 1: Regular path (malloc every call)
+        # =====================================================================
+        times_regular = []
+        for _ in range(3):  # 3 trials
+            x_copy = x.copy()
+            t0 = time.perf_counter()
+            for i in range(n_iterations):
+                x_copy[0] += 0.001
+                ssa = SSA(x_copy, L=L)
+                ssa.decompose(k=k)
+                _ = ssa.reconstruct(group)
+            times_regular.append((time.perf_counter() - t0) * 1000)
+        regular_ms = np.median(times_regular)
+        regular_per_iter = regular_ms / n_iterations
+        
+        # =====================================================================
+        # TEST 2: Prepared path (malloc-free hot loop)
+        # =====================================================================
+        times_prepared = []
+        for _ in range(3):  # 3 trials
+            x_copy = x.copy()
+            ssa = SSA(x_copy, L=L)
+            _lib.ssa_opt_prepare(ctypes.byref(ssa._ctx), k, 8)
+            
+            t0 = time.perf_counter()
+            for i in range(n_iterations):
+                x_copy[0] += 0.001
+                x_ptr = x_copy.ctypes.data_as(c_double_p)
+                _lib.ssa_opt_update_signal(ctypes.byref(ssa._ctx), x_ptr)
+                ssa.decompose(k=k)
+                _ = ssa.reconstruct(group)
+            times_prepared.append((time.perf_counter() - t0) * 1000)
+        prepared_ms = np.median(times_prepared)
+        prepared_per_iter = prepared_ms / n_iterations
+        
+        # =====================================================================
+        # TEST 3: Rssa timing (per iteration)
+        # =====================================================================
+        r_code = f'''suppressMessages(suppressWarnings(library(Rssa)));options(warn=-1);set.seed(42);x<-sin(seq(0,50*pi,length.out={N}))+0.3*rnorm({N});t0<-Sys.time();for(i in 1:{n_runs}){{invisible(capture.output({{s<-ssa(x,L={L},neig={k});r<-reconstruct(s,groups=list(1:{k}))}}));}};cat(as.numeric(Sys.time()-t0)/{n_runs}*1000)'''
+        
+        rssa_per_iter = None
+        try:
+            result = subprocess.run([r_path, '-e', r_code], capture_output=True, text=True, timeout=300)
+            if result.returncode == 0 and result.stdout.strip():
+                out = result.stdout.strip().split()
+                nums = [n for n in out if n.replace('.', '', 1).replace('-', '', 1).isdigit()]
+                if nums:
+                    rssa_per_iter = float(nums[-1])
+        except:
+            pass
+        
+        # Results
+        speedup_vs_regular = regular_per_iter / prepared_per_iter
+        
+        if rssa_per_iter:
+            speedup_vs_rssa = rssa_per_iter / prepared_per_iter
+            print(f"{N:>6} {L:>5} {k:>3} {n_iterations:>6} | {regular_per_iter:>8.2f}ms {prepared_per_iter:>8.2f}ms {rssa_per_iter:>8.1f}ms | {speedup_vs_regular:>7.2f}x {speedup_vs_rssa:>7.1f}x")
+        else:
+            print(f"{N:>6} {L:>5} {k:>3} {n_iterations:>6} | {regular_per_iter:>8.2f}ms {prepared_per_iter:>8.2f}ms {'err':>10} | {speedup_vs_regular:>7.2f}x {'-':>8}")
+    
+    print("-"*90)
+    print("\nNotes:")
+    print("  - 'Regular' creates new SSA object each iteration (malloc ~1MB workspace)")
+    print("  - 'Prepared' reuses pre-allocated workspace (zero malloc in hot loop)")
+    print("  - 'vs Reg' = speedup of Prepared over Regular (malloc overhead)")
+    print("  - 'vs Rssa' = speedup of Prepared over Rssa")
+
+
 def compare_mkl_config(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     """
     Compare performance with and without MKL configuration.
+    Uses malloc-free hot path throughout.
     
     Tests:
     1. Default MKL settings (no config)
     2. With ssa_mkl_init() - full SSA-optimized config
     3. Compare both against Rssa
     """
-    from ssa_wrapper import SSA
+    from ssa_wrapper import SSA, _lib, _SSA_Opt, c_double_p
     
     print("\n" + "="*80)
-    print("MKL CONFIGURATION COMPARISON")
+    print("MKL CONFIGURATION COMPARISON (Malloc-Free Path)")
     print("="*80)
     
     # Check if MKL config functions are available
     try:
-        from ssa_wrapper import _lib
         _lib.ssa_mkl_init.argtypes = [ctypes.c_int]
         _lib.ssa_mkl_init.restype = ctypes.c_int
         _lib.ssa_mkl_get_threads.argtypes = []
@@ -346,6 +560,10 @@ def compare_mkl_config(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
             ctypes.POINTER(ctypes.c_int)
         ]
         _lib.ssa_mkl_get_cpu_info.restype = None
+        _lib.ssa_opt_prepare.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int]
+        _lib.ssa_opt_prepare.restype = ctypes.c_int
+        _lib.ssa_opt_update_signal.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p]
+        _lib.ssa_opt_update_signal.restype = ctypes.c_int
         has_mkl_config = True
     except Exception as e:
         print(f"\nWARNING: MKL config functions not available in DLL: {e}")
@@ -380,10 +598,10 @@ def compare_mkl_config(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     n_runs = 5
     
     # =========================================================================
-    # Test 1: Default MKL settings
+    # Test 1: Default MKL settings (with malloc-free path)
     # =========================================================================
     print("\n" + "-"*80)
-    print("TEST 1: Default MKL Settings (no optimization)")
+    print("TEST 1: Default MKL Settings (no optimization, but malloc-free)")
     print("-"*80)
     
     # Reset to default
@@ -393,7 +611,9 @@ def compare_mkl_config(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     # Warmup
     np.random.seed(0)
     x_warmup = np.random.randn(1000)
-    SSA(x_warmup, L=250).decompose(k=10)
+    ssa_warmup = SSA(x_warmup, L=250)
+    _lib.ssa_opt_prepare(ctypes.byref(ssa_warmup._ctx), 50, 8)
+    ssa_warmup.decompose(k=10)
     
     default_times = {}
     
@@ -406,9 +626,16 @@ def compare_mkl_config(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
         x_true = np.sin(t_vec)
         x = x_true + 0.3*np.random.randn(N)
         
+        # Setup with malloc-free path
+        ssa = SSA(x, L=L)
+        _lib.ssa_opt_prepare(ctypes.byref(ssa._ctx), k, 8)
+        
         times = []
+        recon = None
         for run_idx in range(n_runs):
-            ssa = SSA(x, L=L)
+            x[0] += 0.0001
+            _lib.ssa_opt_update_signal(ctypes.byref(ssa._ctx), x.ctypes.data_as(c_double_p))
+            
             t0 = time.perf_counter()
             ssa.decompose(k=k)
             recon = ssa.reconstruct(list(range(k)))
@@ -421,10 +648,10 @@ def compare_mkl_config(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
         print(f"{N:>6} {L:>5} {k:>3} | {time_ms:>10.1f} {corr:>11.4f}")
     
     # =========================================================================
-    # Test 2: With MKL SSA-optimized config
+    # Test 2: With MKL SSA-optimized config (malloc-free path)
     # =========================================================================
     print("\n" + "-"*80)
-    print("TEST 2: With ssa_mkl_init() - SSA-Optimized Config")
+    print("TEST 2: With ssa_mkl_init() - SSA-Optimized Config (malloc-free)")
     print("-"*80)
     
     # Apply SSA-optimized configuration
@@ -435,7 +662,9 @@ def compare_mkl_config(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     print(f"MKL threads after config: {optimized_threads}")
     
     # Warmup again after config change
-    SSA(x_warmup, L=250).decompose(k=10)
+    ssa_warmup2 = SSA(x_warmup, L=250)
+    _lib.ssa_opt_prepare(ctypes.byref(ssa_warmup2._ctx), 50, 8)
+    ssa_warmup2.decompose(k=10)
     
     optimized_times = {}
     
@@ -448,9 +677,16 @@ def compare_mkl_config(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
         x_true = np.sin(t_vec)
         x = x_true + 0.3*np.random.randn(N)
         
+        # Setup with malloc-free path
+        ssa = SSA(x, L=L)
+        _lib.ssa_opt_prepare(ctypes.byref(ssa._ctx), k, 8)
+        
         times = []
+        recon = None
         for run_idx in range(n_runs):
-            ssa = SSA(x, L=L)
+            x[0] += 0.0001
+            _lib.ssa_opt_update_signal(ctypes.byref(ssa._ctx), x.ctypes.data_as(c_double_p))
+            
             t0 = time.perf_counter()
             ssa.decompose(k=k)
             recon = ssa.reconstruct(list(range(k)))
@@ -467,7 +703,7 @@ def compare_mkl_config(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     # Test 3: Compare against Rssa
     # =========================================================================
     print("\n" + "-"*80)
-    print("TEST 3: Optimized SSA vs Rssa")
+    print("TEST 3: Optimized SSA (malloc-free) vs Rssa")
     print("-"*80)
     
     print(f"\n{'N':>6} {'L':>5} {'k':>3} | {'Ours (ms)':>10} {'Rssa (ms)':>10} {'Speedup':>10}")
@@ -500,7 +736,7 @@ def compare_mkl_config(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     # Summary
     # =========================================================================
     print("\n" + "="*80)
-    print("SUMMARY")
+    print("SUMMARY (All tests use malloc-free hot path)")
     print("="*80)
     
     print(f"\n{'Config':>25} | ", end="")
@@ -539,6 +775,7 @@ if __name__ == "__main__":
     parser.add_argument('--internal', action='store_true', help='Compare our three methods')
     parser.add_argument('--scaling', action='store_true', help='Test O(N log N) scaling')
     parser.add_argument('--mkl-config', action='store_true', help='Compare with/without MKL config')
+    parser.add_argument('--malloc-free', action='store_true', help='Compare malloc-free hot path vs regular')
     parser.add_argument('--all', action='store_true', help='Run all benchmarks')
     parser.add_argument('--r-path', default=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe')
     args = parser.parse_args()
@@ -553,6 +790,8 @@ if __name__ == "__main__":
         benchmark_scaling()
     elif args.mkl_config:
         compare_mkl_config(args.r_path)
+    elif args.malloc_free:
+        compare_malloc_free(args.r_path)
     elif args.all:
         compare_speed_all(args.r_path)
     else:
@@ -565,6 +804,7 @@ if __name__ == "__main__":
         print("  --internal   Compare sequential/block/randomized")
         print("  --scaling    Test O(N log N) complexity")
         print("  --mkl-config Compare with/without MKL optimization")
+        print("  --malloc-free Compare malloc-free hot path vs regular")
         print("  --all        Run everything")
         print()
         print("Example: python benchmark_vs_rssa.py --all")

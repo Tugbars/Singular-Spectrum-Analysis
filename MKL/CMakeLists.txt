@@ -7,8 +7,6 @@ option(USE_MKL "Use Intel MKL for optimized FFT and BLAS" ON)
 
 # Tests are in test/ subdirectory
 add_executable(ssa_opt_test test/ssa_opt_test.c)
-add_executable(ssa_example test/ssa_example.c)
-add_executable(ssa_mkl_debug test/ssa_mkl_debug.c)
 add_executable(ssa_block_test test/ssa_block_test.c)
 add_executable(ssa_forecast_test test/test_ssa_forecast.c)
 add_executable(mssa_test test/test_mssa.c)
@@ -18,8 +16,6 @@ add_executable(wcorr_parallel_bench test/wcorr_parallel_bench.c)
 # All test executables
 set(TEST_TARGETS
     ssa_opt_test
-    ssa_example
-    ssa_mkl_debug
     ssa_block_test
     ssa_forecast_test
     mssa_test

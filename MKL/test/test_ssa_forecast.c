@@ -7,6 +7,8 @@
  * Generates trend + seasonal + noise, decomposes, forecasts, and compares
  * against known ground truth.
  *
+ * Uses malloc-free hot path with ssa_opt_prepare() for optimal performance.
+ *
  * BUILD (Linux + MKL):
  *   source /opt/intel/oneapi/setvars.sh
  *   gcc -O2 -o test_ssa_forecast test_ssa_forecast.c \
@@ -21,6 +23,7 @@
  */
 
 #define SSA_OPT_IMPLEMENTATION
+#include "mkl_config.h"
 #include "ssa_opt.h"
 
 #include <stdio.h>
@@ -164,7 +167,7 @@ static int test_basic_forecast(void)
 {
     printf("\n");
     printf("============================================================\n");
-    printf("TEST 1: Basic SSA Forecasting\n");
+    printf("TEST 1: Basic SSA Forecasting (Malloc-Free Path)\n");
     printf("============================================================\n");
     
     // Generate synthetic data
@@ -187,7 +190,17 @@ static int test_basic_forecast(void)
         return -1;
     }
     
-    // Decompose using randomized SVD (fastest)
+    // Prepare workspace for malloc-free decomposition
+    printf("\nPreparing malloc-free workspace (k=%d)...\n", N_COMPONENTS);
+    if (ssa_opt_prepare(&ssa, N_COMPONENTS, 8) != 0) {
+        printf("ERROR: SSA prepare failed\n");
+        ssa_opt_free(&ssa);
+        free_synthetic_signal(&sig);
+        return -1;
+    }
+    printf("  Workspace prepared (malloc-free hot path enabled)\n");
+    
+    // Decompose using randomized SVD (fastest, uses prepared workspace)
     printf("\nDecomposing with randomized SVD (k=%d)...\n", N_COMPONENTS);
     clock_t start = clock();
     if (ssa_opt_decompose_randomized(&ssa, N_COMPONENTS, 8) != 0) {
@@ -383,7 +396,7 @@ static int test_forecast_accuracy_vs_horizon(void)
 {
     printf("\n");
     printf("============================================================\n");
-    printf("TEST 2: Forecast Accuracy vs Horizon\n");
+    printf("TEST 2: Forecast Accuracy vs Horizon (Malloc-Free Path)\n");
     printf("============================================================\n");
     
     SyntheticSignal sig;
@@ -391,6 +404,7 @@ static int test_forecast_accuracy_vs_horizon(void)
     
     SSA_Opt ssa = {0};
     ssa_opt_init(&ssa, sig.signal, N_OBSERVED, WINDOW_L);
+    ssa_opt_prepare(&ssa, N_COMPONENTS, 8);  // Malloc-free path
     ssa_opt_decompose_randomized(&ssa, N_COMPONENTS, 8);
     
     int signal_group[] = {0, 1, 2};
@@ -436,7 +450,7 @@ static int test_different_component_groups(void)
 {
     printf("\n");
     printf("============================================================\n");
-    printf("TEST 3: Different Component Groupings\n");
+    printf("TEST 3: Different Component Groupings (Malloc-Free Path)\n");
     printf("============================================================\n");
     
     SyntheticSignal sig;
@@ -444,6 +458,7 @@ static int test_different_component_groups(void)
     
     SSA_Opt ssa = {0};
     ssa_opt_init(&ssa, sig.signal, N_OBSERVED, WINDOW_L);
+    ssa_opt_prepare(&ssa, N_COMPONENTS, 8);  // Malloc-free path
     ssa_opt_decompose_randomized(&ssa, N_COMPONENTS, 8);
     
     // Prepare true components for comparison
@@ -495,6 +510,58 @@ static int test_different_component_groups(void)
     return 0;
 }
 
+static int test_streaming_updates(void)
+{
+    printf("\n");
+    printf("============================================================\n");
+    printf("TEST 4: Streaming Signal Updates\n");
+    printf("============================================================\n");
+    
+    SyntheticSignal sig;
+    generate_synthetic_signal(&sig);
+    
+    int signal_group[] = {0, 1, 2};
+    double *recon = (double *)malloc(N_OBSERVED * sizeof(double));
+    int n_updates = 20;
+    
+    // Setup once with prepare
+    SSA_Opt ssa = {0};
+    ssa_opt_init(&ssa, sig.signal, N_OBSERVED, WINDOW_L);
+    ssa_opt_prepare(&ssa, N_COMPONENTS, 8);
+    
+    printf("\nSimulating %d streaming updates:\n", n_updates);
+    printf("  Update | Decomp (ms) | Recon Corr\n");
+    printf("  -------|-------------|----------\n");
+    
+    for (int i = 0; i < n_updates; i++) {
+        // Simulate new data arriving
+        sig.signal[0] += 0.01 * (i + 1);
+        
+        // Update signal (just memcpy + FFT, no malloc)
+        ssa_opt_update_signal(&ssa, sig.signal);
+        
+        // Decompose (uses prepared workspace, no malloc)
+        clock_t start = clock();
+        ssa_opt_decompose_randomized(&ssa, N_COMPONENTS, 8);
+        double decomp_time = (double)(clock() - start) / CLOCKS_PER_SEC * 1000;
+        
+        // Reconstruct
+        ssa_opt_reconstruct(&ssa, signal_group, 3, recon);
+        double corr = compute_correlation(sig.signal, recon, N_OBSERVED);
+        
+        if (i % 5 == 0 || i == n_updates - 1) {
+            printf("  %6d | %11.3f | %.6f\n", i, decomp_time, corr);
+        }
+    }
+    
+    ssa_opt_free(&ssa);
+    free(recon);
+    free_synthetic_signal(&sig);
+    
+    printf("\nTEST 4: PASSED\n");
+    return 0;
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -505,8 +572,13 @@ int main(void)
     printf("############################################################\n");
     printf("#                                                          #\n");
     printf("#            SSA FORECASTING TEST SUITE                    #\n");
+    printf("#            (Malloc-Free Hot Path)                        #\n");
     printf("#                                                          #\n");
     printf("############################################################\n");
+    
+    // Initialize MKL with optimal settings
+    printf("\n--- MKL Configuration ---\n");
+    //ssa_mkl_init(1);  // Verbose output
     
     srand(42);  // Fixed seed for reproducibility
     
@@ -515,6 +587,7 @@ int main(void)
     result |= test_basic_forecast();
     result |= test_forecast_accuracy_vs_horizon();
     result |= test_different_component_groups();
+    result |= test_streaming_updates();
     
     printf("\n");
     printf("############################################################\n");

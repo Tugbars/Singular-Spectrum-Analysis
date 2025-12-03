@@ -27,6 +27,8 @@
 #include "mkl_config.h"
 #include "ssa_opt.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #ifdef _WIN32
@@ -277,6 +279,61 @@ int main(void)
     ssa_opt_free(&ssa_fresh);
 
     // =========================================================================
+    // Test 6: Malloc-Free Hot Path vs Regular Path
+    // =========================================================================
+    printf("=== Test 6: Malloc-Free Hot Path ===\n");
+    
+    int n_hot_iterations = 100;
+    double *x_copy = (double *)mkl_malloc(N * sizeof(double), 64);
+    memcpy(x_copy, x, N * sizeof(double));
+    
+    // --- Regular path (malloc every call) ---
+    t0 = get_time_ms();
+    for (int iter = 0; iter < n_hot_iterations; iter++)
+    {
+        // Simulate new data
+        x_copy[0] += 0.001;
+        
+        SSA_Opt ssa_temp = {0};
+        ssa_opt_init(&ssa_temp, x_copy, N, L);
+        ssa_opt_decompose_randomized(&ssa_temp, k, oversampling);
+        ssa_opt_reconstruct(&ssa_temp, group_all, k, recon_rand);
+        ssa_opt_free(&ssa_temp);
+    }
+    double t_regular = get_time_ms() - t0;
+    printf("Regular path (%d iterations): %.2f ms (%.3f ms/iter)\n", 
+           n_hot_iterations, t_regular, t_regular / n_hot_iterations);
+    
+    // --- Prepared path (malloc-free hot loop) ---
+    memcpy(x_copy, x, N * sizeof(double));  // Reset
+    
+    SSA_Opt ssa_hot = {0};
+    ssa_opt_init(&ssa_hot, x_copy, N, L);
+    ssa_opt_prepare(&ssa_hot, k, oversampling);  // Pre-allocate workspace
+    
+    t0 = get_time_ms();
+    for (int iter = 0; iter < n_hot_iterations; iter++)
+    {
+        // Simulate new data
+        x_copy[0] += 0.001;
+        
+        ssa_opt_update_signal(&ssa_hot, x_copy);  // Just memcpy + 1 FFT
+        ssa_opt_decompose_randomized(&ssa_hot, k, oversampling);  // Reuses workspace
+        ssa_opt_reconstruct(&ssa_hot, group_all, k, recon_rand);
+    }
+    double t_prepared = get_time_ms() - t0;
+    printf("Prepared path (%d iterations): %.2f ms (%.3f ms/iter)\n", 
+           n_hot_iterations, t_prepared, t_prepared / n_hot_iterations);
+    
+    double hot_speedup = t_regular / t_prepared;
+    double saved_per_iter = (t_regular - t_prepared) / n_hot_iterations;
+    printf("Speedup: %.2fx\n", hot_speedup);
+    printf("Malloc overhead saved: %.3f ms/iter\n\n", saved_per_iter);
+    
+    ssa_opt_free(&ssa_hot);
+    mkl_free(x_copy);
+
+    // =========================================================================
     // Comparison Summary
     // =========================================================================
     printf("============================================================\n");
@@ -290,6 +347,9 @@ int main(void)
     printf("------------------------------------------------------------\n");
     printf("%-25s %10.2f %10s\n", "W-corr (no cache)", t_wcorr_nocache, "-");
     printf("%-25s %10.2f %10.2fx\n", "W-corr (cached)", t_wcorr_cached, t_wcorr_nocache/t_wcorr_cached);
+    printf("------------------------------------------------------------\n");
+    printf("%-25s %10.2f %10s\n", "Hot loop (regular)", t_regular/n_hot_iterations, "per iter");
+    printf("%-25s %10.2f %10.2fx\n", "Hot loop (prepared)", t_prepared/n_hot_iterations, hot_speedup);
     printf("============================================================\n\n");
 
     // =========================================================================
@@ -342,6 +402,16 @@ int main(void)
     if (t_seq / t_rand < 1.5)
     {
         printf("[WARN] Randomized SVD speedup < 1.5x (may be expected for small k)\n");
+    }
+    
+    // Check hot path benefit
+    if (hot_speedup < 1.1)
+    {
+        printf("[WARN] Malloc-free hot path speedup < 1.1x (%.2fx)\n", hot_speedup);
+    }
+    else
+    {
+        printf("[PASS] Malloc-free hot path speedup: %.2fx\n", hot_speedup);
     }
     
     if (pass)

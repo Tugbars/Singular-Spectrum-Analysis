@@ -33,6 +33,11 @@ EXPORTS
     
     ; === NEW: Additional SSA functions ===
     ssa_opt_extend
+
+    ; === NEW: Malloc-free hot path ===
+    ssa_opt_prepare
+    ssa_opt_update_signal
+    ssa_opt_free_prepared
     
     ; === NEW: MKL Configuration Functions ===
     ssa_mkl_init
@@ -43,3 +48,5 @@ EXPORTS
     ssa_mkl_get_cpu_info
     ssa_mkl_set_p_core_affinity
     ssa_mkl_disable_affinity
+
+

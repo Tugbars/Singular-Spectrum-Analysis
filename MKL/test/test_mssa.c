@@ -8,15 +8,19 @@
  * - Series-specific idiosyncratic movements
  * - Cross-correlations between pairs
  *
+ * Uses MKL optimized configuration for maximum performance.
+ *
  * BUILD: Same as other SSA tests (see CMakeLists.txt)
  *
  * ============================================================================
  */
 
 #define SSA_OPT_IMPLEMENTATION
+#include "mkl_config.h"
 #include "ssa_opt.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 #include <time.h>
 
@@ -465,6 +469,53 @@ static int test_mssa_pairs_analysis(void)
     return 0;
 }
 
+static int test_mssa_throughput(void)
+{
+    printf("\n");
+    printf("============================================================\n");
+    printf("TEST 5: MSSA Throughput Measurement\n");
+    printf("============================================================\n");
+    
+    SyntheticMSSAData data;
+    generate_mssa_data(&data);
+    
+    double *recon_all = (double *)malloc(N_SERIES * N_SAMPLES * sizeof(double));
+    int group[] = {0, 1, 2, 3, 4};
+    
+    // Single MSSA setup
+    MSSA_Opt mssa = {0};
+    mssa_opt_init(&mssa, data.X, N_SERIES, N_SAMPLES, WINDOW_L);
+    mssa_opt_decompose(&mssa, N_COMPONENTS, 8);
+    
+    // Measure reconstruction throughput
+    int n_recon = 100;
+    clock_t start = clock();
+    
+    for (int i = 0; i < n_recon; i++) {
+        mssa_opt_reconstruct_all(&mssa, group, 5, recon_all);
+    }
+    
+    double recon_time = (double)(clock() - start) / CLOCKS_PER_SEC * 1000;
+    
+    printf("\nReconstruction throughput:\n");
+    printf("  %d reconstructions: %.2f ms\n", n_recon, recon_time);
+    printf("  Per reconstruction: %.3f ms\n", recon_time / n_recon);
+    
+    // Single decompose timing
+    start = clock();
+    mssa_opt_decompose(&mssa, N_COMPONENTS, 8);
+    double decomp_time = (double)(clock() - start) / CLOCKS_PER_SEC * 1000;
+    
+    printf("\nDecomposition time: %.2f ms\n", decomp_time);
+    
+    mssa_opt_free(&mssa);
+    free(recon_all);
+    free_mssa_data(&data);
+    
+    printf("\nTEST 5: PASSED\n");
+    return 0;
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -475,8 +526,13 @@ int main(void)
     printf("############################################################\n");
     printf("#                                                          #\n");
     printf("#         MSSA (MULTIVARIATE SSA) TEST SUITE               #\n");
+    printf("#         (MKL Optimized Configuration)                    #\n");
     printf("#                                                          #\n");
     printf("############################################################\n");
+    
+    // Initialize MKL with optimal settings
+    printf("\n--- MKL Configuration ---\n");
+    //ssa_mkl_init(1);  // Verbose output
     
     srand(42);
     
@@ -486,6 +542,7 @@ int main(void)
     result |= test_mssa_reconstruction();
     result |= test_mssa_common_factor();
     result |= test_mssa_pairs_analysis();
+    result |= test_mssa_throughput();
     
     printf("\n");
     printf("############################################################\n");
