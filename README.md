@@ -34,6 +34,10 @@ Unlike Fourier analysis, SSA is non-parametric and adapts to your data's structu
 
 *2-year ahead forecast capturing trend and 12-month seasonality (RMSE: 47.5).*
 
+### 2.3 Signal Denoising with Cadzow. 
+
+<img width="3472" height="1971" alt="cadzow_comparison" src="https://github.com/user-attachments/assets/5bf60b04-05c7-4f58-af48-b1b883df4468" />
+
 ## 3. Benchmarks
 
 ### 3.1 Speed: SSA-Opt vs Rssa
