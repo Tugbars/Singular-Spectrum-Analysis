@@ -47,61 +47,165 @@ extern "C"
 
     typedef struct
     {
-        int N, L, K, fft_len, r2c_len;
-        DFTI_DESCRIPTOR_HANDLE fft_r2c, fft_c2r, fft_r2c_batch, fft_c2r_batch, fft_c2r_wcorr;
-        VSLStreamStatePtr rng;
-        double *fft_x, *ws_real, *ws_complex, *ws_real2, *ws_proj;
-        double *ws_batch_real, *ws_batch_complex;
-        double *U, *V, *sigma, *eigenvalues;
-        int n_components;
-        double *inv_diag_count, *U_fft, *V_fft;
-        bool fft_cached;
-        double *wcorr_ws_complex, *wcorr_h, *wcorr_G, *wcorr_sqrt_inv_c;
-        // Decompose workspace (pre-allocated for hot path)
-        int prepared_kp;          // Max k+p this workspace supports
-        int prepared_lwork;       // LAPACK workspace size
-        double *decomp_Omega;     // K * kp
-        double *decomp_Y;         // L * kp
-        double *decomp_Q;         // L * kp
-        double *decomp_B;         // K * kp
-        double *decomp_tau;       // kp
-        double *decomp_B_left;    // K * kp
-        double *decomp_B_right_T; // kp * kp
-        double *decomp_S;         // kp
-        double *decomp_work;      // lwork
-        int *decomp_iwork;        // 8 * kp
-        bool prepared;
-        bool initialized, decomposed;
-        double total_variance;
+        // === Dimensions ===
+        int N;       // Signal length (number of samples)
+        int L;       // Window length (embedding dimension), typically N/4 to N/2
+        int K;       // Number of lagged copies, K = N - L + 1
+        int fft_len; // FFT length (next power of 2 >= N + K for convolution)
+        int r2c_len; // Real-to-complex output length = fft_len/2 + 1 (Hermitian symmetry)
+
+        // === MKL FFT Descriptors ===
+        DFTI_DESCRIPTOR_HANDLE fft_r2c;       // Forward: real → complex (single vector)
+        DFTI_DESCRIPTOR_HANDLE fft_c2r;       // Inverse: complex → real (single vector)
+        DFTI_DESCRIPTOR_HANDLE fft_r2c_batch; // Forward batched: up to SSA_BATCH_SIZE vectors
+        DFTI_DESCRIPTOR_HANDLE fft_c2r_batch; // Inverse batched: up to SSA_BATCH_SIZE vectors
+        DFTI_DESCRIPTOR_HANDLE fft_c2r_wcorr; // Inverse for W-correlation (n_components at once)
+
+        // === Random Number Generator ===
+        VSLStreamStatePtr rng; // MKL VSL stream for randomized SVD (Mersenne Twister)
+
+        // === Core FFT Workspaces ===
+        double *fft_x;      // Pre-computed FFT of signal x, length 2*r2c_len (complex)
+        double *ws_real;    // Real workspace for FFT input, length fft_len
+        double *ws_complex; // Complex workspace for FFT output, length 2*r2c_len
+        double *ws_real2;   // Secondary real workspace for adjoint matvec
+        double *ws_proj;    // Projection workspace for power iteration
+
+        // === Batched FFT Workspaces ===
+        double *ws_batch_real;    // Batched real input, fft_len * SSA_BATCH_SIZE
+        double *ws_batch_complex; // Batched complex output, 2*r2c_len * SSA_BATCH_SIZE
+
+        // === SVD Results ===
+        double *U;           // Left singular vectors, L × n_components (column-major)
+        double *V;           // Right singular vectors, K × n_components (column-major)
+        double *sigma;       // Singular values σ₀ ≥ σ₁ ≥ ... ≥ σₖ₋₁
+        double *eigenvalues; // Eigenvalues λᵢ = σᵢ² (of HᵀH)
+        int n_components;    // Number of computed components
+
+        // === Reconstruction Cache (frequency-domain accumulation) ===
+        double *inv_diag_count; // 1/w[t] where w[t] = diagonal averaging weight, length N
+        double *U_fft;          // Cached FFT of scaled U columns: FFT(σᵢ·Uᵢ), n_components × 2*r2c_len
+        double *V_fft;          // Cached FFT of V columns: FFT(Vᵢ), n_components × 2*r2c_len
+        bool fft_cached;        // True if U_fft/V_fft are valid
+
+        // === W-Correlation Workspace (DSYRK optimization) ===
+        double *wcorr_ws_complex; // Complex workspace for batched component FFTs
+        double *wcorr_h;          // Reconstructed components before weighting, n × N
+        double *wcorr_G;          // Weighted/normalized matrix for DSYRK, n × N
+        double *wcorr_sqrt_inv_c; // Precomputed √(1/w[t]) for fast weighting
+
+        // === Randomized SVD Workspace (malloc-free hot path) ===
+        int prepared_kp;          // Max k+p this workspace supports (set by ssa_opt_prepare)
+        int prepared_lwork;       // LAPACK workspace size for DGESDD
+        double *decomp_Omega;     // Random Gaussian matrix, K × (k+p)
+        double *decomp_Y;         // Random projection Y = H·Ω, L × (k+p)
+        double *decomp_Q;         // Orthonormal basis from QR(Y), L × (k+p)
+        double *decomp_B;         // Projected matrix B = Hᵀ·Q, K × (k+p)
+        double *decomp_tau;       // Householder reflectors from QR, length k+p
+        double *decomp_B_left;    // Left singular vectors of B (DGESDD output)
+        double *decomp_B_right_T; // Right singular vectors of B transposed
+        double *decomp_S;         // Singular values from small SVD, length k+p
+        double *decomp_work;      // LAPACK DGESDD workspace, length prepared_lwork
+        int *decomp_iwork;        // LAPACK DGESDD integer workspace, length 8*(k+p)
+        bool prepared;            // True if randomized workspace is allocated
+
+        // === State Flags ===
+        bool initialized; // True after ssa_opt_init() succeeds
+        bool decomposed;  // True after any decompose function succeeds
+
+        // === Statistics ===
+        double total_variance; // Sum of all eigenvalues (trace of HᵀH)
+
     } SSA_Opt;
 
+    // === Component Statistics (for automatic grouping / rank selection) ===
     typedef struct
     {
-        int n;
-        double *singular_values, *log_sv, *gaps, *cumulative_var, *second_diff;
-        int suggested_signal;
-        double gap_threshold;
+        int n; // Number of components analyzed
+
+        // === Singular Value Analysis ===
+        double *singular_values; // σᵢ values, length n (descending order)
+        double *log_sv;          // log(σᵢ), useful for scree plot visualization
+        double *gaps;            // Relative gaps: (σᵢ - σᵢ₊₁) / σᵢ, length n-1
+                                 // Large gap suggests signal/noise boundary
+
+        // === Variance Analysis ===
+        double *cumulative_var; // Cumulative variance explained: Σⱼ₌₀ⁱ λⱼ / Σλ
+                                // cumulative_var[i] = fraction of total variance in components 0..i
+
+        // === Automatic Rank Selection ===
+        double *second_diff;  // Second difference of log(σ): Δ²log(σᵢ), length n-2
+                              // Peak indicates "elbow" in scree plot
+        int suggested_signal; // Suggested number of signal components (auto-detected)
+        double gap_threshold; // Threshold used for gap detection (default 0.1 = 10% drop)
+
     } SSA_ComponentStats;
 
+    // === Linear Recurrence Formula (for R-forecasting) ===
     typedef struct
     {
-        double *R;
-        int L;
-        double verticality;
-        bool valid;
+        double *R; // LRF coefficients [a₁, a₂, ..., aₗ₋₁], length L-1
+                   // Forecasts via: x[n] = Σⱼ aⱼ · x[n-j]
+                   // Derived from last row of eigenvectors (shifted structure)
+
+        int L; // Window length (determines LRF order = L-1)
+
+        double verticality; // ν² = Σᵢ πᵢ² where πᵢ = U[L-1, i] (last row of U)
+                            // Measures forecast stability:
+                            //   ν² ≈ 0: stable, coefficients well-defined
+                            //   ν² → 1: unstable, LRF becomes singular
+                            // Rule: if ν² > 0.9, use V-forecast instead
+
+        bool valid; // True if LRF was computed successfully
+                    // False if verticality too high or other failure
+
     } SSA_LRF;
 
+    // === Multivariate SSA (M time series analyzed jointly) ===
     typedef struct
     {
-        int M, N, L, K, fft_len, r2c_len;
-        DFTI_DESCRIPTOR_HANDLE fft_r2c, fft_c2r, fft_r2c_batch, fft_c2r_batch;
-        VSLStreamStatePtr rng;
-        double *fft_x, *ws_real, *ws_complex, *ws_batch_real, *ws_batch_complex;
-        double *U, *V, *sigma, *eigenvalues;
-        int n_components;
-        double *inv_diag_count;
-        bool initialized, decomposed;
-        double total_variance;
+        // === Dimensions ===
+        int M;       // Number of time series (channels)
+        int N;       // Length of each series (all must be equal)
+        int L;       // Window length per series
+        int K;       // Number of lagged copies, K = N - L + 1
+        int fft_len; // FFT length for Hankel matvec
+        int r2c_len; // Real-to-complex output length = fft_len/2 + 1
+
+        // === MKL FFT Descriptors ===
+        DFTI_DESCRIPTOR_HANDLE fft_r2c;       // Forward: real → complex
+        DFTI_DESCRIPTOR_HANDLE fft_c2r;       // Inverse: complex → real
+        DFTI_DESCRIPTOR_HANDLE fft_r2c_batch; // Forward batched
+        DFTI_DESCRIPTOR_HANDLE fft_c2r_batch; // Inverse batched
+
+        // === Random Number Generator ===
+        VSLStreamStatePtr rng; // For randomized SVD
+
+        // === FFT Workspaces ===
+        double *fft_x;            // Pre-computed FFT of all M signals, M × 2*r2c_len
+                                  // fft_x[m * 2*r2c_len ...] = FFT(series m)
+        double *ws_real;          // Real workspace, length fft_len
+        double *ws_complex;       // Complex workspace, length 2*r2c_len
+        double *ws_batch_real;    // Batched real workspace
+        double *ws_batch_complex; // Batched complex workspace
+
+        // === SVD Results ===
+        // Block trajectory matrix is (M·L) × K, stacking L-lagged windows from all series
+        double *U;           // Left singular vectors, (M·L) × n_components
+                             // U is block-structured: U[m*L : (m+1)*L, :] for series m
+        double *V;           // Right singular vectors, K × n_components (shared across series)
+        double *sigma;       // Singular values, length n_components
+        double *eigenvalues; // Eigenvalues λᵢ = σᵢ²
+        int n_components;    // Number of computed components
+
+        // === Reconstruction ===
+        double *inv_diag_count; // Diagonal averaging weights (same for all series)
+
+        // === State ===
+        bool initialized;      // True after mssa_opt_init() succeeds
+        bool decomposed;       // True after mssa_opt_decompose() succeeds
+        double total_variance; // Total variance across all M series
+
     } MSSA_Opt;
 
     // Public API declarations
@@ -550,39 +654,107 @@ extern "C"
         }
     }
 
+    /**
+     * Initialize SSA structure with signal and parameters.
+     *
+     * This function sets up all data structures needed for FFT-accelerated SSA:
+     * - Computes dimensions and FFT length
+     * - Allocates all workspaces
+     * - Creates MKL FFT descriptors (forward, inverse, batched)
+     * - Pre-computes FFT of signal (reused in every Hankel matvec)
+     * - Pre-computes diagonal averaging weights
+     *
+     * After init, call ssa_opt_decompose*() then ssa_opt_reconstruct().
+     *
+     * @param ssa   Output structure (caller allocates, we fill in)
+     * @param x     Input signal, length N
+     * @param N     Signal length
+     * @param L     Window length (embedding dimension), typically N/4 to N/2
+     * @return      0 on success, -1 on failure
+     */
     int ssa_opt_init(SSA_Opt *ssa, const double *x, int N, int L)
     {
+        // === Parameter Validation ===
+        // N >= 4: need at least a few samples for meaningful SSA
+        // L >= 2: window must have at least 2 elements
+        // L <= N-1: need K = N-L+1 >= 2 lagged copies
         if (!ssa || !x || N < 4 || L < 2 || L > N - 1)
             return -1;
+
+        // Zero-initialize entire structure (sets all pointers to NULL, flags to false)
         memset(ssa, 0, sizeof(SSA_Opt));
+
+        // === Compute Dimensions ===
         ssa->N = N;
         ssa->L = L;
-        ssa->K = N - L + 1;
+        ssa->K = N - L + 1; // Number of lagged windows (columns of trajectory matrix)
+
+        // FFT length for convolution:
+        // Hankel matvec y = H·v is computed as convolution of x (length N) and v (length K)
+        // Convolution result has length N + K - 1
+        // Round up to power of 2 for FFT efficiency (radix-2 is fastest)
         int conv_len = N + ssa->K - 1;
         int fft_n = ssa_opt_next_pow2(conv_len);
         ssa->fft_len = fft_n;
+
+        // Real-to-Complex FFT output length:
+        // For real input of length N, FFT output has Hermitian symmetry: X[k] = conj(X[N-k])
+        // Only need to store first N/2+1 complex values (the rest are redundant)
+        // This saves ~50% memory compared to full complex-to-complex FFT
         ssa->r2c_len = fft_n / 2 + 1;
 
+        // === Allocate Core Workspaces ===
+        // All allocations use 64-byte alignment for AVX-512 compatibility
+
+        // ws_real: Real-valued input buffer for forward FFT
+        // Used to hold zero-padded, reversed vectors before FFT
         ssa->ws_real = (double *)ssa_opt_alloc(fft_n * sizeof(double));
+
+        // ws_complex: Complex output from forward FFT / input to inverse FFT
+        // Stored as interleaved [re, im, re, im, ...], length 2 * r2c_len doubles
         ssa->ws_complex = (double *)ssa_opt_alloc(2 * ssa->r2c_len * sizeof(double));
+
+        // ws_real2: Secondary real workspace for adjoint matvec (Hᵀ·u)
+        // Needed because forward and adjoint use different extraction offsets
         ssa->ws_real2 = (double *)ssa_opt_alloc(fft_n * sizeof(double));
+
+        // ws_batch_real/complex: Batched FFT workspaces
+        // Process up to SSA_BATCH_SIZE (default 32) vectors in one MKL call
+        // Reduces function call overhead, improves cache utilization
         ssa->ws_batch_real = (double *)ssa_opt_alloc(SSA_BATCH_SIZE * fft_n * sizeof(double));
         ssa->ws_batch_complex = (double *)ssa_opt_alloc(SSA_BATCH_SIZE * 2 * ssa->r2c_len * sizeof(double));
+
+        // fft_x: Pre-computed FFT of the input signal
+        // This is the key optimization: signal doesn't change during decomposition,
+        // so we compute FFT(x) once here and reuse it in every Hankel matvec
+        // Saves one FFT per matvec operation
         ssa->fft_x = (double *)ssa_opt_alloc(2 * ssa->r2c_len * sizeof(double));
-        if (!ssa->ws_real || !ssa->ws_complex || !ssa->ws_real2 || !ssa->ws_batch_real || !ssa->ws_batch_complex || !ssa->fft_x)
+
+        // Check all allocations succeeded
+        if (!ssa->ws_real || !ssa->ws_complex || !ssa->ws_real2 ||
+            !ssa->ws_batch_real || !ssa->ws_batch_complex || !ssa->fft_x)
         {
-            ssa_opt_free(ssa);
+            ssa_opt_free(ssa); // Clean up partial allocations
             return -1;
         }
 
+        // === Create MKL FFT Descriptors ===
+        // MKL uses "descriptors" that encode FFT configuration (size, placement, scaling)
+        // Creating descriptor is expensive, so we do it once and reuse
+
         MKL_LONG status;
+
+        // --- Forward R2C (single vector) ---
+        // Transforms real input to complex output
         status = DftiCreateDescriptor(&ssa->fft_r2c, DFTI_DOUBLE, DFTI_REAL, 1, fft_n);
         if (status != 0)
         {
             ssa_opt_free(ssa);
             return -1;
         }
+        // DFTI_NOT_INPLACE: input and output are separate buffers (safer, no aliasing issues)
         DftiSetValue(ssa->fft_r2c, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
+        // DFTI_COMPLEX_COMPLEX: store output as [re, im] pairs (not split re/im arrays)
         DftiSetValue(ssa->fft_r2c, DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
         if (DftiCommitDescriptor(ssa->fft_r2c) != 0)
         {
@@ -590,6 +762,8 @@ extern "C"
             return -1;
         }
 
+        // --- Inverse C2R (single vector) ---
+        // Transforms complex input back to real output
         status = DftiCreateDescriptor(&ssa->fft_c2r, DFTI_DOUBLE, DFTI_REAL, 1, fft_n);
         if (status != 0)
         {
@@ -598,6 +772,8 @@ extern "C"
         }
         DftiSetValue(ssa->fft_c2r, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
         DftiSetValue(ssa->fft_c2r, DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
+        // DFTI_BACKWARD_SCALE: MKL's FFT is unnormalized by default (IFFT(FFT(x)) = N*x)
+        // We apply 1/N scaling to inverse so IFFT(FFT(x)) = x
         DftiSetValue(ssa->fft_c2r, DFTI_BACKWARD_SCALE, 1.0 / fft_n);
         if (DftiCommitDescriptor(ssa->fft_c2r) != 0)
         {
@@ -605,6 +781,9 @@ extern "C"
             return -1;
         }
 
+        // --- Forward R2C Batched ---
+        // Same as fft_r2c but processes SSA_BATCH_SIZE vectors in one call
+        // Used by block power iteration and randomized SVD
         status = DftiCreateDescriptor(&ssa->fft_r2c_batch, DFTI_DOUBLE, DFTI_REAL, 1, fft_n);
         if (status != 0)
         {
@@ -613,8 +792,12 @@ extern "C"
         }
         DftiSetValue(ssa->fft_r2c_batch, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
         DftiSetValue(ssa->fft_r2c_batch, DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
+        // NUMBER_OF_TRANSFORMS: how many FFTs to compute in parallel
         DftiSetValue(ssa->fft_r2c_batch, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)SSA_BATCH_SIZE);
+        // INPUT_DISTANCE: stride between consecutive input vectors (each is fft_n doubles)
         DftiSetValue(ssa->fft_r2c_batch, DFTI_INPUT_DISTANCE, (MKL_LONG)fft_n);
+        // OUTPUT_DISTANCE: stride between consecutive output vectors (each is r2c_len complex = 2*r2c_len doubles)
+        // Note: MKL measures in complex units for complex data, so we use r2c_len not 2*r2c_len
         DftiSetValue(ssa->fft_r2c_batch, DFTI_OUTPUT_DISTANCE, (MKL_LONG)ssa->r2c_len);
         if (DftiCommitDescriptor(ssa->fft_r2c_batch) != 0)
         {
@@ -622,6 +805,7 @@ extern "C"
             return -1;
         }
 
+        // --- Inverse C2R Batched ---
         status = DftiCreateDescriptor(&ssa->fft_c2r_batch, DFTI_DOUBLE, DFTI_REAL, 1, fft_n);
         if (status != 0)
         {
@@ -632,6 +816,7 @@ extern "C"
         DftiSetValue(ssa->fft_c2r_batch, DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
         DftiSetValue(ssa->fft_c2r_batch, DFTI_BACKWARD_SCALE, 1.0 / fft_n);
         DftiSetValue(ssa->fft_c2r_batch, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)SSA_BATCH_SIZE);
+        // For inverse: input is complex (r2c_len), output is real (fft_n)
         DftiSetValue(ssa->fft_c2r_batch, DFTI_INPUT_DISTANCE, (MKL_LONG)ssa->r2c_len);
         DftiSetValue(ssa->fft_c2r_batch, DFTI_OUTPUT_DISTANCE, (MKL_LONG)fft_n);
         if (DftiCommitDescriptor(ssa->fft_c2r_batch) != 0)
@@ -640,16 +825,29 @@ extern "C"
             return -1;
         }
 
+        // === Initialize Random Number Generator ===
+        // Used by randomized SVD for generating Gaussian random matrices
+        // MT2203: Mersenne Twister variant optimized for parallel streams
+        // Seed 42: fixed seed for reproducibility (can be changed via API if needed)
         if (vslNewStream(&ssa->rng, VSL_BRNG_MT2203, 42) != VSL_STATUS_OK)
         {
             ssa_opt_free(ssa);
             return -1;
         }
 
-        ssa_opt_zero(ssa->ws_real, fft_n);
-        memcpy(ssa->ws_real, x, N * sizeof(double));
+        // === Pre-compute FFT of Signal ===
+        // This is computed once and reused in every Hankel matvec:
+        //   y = H·v = IFFT(FFT(x) ⊙ FFT(flip(v)))
+        // By storing FFT(x), we save one FFT per matvec
+        ssa_opt_zero(ssa->ws_real, fft_n);           // Zero-pad to FFT length
+        memcpy(ssa->ws_real, x, N * sizeof(double)); // Copy signal
         DftiComputeForward(ssa->fft_r2c, ssa->ws_real, ssa->fft_x);
 
+        // === Pre-compute Diagonal Averaging Weights ===
+        // Reconstruction uses diagonal averaging: each signal position t receives
+        // contributions from multiple (i,j) pairs where i+j = t
+        // The count of such pairs is: min(t+1, L, K, N-t)
+        // We store 1/count for fast division during reconstruction
         ssa->inv_diag_count = (double *)ssa_opt_alloc(N * sizeof(double));
         if (!ssa->inv_diag_count)
         {
@@ -658,9 +856,16 @@ extern "C"
         }
         for (int t = 0; t < N; t++)
         {
+            // Count of anti-diagonal elements contributing to position t:
+            // - Can't exceed t+1 (not enough earlier elements)
+            // - Can't exceed L (window length)
+            // - Can't exceed K (number of lagged copies)
+            // - Can't exceed N-t (not enough later elements)
             int count = ssa_opt_min(ssa_opt_min(t + 1, L), ssa_opt_min(ssa->K, N - t));
             ssa->inv_diag_count[t] = (count > 0) ? 1.0 / count : 0.0;
         }
+
+        // === Mark as Initialized ===
         ssa->initialized = true;
         return 0;
     }
