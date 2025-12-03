@@ -28,13 +28,17 @@ Unlike Fourier analysis, SSA is non-parametric and adapts to your data's structu
 
 *Ensemble SSA extracts smooth trend from volatile Bitcoin prices (r = 0.987).*
 
-### 2.3 Forecasting: Airline Passengers
+### 2.3.1 Forecasting: Airline Passengers
 
 <img width="2303" height="1077" alt="linkedin_forecast" src="https://github.com/user-attachments/assets/6a6400ae-c5f3-41b1-ba8f-ea8ce8193a49" />
 
 *2-year ahead forecast capturing trend and 12-month seasonality (RMSE: 47.5).*
 
-### 2.3 Signal Denoising with Cadzow. 
+### 2.3.2 Forecasting: Finance
+
+<img width="3473" height="1971" alt="forecast_finance" src="https://github.com/user-attachments/assets/1cad222a-95d5-4a86-bfa1-d2906330c17a" />
+
+### 2.4 Signal Denoising with Cadzow
 
 <img width="3472" height="1971" alt="cadzow_comparison" src="https://github.com/user-attachments/assets/5bf60b04-05c7-4f58-af48-b1b883df4468" />
 
