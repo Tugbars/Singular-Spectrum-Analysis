@@ -1357,7 +1357,7 @@ extern "C"
         double *work = ssa->decomp_work;
         int *iwork = ssa->decomp_iwork;
         int lwork = ssa->prepared_lwork;
-        
+
         // U, V, sigma, eigenvalues already allocated by prepare()
         // Just update count to reflect actual k being used
         ssa->n_components = k;
@@ -1782,6 +1782,118 @@ extern "C"
             return -1;
         }
 
+#ifdef _OPENMP
+        // =========================================================================
+        // PARALLEL PATH: Each thread gets its own workspace and FFT descriptor
+        // MKL FFT descriptors are not thread-safe for concurrent execution,
+        // so each thread needs its own descriptor instance.
+        // =========================================================================
+        int n_threads = omp_get_max_threads();
+
+        // Allocate per-thread workspaces for zero-padded input
+        double *ws_pool = (double *)ssa_opt_alloc(n_threads * fft_len * sizeof(double));
+        if (!ws_pool)
+        {
+            ssa_opt_free_cached_ffts(ssa);
+            return -1;
+        }
+
+        // Create per-thread FFT descriptors
+        DFTI_DESCRIPTOR_HANDLE *fft_handles = (DFTI_DESCRIPTOR_HANDLE *)malloc(n_threads * sizeof(DFTI_DESCRIPTOR_HANDLE));
+        if (!fft_handles)
+        {
+            ssa_opt_free_ptr(ws_pool);
+            ssa_opt_free_cached_ffts(ssa);
+            return -1;
+        }
+
+        int fft_init_ok = 1;
+        for (int t = 0; t < n_threads; t++)
+        {
+            MKL_LONG status = DftiCreateDescriptor(&fft_handles[t], DFTI_DOUBLE, DFTI_REAL, 1, fft_len);
+            if (status != 0)
+            {
+                fft_init_ok = 0;
+                break;
+            }
+            DftiSetValue(fft_handles[t], DFTI_PLACEMENT, DFTI_NOT_INPLACE);
+            DftiSetValue(fft_handles[t], DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
+            status = DftiCommitDescriptor(fft_handles[t]);
+            if (status != 0)
+            {
+                fft_init_ok = 0;
+                break;
+            }
+        }
+
+        if (!fft_init_ok)
+        {
+            for (int t = 0; t < n_threads; t++)
+                DftiFreeDescriptor(&fft_handles[t]);
+            free(fft_handles);
+            ssa_opt_free_ptr(ws_pool);
+            ssa_opt_free_cached_ffts(ssa);
+            return -1;
+        }
+
+// === Compute FFT of Each Scaled Left Singular Vector (PARALLEL) ===
+// U_fft[i] = FFT(σᵢ · uᵢ)
+// The σᵢ scaling is baked in so reconstruction just needs element-wise multiply
+ #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        double *ws_real = ws_pool + tid * fft_len;
+        DFTI_DESCRIPTOR_HANDLE my_fft = fft_handles[tid];
+        int i;  // Declare BEFORE pragma for MSVC OpenMP 2.0 compatibility
+
+        #pragma omp for schedule(static)
+        for (i = 0; i < k; i++)
+        {
+            double sigma = ssa->sigma[i];
+            const double *u_vec = &ssa->U[i * L];
+            double *dst = &ssa->U_fft[i * 2 * r2c_len];
+
+            memset(ws_real, 0, fft_len * sizeof(double));
+            for (int j = 0; j < L; j++)
+                ws_real[j] = sigma * u_vec[j];
+
+            DftiComputeForward(my_fft, ws_real, dst);
+        }
+    }
+
+// === Compute FFT of Each Right Singular Vector (PARALLEL) ===
+// V_fft[i] = FFT(vᵢ)
+ #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        double *ws_real = ws_pool + tid * fft_len;
+        DFTI_DESCRIPTOR_HANDLE my_fft = fft_handles[tid];
+        int i;  // Declare BEFORE pragma for MSVC OpenMP 2.0 compatibility
+
+        #pragma omp for schedule(static)
+        for (i = 0; i < k; i++)
+        {
+            const double *v_vec = &ssa->V[i * K];
+            double *dst = &ssa->V_fft[i * 2 * r2c_len];
+
+            memset(ws_real, 0, fft_len * sizeof(double));
+            for (int j = 0; j < K; j++)
+                ws_real[j] = v_vec[j];
+
+            DftiComputeForward(my_fft, ws_real, dst);
+        }
+    }
+        // Cleanup per-thread resources
+        for (int t = 0; t < n_threads; t++)
+            DftiFreeDescriptor(&fft_handles[t]);
+        free(fft_handles);
+        ssa_opt_free_ptr(ws_pool);
+
+#else
+        // =========================================================================
+        // SEQUENTIAL PATH: Original single-threaded implementation
+        // =========================================================================
+
         // === Compute FFT of Each Scaled Left Singular Vector ===
         // U_fft[i] = FFT(σᵢ · uᵢ)
         // The σᵢ scaling is baked in so reconstruction just needs element-wise multiply
@@ -1815,6 +1927,7 @@ extern "C"
             // Forward FFT directly into cache
             DftiComputeForward(ssa->fft_r2c, ssa->ws_real, dst);
         }
+#endif
 
         // === Allocate W-Correlation Workspace ===
         // W-correlation matrix W[i,j] = weighted correlation between components i and j
