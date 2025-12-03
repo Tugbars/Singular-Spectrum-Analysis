@@ -154,14 +154,18 @@ _lib.ssa_opt_forecast_full.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes
 _lib.ssa_opt_forecast_full.restype = ctypes.c_int
 
 # Vector forecast (V-forecast) - alternative to recurrent forecast
-_lib.ssa_opt_vforecast.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, ctypes.c_int, c_double_p]
-_lib.ssa_opt_vforecast.restype = ctypes.c_int
-
-_lib.ssa_opt_vforecast_full.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, ctypes.c_int, c_double_p]
-_lib.ssa_opt_vforecast_full.restype = ctypes.c_int
-
-_lib.ssa_opt_vforecast_fast.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, c_double_p, ctypes.c_int, ctypes.c_int, c_double_p]
-_lib.ssa_opt_vforecast_fast.restype = ctypes.c_int
+# These are optional - will fail gracefully if DLL not rebuilt
+_HAS_VFORECAST = False
+try:
+    _lib.ssa_opt_vforecast.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, ctypes.c_int, c_double_p]
+    _lib.ssa_opt_vforecast.restype = ctypes.c_int
+    _lib.ssa_opt_vforecast_full.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, ctypes.c_int, c_double_p]
+    _lib.ssa_opt_vforecast_full.restype = ctypes.c_int
+    _lib.ssa_opt_vforecast_fast.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, c_double_p, ctypes.c_int, ctypes.c_int, c_double_p]
+    _lib.ssa_opt_vforecast_fast.restype = ctypes.c_int
+    _HAS_VFORECAST = True
+except AttributeError:
+    pass  # DLL doesn't have vforecast yet
 
 _lib.ssa_opt_wcorr_matrix.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p]
 _lib.ssa_opt_wcorr_matrix.restype = ctypes.c_int
@@ -184,20 +188,47 @@ _lib.ssa_opt_get_noise.restype = ctypes.c_int
 _lib.ssa_opt_free.argtypes = [ctypes.POINTER(_SSA_Opt)]
 _lib.ssa_opt_free.restype = None
 
-# --- Cadzow iterations ---
-_lib.ssa_opt_cadzow.argtypes = [c_double_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, 
-                                ctypes.c_int, ctypes.c_double, c_double_p, 
-                                ctypes.POINTER(_SSA_CadzowResult)]
-_lib.ssa_opt_cadzow.restype = ctypes.c_int
+# --- Cadzow iterations (optional - requires rebuilt DLL) ---
+_HAS_CADZOW = False
+try:
+    _lib.ssa_opt_cadzow.argtypes = [c_double_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, 
+                                    ctypes.c_int, ctypes.c_double, c_double_p, 
+                                    ctypes.POINTER(_SSA_CadzowResult)]
+    _lib.ssa_opt_cadzow.restype = ctypes.c_int
+    
+    _lib.ssa_opt_cadzow_weighted.argtypes = [c_double_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                             ctypes.c_int, ctypes.c_double, ctypes.c_double, 
+                                             c_double_p, ctypes.POINTER(_SSA_CadzowResult)]
+    _lib.ssa_opt_cadzow_weighted.restype = ctypes.c_int
+    
+    _lib.ssa_opt_cadzow_inplace.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int, 
+                                            ctypes.c_double, ctypes.POINTER(_SSA_CadzowResult)]
+    _lib.ssa_opt_cadzow_inplace.restype = ctypes.c_int
+    _HAS_CADZOW = True
+except AttributeError:
+    pass  # DLL doesn't have cadzow yet
 
-_lib.ssa_opt_cadzow_weighted.argtypes = [c_double_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                         ctypes.c_int, ctypes.c_double, ctypes.c_double, 
-                                         c_double_p, ctypes.POINTER(_SSA_CadzowResult)]
-_lib.ssa_opt_cadzow_weighted.restype = ctypes.c_int
+# --- ESPRIT (parestimate) ---
+class _SSA_ParEstimate(ctypes.Structure):
+    _fields_ = [
+        ("periods", c_double_p),
+        ("frequencies", c_double_p),
+        ("moduli", c_double_p),
+        ("rates", c_double_p),
+        ("n_components", ctypes.c_int)
+    ]
 
-_lib.ssa_opt_cadzow_inplace.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int, 
-                                        ctypes.c_double, ctypes.POINTER(_SSA_CadzowResult)]
-_lib.ssa_opt_cadzow_inplace.restype = ctypes.c_int
+_HAS_ESPRIT = False
+try:
+    _lib.ssa_opt_parestimate.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, 
+                                          ctypes.POINTER(_SSA_ParEstimate)]
+    _lib.ssa_opt_parestimate.restype = ctypes.c_int
+    
+    _lib.ssa_opt_parestimate_free.argtypes = [ctypes.POINTER(_SSA_ParEstimate)]
+    _lib.ssa_opt_parestimate_free.restype = None
+    _HAS_ESPRIT = True
+except AttributeError:
+    pass  # DLL doesn't have ESPRIT yet
 
 # --- MSSA functions ---
 _lib.mssa_opt_init.argtypes = [ctypes.POINTER(_MSSA_Opt), c_double_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -253,6 +284,96 @@ class CadzowResult:
         return (f"CadzowResult(iterations={self.iterations}, "
                 f"final_diff={self.final_diff:.2e}, converged={self.converged})")
 
+
+class ParEstimate:
+    """
+    Result of ESPRIT frequency estimation.
+    
+    Attributes
+    ----------
+    periods : ndarray
+        Estimated periods in samples. Inf for DC/trend components.
+    frequencies : ndarray  
+        Frequencies in cycles per sample (0 to 0.5).
+    moduli : ndarray
+        Eigenvalue moduli (damping factor). 1.0 = pure undamped sinusoid.
+    rates : ndarray
+        Damping rates = log(modulus). 0 = undamped, negative = decaying.
+    n_components : int
+        Number of components analyzed.
+    """
+    def __init__(self, periods: np.ndarray, frequencies: np.ndarray, 
+                 moduli: np.ndarray, rates: np.ndarray):
+        self.periods = periods
+        self.frequencies = frequencies
+        self.moduli = moduli
+        self.rates = rates
+        self.n_components = len(periods)
+    
+    def __repr__(self):
+        return f"ParEstimate(n_components={self.n_components})"
+    
+    def summary(self) -> str:
+        """Return formatted summary of detected components."""
+        lines = ["ESPRIT Frequency Estimation Results", "=" * 50]
+        lines.append(f"{'Comp':<6} {'Period':<12} {'Frequency':<12} {'Modulus':<10} {'Rate':<10}")
+        lines.append("-" * 50)
+        
+        # Sort by period (descending, so trends first)
+        order = np.argsort(-self.periods)
+        
+        for i, idx in enumerate(order):
+            period = self.periods[idx]
+            freq = self.frequencies[idx]
+            mod = self.moduli[idx]
+            rate = self.rates[idx]
+            
+            if np.isinf(period):
+                period_str = "Inf (trend)"
+            else:
+                period_str = f"{period:.2f}"
+            
+            lines.append(f"{idx:<6} {period_str:<12} {freq:<12.6f} {mod:<10.4f} {rate:<10.4f}")
+        
+        return "\n".join(lines)
+    
+    def get_periodic_components(self, min_period: float = 2.0, max_period: float = None,
+                                 min_modulus: float = 0.9) -> List[int]:
+        """
+        Get indices of components that appear to be periodic (undamped sinusoids).
+        
+        Parameters
+        ----------
+        min_period : float
+            Minimum period to consider (default 2 = Nyquist limit)
+        max_period : float
+            Maximum period to consider (default None = no limit)
+        min_modulus : float
+            Minimum modulus to consider "undamped" (default 0.9)
+        
+        Returns
+        -------
+        indices : list of int
+            Component indices that appear periodic
+        """
+        indices = []
+        for i in range(self.n_components):
+            period = self.periods[i]
+            mod = self.moduli[i]
+            
+            if np.isinf(period):
+                continue  # Skip trend
+            if period < min_period:
+                continue  # Below Nyquist
+            if max_period is not None and period > max_period:
+                continue
+            if mod < min_modulus:
+                continue  # Too damped
+            
+            indices.append(i)
+        
+        return indices
+
 def cadzow(x: np.ndarray, L: int, rank: int, max_iter: int = 20, tol: float = 1e-9,
            alpha: float = 1.0) -> CadzowResult:
     """
@@ -296,6 +417,9 @@ def cadzow(x: np.ndarray, L: int, rank: int, max_iter: int = 20, tol: float = 1e
     >>> # Conservative denoising with blending
     >>> result = cadzow(x_noisy, L=100, rank=6, alpha=0.8)
     """
+    if not _HAS_CADZOW:
+        raise RuntimeError("Cadzow not available - rebuild DLL with updated ssa_opt.h")
+    
     x = np.ascontiguousarray(x, dtype=np.float64)
     N = len(x)
     output = np.zeros(N, dtype=np.float64)
@@ -590,6 +714,8 @@ class SSA:
         -------
         forecast : ndarray of shape (n_forecast,)
         """
+        if not _HAS_VFORECAST:
+            raise RuntimeError("vforecast not available - rebuild DLL with updated ssa_opt.h")
         if not self._decomposed:
             raise RuntimeError("Call decompose() first")
         
@@ -617,6 +743,8 @@ class SSA:
         -------
         full : ndarray of shape (N + n_forecast,)
         """
+        if not _HAS_VFORECAST:
+            raise RuntimeError("vforecast not available - rebuild DLL with updated ssa_opt.h")
         if not self._decomposed:
             raise RuntimeError("Call decompose() first")
         
@@ -656,6 +784,8 @@ class SSA:
         -------
         forecast : ndarray of shape (n_forecast,)
         """
+        if not _HAS_VFORECAST:
+            raise RuntimeError("vforecast not available - rebuild DLL with updated ssa_opt.h")
         if not self._decomposed:
             raise RuntimeError("Call decompose() first")
         
@@ -745,6 +875,75 @@ class SSA:
         >>> clean_signal = result.signal
         """
         return cadzow(self._x, self.L, rank, max_iter, tol, alpha)
+    
+    def parestimate(self, group: List[int] = None) -> 'ParEstimate':
+        """
+        Estimate periods/frequencies using ESPRIT method.
+        
+        Extracts dominant periods from the eigenvectors of the selected
+        components. Useful for detecting market cycles and optimal L selection.
+        
+        Parameters
+        ----------
+        group : list of int, optional
+            Component indices to analyze. If None, uses all decomposed components.
+        
+        Returns
+        -------
+        result : ParEstimate
+            - periods: Estimated periods in samples
+            - frequencies: Frequencies in cycles per sample
+            - moduli: Eigenvalue moduli (1.0 = undamped sinusoid)
+            - rates: Damping rates (0 = undamped)
+        
+        Examples
+        --------
+        >>> ssa = SSA(prices, L=120)
+        >>> ssa.decompose(k=10)
+        >>> par = ssa.parestimate()
+        >>> print(par.summary())
+        >>> 
+        >>> # Find dominant cycles
+        >>> periodic = par.get_periodic_components(min_period=5, min_modulus=0.95)
+        >>> print(f"Dominant periods: {par.periods[periodic]}")
+        """
+        if not _HAS_ESPRIT:
+            raise RuntimeError("ESPRIT not available - rebuild DLL with updated ssa_opt.h")
+        if not self._decomposed:
+            raise RuntimeError("Call decompose() first")
+        
+        c_result = _SSA_ParEstimate()
+        
+        if group is not None and len(group) > 0:
+            group_arr = np.ascontiguousarray(group, dtype=np.int32)
+            ret = _lib.ssa_opt_parestimate(
+                ctypes.byref(self._ctx),
+                group_arr.ctypes.data_as(c_int_p),
+                len(group),
+                ctypes.byref(c_result)
+            )
+        else:
+            ret = _lib.ssa_opt_parestimate(
+                ctypes.byref(self._ctx),
+                None,
+                0,
+                ctypes.byref(c_result)
+            )
+        
+        if ret != 0:
+            raise RuntimeError("parestimate failed")
+        
+        # Copy data to numpy arrays before freeing
+        n = c_result.n_components
+        periods = np.ctypeslib.as_array(c_result.periods, shape=(n,)).copy()
+        frequencies = np.ctypeslib.as_array(c_result.frequencies, shape=(n,)).copy()
+        moduli = np.ctypeslib.as_array(c_result.moduli, shape=(n,)).copy()
+        rates = np.ctypeslib.as_array(c_result.rates, shape=(n,)).copy()
+        
+        # Free C memory
+        _lib.ssa_opt_parestimate_free(ctypes.byref(c_result))
+        
+        return ParEstimate(periods, frequencies, moduli, rates)
     
     def wcorr_matrix(self) -> np.ndarray:
         """

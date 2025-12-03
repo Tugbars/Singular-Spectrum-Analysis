@@ -49,6 +49,10 @@ EXPORTS
     ssa_opt_cadzow_weighted
     ssa_opt_cadzow_inplace
     
+    ; === NEW: ESPRIT Frequency Estimation ===
+    ssa_opt_parestimate
+    ssa_opt_parestimate_free
+    
     ; === NEW: MKL Configuration Functions ===
     ssa_mkl_init
     ssa_mkl_init_14900kf

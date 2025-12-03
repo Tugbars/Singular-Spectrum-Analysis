@@ -162,6 +162,24 @@ extern "C"
                                 double tol, double alpha, double *output, SSA_CadzowResult *result);
     int ssa_opt_cadzow_inplace(SSA_Opt *ssa, int rank, int max_iter, double tol, SSA_CadzowResult *result);
 
+    // ESPRIT - Estimation of Signal Parameters via Rotational Invariance
+    // Extracts frequencies/periods from eigenvectors
+    typedef struct
+    {
+        double *periods;     // Estimated periods (in samples), length = n_components
+        double *frequencies; // Frequencies (cycles per sample), length = n_components
+        double *moduli;      // |eigenvalue| - damping factor (1.0 = undamped sinusoid)
+        double *rates;       // log(|eigenvalue|) - damping rate (0 = undamped)
+        int n_components;    // Number of components analyzed
+    } SSA_ParEstimate;
+
+    // Estimate periods/frequencies from SSA eigenvectors using ESPRIT
+    // group: component indices to analyze (NULL = use all decomposed components)
+    // n_group: number of components in group (0 = use all)
+    // Returns 0 on success, allocates result arrays (caller must free with ssa_opt_parestimate_free)
+    int ssa_opt_parestimate(const SSA_Opt *ssa, const int *group, int n_group, SSA_ParEstimate *result);
+    void ssa_opt_parestimate_free(SSA_ParEstimate *result);
+
 #ifdef SSA_OPT_IMPLEMENTATION
 
     static inline int ssa_opt_next_pow2(int n)
@@ -2517,6 +2535,281 @@ extern "C"
         for (int i = start; i <= end; i++)
             sum += mssa->eigenvalues[i];
         return sum / mssa->total_variance;
+    }
+
+    // ========================================================================
+    // ESPRIT - Estimation of Signal Parameters via Rotational Invariance
+    // ========================================================================
+
+    void ssa_opt_parestimate_free(SSA_ParEstimate *result)
+    {
+        if (!result)
+            return;
+        if (result->periods)
+            ssa_opt_free_ptr(result->periods);
+        if (result->frequencies)
+            ssa_opt_free_ptr(result->frequencies);
+        if (result->moduli)
+            ssa_opt_free_ptr(result->moduli);
+        if (result->rates)
+            ssa_opt_free_ptr(result->rates);
+        memset(result, 0, sizeof(*result));
+    }
+
+    int ssa_opt_parestimate(const SSA_Opt *ssa, const int *group, int n_group, SSA_ParEstimate *result)
+    {
+        if (!ssa || !ssa->decomposed || !result)
+            return -1;
+
+        // Default: use all components
+        int k = (n_group > 0 && group) ? n_group : ssa->n_components;
+        if (k < 1 || k > ssa->n_components)
+            return -1;
+
+        int L = ssa->L;
+        if (L < 3)
+            return -1; // Need at least 3 rows for ESPRIT
+
+        // Build index array if not provided
+        int *idx = NULL;
+        int idx_allocated = 0;
+        if (group && n_group > 0)
+        {
+            idx = (int *)group;
+        }
+        else
+        {
+            idx = (int *)ssa_opt_alloc(k * sizeof(int));
+            if (!idx)
+                return -1;
+            for (int i = 0; i < k; i++)
+                idx[i] = i;
+            idx_allocated = 1;
+        }
+
+        // Extract selected eigenvectors: U_sel is (L x k)
+        double *U_sel = (double *)ssa_opt_alloc(L * k * sizeof(double));
+        if (!U_sel)
+        {
+            if (idx_allocated)
+                ssa_opt_free_ptr(idx);
+            return -1;
+        }
+
+        // Copy selected eigenvectors (column-major)
+        for (int j = 0; j < k; j++)
+        {
+            int comp_idx = idx[j];
+            if (comp_idx < 0 || comp_idx >= ssa->n_components)
+            {
+                ssa_opt_free_ptr(U_sel);
+                if (idx_allocated)
+                    ssa_opt_free_ptr(idx);
+                return -1;
+            }
+            cblas_dcopy(L, &ssa->U[comp_idx * L], 1, &U_sel[j * L], 1);
+        }
+
+        if (idx_allocated)
+            ssa_opt_free_ptr(idx);
+
+        // ESPRIT: Use shift-invariance property
+        // U_up = U[0:L-1, :], U_down = U[1:L, :]
+        // Shift matrix Z = pinv(U_up) @ U_down
+        // Eigenvalues of Z give signal poles
+
+        int Lm1 = L - 1;
+
+        // U_up: rows 0 to L-2 (Lm1 x k)
+        double *U_up = (double *)ssa_opt_alloc(Lm1 * k * sizeof(double));
+        // U_down: rows 1 to L-1 (Lm1 x k)
+        double *U_down = (double *)ssa_opt_alloc(Lm1 * k * sizeof(double));
+
+        if (!U_up || !U_down)
+        {
+            if (U_up)
+                ssa_opt_free_ptr(U_up);
+            if (U_down)
+                ssa_opt_free_ptr(U_down);
+            ssa_opt_free_ptr(U_sel);
+            return -1;
+        }
+
+        // Copy with shift (column-major storage)
+        for (int j = 0; j < k; j++)
+        {
+            cblas_dcopy(Lm1, &U_sel[j * L], 1, &U_up[j * Lm1], 1);       // rows 0:L-2
+            cblas_dcopy(Lm1, &U_sel[j * L + 1], 1, &U_down[j * Lm1], 1); // rows 1:L-1
+        }
+
+        ssa_opt_free_ptr(U_sel);
+
+        // Compute Z = pinv(U_up) @ U_down using least squares
+        // Z is k x k, we solve: U_up @ Z = U_down in least squares sense
+        // This is: min ||U_up @ Z - U_down||_F
+        // For each column z_j of Z: solve U_up @ z_j = u_down_j
+
+        // Use LAPACK DGELS: solves min ||A*X - B||
+        // A = U_up (Lm1 x k), B = U_down (Lm1 x k), X = Z (k x k)
+
+        double *Z = (double *)ssa_opt_alloc(k * k * sizeof(double));
+        double *work_dgels = (double *)ssa_opt_alloc(Lm1 * k * sizeof(double));
+
+        if (!Z || !work_dgels)
+        {
+            if (Z)
+                ssa_opt_free_ptr(Z);
+            if (work_dgels)
+                ssa_opt_free_ptr(work_dgels);
+            ssa_opt_free_ptr(U_up);
+            ssa_opt_free_ptr(U_down);
+            return -1;
+        }
+
+        // Copy U_up for DGELS (it gets overwritten)
+        double *U_up_copy = (double *)ssa_opt_alloc(Lm1 * k * sizeof(double));
+        if (!U_up_copy)
+        {
+            ssa_opt_free_ptr(Z);
+            ssa_opt_free_ptr(work_dgels);
+            ssa_opt_free_ptr(U_up);
+            ssa_opt_free_ptr(U_down);
+            return -1;
+        }
+        cblas_dcopy(Lm1 * k, U_up, 1, U_up_copy, 1);
+
+        // Solve least squares: U_up @ Z = U_down
+        // DGELS expects column-major, solves A*X=B
+        // A is Lm1 x k, B is Lm1 x k, solution X is k x k (stored in first k rows of B)
+        lapack_int info;
+        lapack_int lwork = -1;
+        double work_query;
+
+        // Query workspace size
+        info = LAPACKE_dgels_work(LAPACK_COL_MAJOR, 'N', Lm1, k, k,
+                                  U_up_copy, Lm1, U_down, Lm1, &work_query, lwork);
+
+        lwork = (lapack_int)work_query + 1;
+        double *work = (double *)ssa_opt_alloc(lwork * sizeof(double));
+        if (!work)
+        {
+            ssa_opt_free_ptr(U_up_copy);
+            ssa_opt_free_ptr(Z);
+            ssa_opt_free_ptr(work_dgels);
+            ssa_opt_free_ptr(U_up);
+            ssa_opt_free_ptr(U_down);
+            return -1;
+        }
+
+        // Solve
+        info = LAPACKE_dgels_work(LAPACK_COL_MAJOR, 'N', Lm1, k, k,
+                                  U_up_copy, Lm1, U_down, Lm1, work, lwork);
+
+        ssa_opt_free_ptr(work);
+        ssa_opt_free_ptr(U_up_copy);
+        ssa_opt_free_ptr(U_up);
+
+        if (info != 0)
+        {
+            ssa_opt_free_ptr(Z);
+            ssa_opt_free_ptr(work_dgels);
+            ssa_opt_free_ptr(U_down);
+            return -1;
+        }
+
+        // Z is now in first k rows of U_down (k x k, column-major)
+        for (int j = 0; j < k; j++)
+        {
+            cblas_dcopy(k, &U_down[j * Lm1], 1, &Z[j * k], 1);
+        }
+
+        ssa_opt_free_ptr(U_down);
+        ssa_opt_free_ptr(work_dgels);
+
+        // Compute eigenvalues of Z (k x k)
+        // Use DGEEV for general eigenvalue problem (Z may not be symmetric)
+        double *wr = (double *)ssa_opt_alloc(k * sizeof(double)); // Real parts
+        double *wi = (double *)ssa_opt_alloc(k * sizeof(double)); // Imaginary parts
+
+        if (!wr || !wi)
+        {
+            if (wr)
+                ssa_opt_free_ptr(wr);
+            if (wi)
+                ssa_opt_free_ptr(wi);
+            ssa_opt_free_ptr(Z);
+            return -1;
+        }
+
+        // DGEEV: compute eigenvalues only (no eigenvectors needed)
+        info = LAPACKE_dgeev(LAPACK_COL_MAJOR, 'N', 'N', k, Z, k, wr, wi, NULL, 1, NULL, 1);
+
+        ssa_opt_free_ptr(Z);
+
+        if (info != 0)
+        {
+            ssa_opt_free_ptr(wr);
+            ssa_opt_free_ptr(wi);
+            return -1;
+        }
+
+        // Allocate result arrays
+        result->periods = (double *)ssa_opt_alloc(k * sizeof(double));
+        result->frequencies = (double *)ssa_opt_alloc(k * sizeof(double));
+        result->moduli = (double *)ssa_opt_alloc(k * sizeof(double));
+        result->rates = (double *)ssa_opt_alloc(k * sizeof(double));
+        result->n_components = k;
+
+        if (!result->periods || !result->frequencies || !result->moduli || !result->rates)
+        {
+            ssa_opt_parestimate_free(result);
+            ssa_opt_free_ptr(wr);
+            ssa_opt_free_ptr(wi);
+            return -1;
+        }
+
+        // Convert eigenvalues to periods/frequencies
+        // eigenvalue = modulus * exp(i * argument)
+        // frequency = argument / (2 * pi)
+        // period = 1 / |frequency| (in samples)
+        // rate = log(modulus)
+
+        const double TWO_PI = 2.0 * M_PI;
+
+        for (int i = 0; i < k; i++)
+        {
+            double re = wr[i];
+            double im = wi[i];
+
+            // Modulus (damping factor)
+            double mod = sqrt(re * re + im * im);
+            result->moduli[i] = mod;
+
+            // Damping rate
+            result->rates[i] = (mod > 1e-12) ? log(mod) : -30.0; // -30 ~ effectively zero
+
+            // Argument (phase angle)
+            double arg = atan2(im, re);
+
+            // Frequency (cycles per sample)
+            double freq = arg / TWO_PI;
+            result->frequencies[i] = freq;
+
+            // Period (samples per cycle)
+            if (fabs(freq) > 1e-12)
+            {
+                result->periods[i] = 1.0 / fabs(freq);
+            }
+            else
+            {
+                result->periods[i] = INFINITY; // DC component (trend)
+            }
+        }
+
+        ssa_opt_free_ptr(wr);
+        ssa_opt_free_ptr(wi);
+
+        return 0;
     }
 
 #endif // SSA_OPT_IMPLEMENTATION
