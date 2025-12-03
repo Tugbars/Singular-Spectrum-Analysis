@@ -16,9 +16,13 @@ Unlike Fourier analysis, SSA is non-parametric and adapts to your data's structu
 
 ## 2. Results
 
-### 2.1 Signal Denoising: 159× Noise Reduction
+### 2.1.1 Signal Denoising: 159× Noise Reduction
 
 <img width="2779" height="1576" alt="ssa_denoising_best" src="https://github.com/user-attachments/assets/980caf63-7c12-4a8c-86ed-35a6e237bbc2" />
+
+### 2.1.2 Signal Denoising with Cadzow
+
+<img width="3472" height="1971" alt="cadzow_comparison" src="https://github.com/user-attachments/assets/5bf60b04-05c7-4f58-af48-b1b883df4468" />
 
 *SSA recovers clean signal from heavy noise (SNR: 4.1 → 26.1 dB).*
 
@@ -37,10 +41,6 @@ Unlike Fourier analysis, SSA is non-parametric and adapts to your data's structu
 ### 2.3.2 Forecasting: Finance
 
 <img width="3473" height="1971" alt="forecast_finance" src="https://github.com/user-attachments/assets/1cad222a-95d5-4a86-bfa1-d2906330c17a" />
-
-### 2.4 Signal Denoising with Cadzow
-
-<img width="3472" height="1971" alt="cadzow_comparison" src="https://github.com/user-attachments/assets/5bf60b04-05c7-4f58-af48-b1b883df4468" />
 
 ## 3. Benchmarks
 
