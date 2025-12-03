@@ -48,10 +48,11 @@ Unlike Fourier analysis, SSA is non-parametric and adapts to your data's structu
 
 Benchmarked with `benchmark_vs_rssa.py` on Intel Core i9-14900KF, MKL 2025.0.3:
 
-<img width="2081" height="730" alt="benchmark_chart" src="https://github.com/user-attachments/assets/788a399f-ae8c-4e64-9b83-a9ee0d0da8ad" />
+<img width="2374" height="1029" alt="benchmark_final" src="https://github.com/user-attachments/assets/6ea3d779-c915-46b5-8dc5-46c7b62ae24a" />
+<img width="1484" height="882" alt="chart2_speedup" src="https://github.com/user-attachments/assets/6cebc565-7fe7-4c2f-8feb-8875e6dfa462" />
 
 | N | L | k | SSA-Opt (ms) | Rssa (ms) | Speedup | Correlation |
-|---|---|---|--------------|-----------|---------|-------------|
+|------:|-----:|---:|-------------:|----------:|--------:|------------:|
 | 500 | 125 | 30 | 1.2 | 23.8 | **20.3×** | 0.9895 |
 | 1000 | 250 | 30 | 2.1 | 36.9 | **17.2×** | 0.9973 |
 | 5000 | 1250 | 30 | 8.9 | 118.1 | **13.3×** | 0.9996 |
@@ -84,13 +85,40 @@ The `mkl_config.h` header auto-detects hybrid CPUs (Intel 12th-14th gen) and pin
 
 ## 4. Features
 
-- **Python bindings** - Full ctypes wrapper with NumPy integration
-- **3 decomposition methods** - Sequential, block, and randomized SVD
-- **FFT-accelerated** - O(N log N) Hankel matrix operations
-- **Forecasting (LRF)** - Linear Recurrent Formula prediction
-- **MSSA** - Multivariate SSA for correlated series
-- **MKL-optimized** - Hybrid CPU auto-configuration
-- **Header-only** - Just `#include "ssa_opt_r2c.h"`
+### Core SSA
+* **3 Decomposition Methods** - Sequential power iteration, block power iteration, and randomized SVD
+* **FFT-Accelerated** - O(N log N) Hankel matrix-vector products via convolution theorem
+* **R2C Optimization** - Real-to-complex FFT exploits Hermitian symmetry (50% memory savings)
+* **Malloc-Free Hot Path** - `prepare()` + `decompose_randomized()` for zero-allocation streaming
+
+### Analysis & Reconstruction
+* **Grouped Reconstruction** - Combine arbitrary component subsets
+* **W-Correlation Matrix** - Fast DSYRK-based weighted correlation for component grouping
+* **Automatic Pair Detection** - Find sine/cosine pairs via singular value + W-correlation matching
+* **Variance Explained** - Per-component and cumulative variance statistics
+* **Component Statistics** - Scree plot data, gap detection, automatic rank selection
+
+### Forecasting & Prediction
+* **R-Forecast (LRF)** - Linear Recurrent Formula for extrapolation
+* **V-Forecast** - Alternative vector forecast method
+* **Verticality Check** - Stability indicator for forecast reliability
+
+### Advanced Features
+* **ESPRIT** - Frequency/period estimation from eigenvectors
+* **Cadzow Iterations** - Iterative rank reduction for enhanced denoising
+* **Gap Filling** - Missing value imputation (iterative + simple methods)
+* **MSSA** - Multivariate SSA for multi-channel/correlated series
+
+### Performance
+* **MKL-Optimized** - Intel MKL for FFT, BLAS, LAPACK, and RNG
+* **Batched FFT** - Process multiple vectors in single MKL call
+* **Cached FFTs** - Pre-computed eigenvector FFTs for fast reconstruction
+* **OpenMP Ready** - Parallel-friendly design
+
+### Integration
+* **Header-Only** - Single `#include "ssa_opt.h"`
+* **Python Bindings** - Full ctypes wrapper with NumPy integration
+* **Minimal Dependencies** - Just Intel MKL (or compatible BLAS/LAPACK)
 
 ## 5. Quick Start
 
