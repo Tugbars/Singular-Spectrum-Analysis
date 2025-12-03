@@ -63,10 +63,9 @@ endif()
 
 if(MSVC)
     foreach(target ${TEST_TARGETS})
-        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2 /fp:fast> /W3)
+        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2 /fp:fast /arch:AVX2> /W3)
     endforeach()
 endif()
-
 # ============================================================================
 # Python shared library
 # ============================================================================
@@ -89,5 +88,5 @@ else()
 endif()
 
 if(MSVC)
-    target_compile_options(ssa PRIVATE $<$<CONFIG:Release>:/O2 /fp:fast> /W3)
+    target_compile_options(ssa PRIVATE $<$<CONFIG:Release>:/O2 /fp:fast /arch:AVX2> /W3)
 endif()

@@ -19,6 +19,13 @@
 #include <mkl_vsl.h>
 #include <mkl_lapacke.h>
 
+// SIMD intrinsics for AVX2/AVX-512 optimizations
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <immintrin.h>
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -207,11 +214,207 @@ extern "C"
     }
     static inline void ssa_opt_zero(double *v, int n) { memset(v, 0, n * sizeof(double)); }
     static inline void ssa_opt_complex_mul_r2c(const double *a, const double *b, double *c, int r2c_len) { vzMul(r2c_len, (const MKL_Complex16 *)a, (const MKL_Complex16 *)b, (MKL_Complex16 *)c); }
+
+    // ========================================================================
+    // SIMD-optimized helper functions (AVX2)
+    // ========================================================================
+
+    // AVX2 reverse copy: dst[i] = src[n-1-i]
     static inline void ssa_opt_reverse_copy(const double *src, double *dst, int n)
     {
-        for (int i = 0; i < n; i++)
+        int i = 0;
+#if defined(__AVX2__) || defined(__AVX__)
+        // Process 4 doubles at a time with AVX
+        const int simd_width = 4;
+        const int n_simd = (n / simd_width) * simd_width;
+
+        // AVX doesn't have a native reverse, so we load from end and shuffle
+        for (; i + simd_width <= n; i += simd_width)
+        {
+            // Load 4 doubles from end of src (reversed position)
+            __m256d v = _mm256_loadu_pd(&src[n - 1 - i - 3]);
+            // Reverse the 4 elements within the vector
+            v = _mm256_permute4x64_pd(v, 0x1B); // 0x1B = 0,1,2,3 -> 3,2,1,0
+            _mm256_storeu_pd(&dst[i], v);
+        }
+#endif
+        // Scalar cleanup
+        for (; i < n; i++)
+        {
             dst[i] = src[n - 1 - i];
+        }
     }
+
+    // AVX2 weighted squared norm: sum(h[t]^2 * w[t])
+    static inline double ssa_opt_weighted_norm_sq(const double *h, const double *w, int n)
+    {
+        double result = 0.0;
+        int i = 0;
+
+#if defined(__AVX2__) || defined(__AVX__)
+        __m256d sum_vec = _mm256_setzero_pd();
+
+        // Process 4 doubles at a time
+        for (; i + 4 <= n; i += 4)
+        {
+            __m256d h_vec = _mm256_loadu_pd(&h[i]);
+            __m256d w_vec = _mm256_loadu_pd(&w[i]);
+            __m256d h_sq = _mm256_mul_pd(h_vec, h_vec);
+            __m256d prod = _mm256_mul_pd(h_sq, w_vec);
+            sum_vec = _mm256_add_pd(sum_vec, prod);
+        }
+
+        // Horizontal sum
+        __m128d low = _mm256_castpd256_pd128(sum_vec);
+        __m128d high = _mm256_extractf128_pd(sum_vec, 1);
+        __m128d sum128 = _mm_add_pd(low, high);
+        sum128 = _mm_hadd_pd(sum128, sum128);
+        result = _mm_cvtsd_f64(sum128);
+#endif
+
+        // Scalar cleanup
+        for (; i < n; i++)
+        {
+            result += h[i] * h[i] * w[i];
+        }
+
+        return result;
+    }
+
+    // AVX2 weighted inner product: sum(a[t] * b[t] * w[t])
+    static inline double ssa_opt_weighted_inner(const double *a, const double *b, const double *w, int n)
+    {
+        double result = 0.0;
+        int i = 0;
+
+#if defined(__AVX2__) || defined(__AVX__)
+        __m256d sum_vec = _mm256_setzero_pd();
+
+        for (; i + 4 <= n; i += 4)
+        {
+            __m256d a_vec = _mm256_loadu_pd(&a[i]);
+            __m256d b_vec = _mm256_loadu_pd(&b[i]);
+            __m256d w_vec = _mm256_loadu_pd(&w[i]);
+            __m256d ab = _mm256_mul_pd(a_vec, b_vec);
+            __m256d prod = _mm256_mul_pd(ab, w_vec);
+            sum_vec = _mm256_add_pd(sum_vec, prod);
+        }
+
+        // Horizontal sum
+        __m128d low = _mm256_castpd256_pd128(sum_vec);
+        __m128d high = _mm256_extractf128_pd(sum_vec, 1);
+        __m128d sum128 = _mm_add_pd(low, high);
+        sum128 = _mm_hadd_pd(sum128, sum128);
+        result = _mm_cvtsd_f64(sum128);
+#endif
+
+        // Scalar cleanup
+        for (; i < n; i++)
+        {
+            result += a[i] * b[i] * w[i];
+        }
+
+        return result;
+    }
+
+    // AVX2 triple weighted computation: computes inner, norm_a_sq, norm_b_sq in one pass
+    // Returns: inner = sum(a*b*w), norm_a_sq = sum(a*a*w), norm_b_sq = sum(b*b*w)
+    static inline void ssa_opt_weighted_inner3(const double *a, const double *b, const double *w, int n,
+                                               double *inner, double *norm_a_sq, double *norm_b_sq)
+    {
+        double r_inner = 0.0, r_norm_a = 0.0, r_norm_b = 0.0;
+        int i = 0;
+
+#if defined(__AVX2__) || defined(__AVX__)
+        __m256d sum_inner = _mm256_setzero_pd();
+        __m256d sum_norm_a = _mm256_setzero_pd();
+        __m256d sum_norm_b = _mm256_setzero_pd();
+
+        for (; i + 4 <= n; i += 4)
+        {
+            __m256d a_vec = _mm256_loadu_pd(&a[i]);
+            __m256d b_vec = _mm256_loadu_pd(&b[i]);
+            __m256d w_vec = _mm256_loadu_pd(&w[i]);
+
+            // a*b*w
+            __m256d ab = _mm256_mul_pd(a_vec, b_vec);
+            sum_inner = _mm256_add_pd(sum_inner, _mm256_mul_pd(ab, w_vec));
+
+            // a*a*w
+            __m256d aa = _mm256_mul_pd(a_vec, a_vec);
+            sum_norm_a = _mm256_add_pd(sum_norm_a, _mm256_mul_pd(aa, w_vec));
+
+            // b*b*w
+            __m256d bb = _mm256_mul_pd(b_vec, b_vec);
+            sum_norm_b = _mm256_add_pd(sum_norm_b, _mm256_mul_pd(bb, w_vec));
+        }
+
+        // Horizontal sums
+        {
+            __m128d low = _mm256_castpd256_pd128(sum_inner);
+            __m128d high = _mm256_extractf128_pd(sum_inner, 1);
+            __m128d sum128 = _mm_add_pd(low, high);
+            sum128 = _mm_hadd_pd(sum128, sum128);
+            r_inner = _mm_cvtsd_f64(sum128);
+        }
+        {
+            __m128d low = _mm256_castpd256_pd128(sum_norm_a);
+            __m128d high = _mm256_extractf128_pd(sum_norm_a, 1);
+            __m128d sum128 = _mm_add_pd(low, high);
+            sum128 = _mm_hadd_pd(sum128, sum128);
+            r_norm_a = _mm_cvtsd_f64(sum128);
+        }
+        {
+            __m128d low = _mm256_castpd256_pd128(sum_norm_b);
+            __m128d high = _mm256_extractf128_pd(sum_norm_b, 1);
+            __m128d sum128 = _mm_add_pd(low, high);
+            sum128 = _mm_hadd_pd(sum128, sum128);
+            r_norm_b = _mm_cvtsd_f64(sum128);
+        }
+#endif
+
+        // Scalar cleanup
+        for (; i < n; i++)
+        {
+            double wi = w[i];
+            r_inner += a[i] * b[i] * wi;
+            r_norm_a += a[i] * a[i] * wi;
+            r_norm_b += b[i] * b[i] * wi;
+        }
+
+        *inner = r_inner;
+        *norm_a_sq = r_norm_a;
+        *norm_b_sq = r_norm_b;
+    }
+
+    // AVX2 scale and weight: dst[t] = scale * src[t] * w[t]
+    static inline void ssa_opt_scale_weighted(const double *src, const double *w, double scale, double *dst, int n)
+    {
+        int i = 0;
+
+#if defined(__AVX2__) || defined(__AVX__)
+        __m256d scale_vec = _mm256_set1_pd(scale);
+
+        for (; i + 4 <= n; i += 4)
+        {
+            __m256d s_vec = _mm256_loadu_pd(&src[i]);
+            __m256d w_vec = _mm256_loadu_pd(&w[i]);
+            __m256d prod = _mm256_mul_pd(_mm256_mul_pd(s_vec, w_vec), scale_vec);
+            _mm256_storeu_pd(&dst[i], prod);
+        }
+#endif
+
+        // Scalar cleanup
+        for (; i < n; i++)
+        {
+            dst[i] = scale * src[i] * w[i];
+        }
+    }
+
+    // ========================================================================
+    // End SIMD helpers
+    // ========================================================================
+
     // Hankel matvec via R2C FFT
     static void ssa_opt_hankel_matvec(SSA_Opt *ssa, const double *v, double *y)
     {
@@ -1261,15 +1464,12 @@ extern "C"
             }
             ssa_opt_complex_mul_r2c(u_fft_ptr, v_fft_ptr, ssa_mut->ws_complex, r2c_len);
             DftiComputeBackward(ssa_mut->fft_c2r, ssa_mut->ws_complex, h_temp);
-            double norm_sq = 0.0;
-            for (int t = 0; t < N; t++)
-                norm_sq += h_temp[t] * h_temp[t] * ssa->inv_diag_count[t];
+            double norm_sq = ssa_opt_weighted_norm_sq(h_temp, ssa->inv_diag_count, N);
             norm_sq *= sigma * sigma;
             norms[i] = sqrt(norm_sq);
             double scale = (norms[i] > 1e-12) ? sigma / norms[i] : 0.0;
             double *g_row = &G[i * N];
-            for (int t = 0; t < N; t++)
-                g_row[t] = scale * h_temp[t] * sqrt_inv_c[t];
+            ssa_opt_scale_weighted(h_temp, sqrt_inv_c, scale, g_row, N);
         }
         cblas_dsyrk(CblasRowMajor, CblasUpper, CblasNoTrans, n, N, 1.0, G, N, 0.0, W, n);
         for (int i = 0; i < n; i++)
@@ -1316,15 +1516,13 @@ extern "C"
 #pragma omp parallel for private(t)
         for (i = 0; i < n; i++)
         {
-            double *h = &all_h[i * fft_len], sigma = ssa->sigma[i], norm_sq = 0.0, norm, scale, *g_row;
-            for (t = 0; t < N; t++)
-                norm_sq += h[t] * h[t] * ssa->inv_diag_count[t];
+            double *h = &all_h[i * fft_len], sigma = ssa->sigma[i], norm_sq, norm, scale, *g_row;
+            norm_sq = ssa_opt_weighted_norm_sq(h, ssa->inv_diag_count, N);
             norm_sq *= sigma * sigma;
             norm = sqrt(norm_sq);
             scale = (norm > 1e-12) ? sigma / norm : 0.0;
             g_row = &G[i * N];
-            for (t = 0; t < N; t++)
-                g_row[t] = scale * h[t] * sqrt_inv_c[t];
+            ssa_opt_scale_weighted(h, sqrt_inv_c, scale, g_row, N);
         }
         cblas_dsyrk(CblasRowMajor, CblasUpper, CblasNoTrans, n, N, 1.0, G, N, 0.0, W, n);
         for (ii = 0; ii < n; ii++)
@@ -1403,14 +1601,8 @@ extern "C"
             DftiComputeBackward(ssa_mut->fft_c2r, ssa_mut->ws_complex, ssa_mut->ws_real);
             memcpy(h_j, ssa_mut->ws_real, N * sizeof(double));
         }
-        double sigma_i = ssa->sigma[i], sigma_j = ssa->sigma[j], inner = 0.0, norm_i_sq = 0.0, norm_j_sq = 0.0;
-        for (int t = 0; t < N; t++)
-        {
-            double inv_c = ssa->inv_diag_count[t];
-            inner += h_i[t] * h_j[t] * inv_c;
-            norm_i_sq += h_i[t] * h_i[t] * inv_c;
-            norm_j_sq += h_j[t] * h_j[t] * inv_c;
-        }
+        double sigma_i = ssa->sigma[i], sigma_j = ssa->sigma[j], inner, norm_i_sq, norm_j_sq;
+        ssa_opt_weighted_inner3(h_i, h_j, ssa->inv_diag_count, N, &inner, &norm_i_sq, &norm_j_sq);
         inner *= sigma_i * sigma_j;
         norm_i_sq *= sigma_i * sigma_i;
         norm_j_sq *= sigma_j * sigma_j;
