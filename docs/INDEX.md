@@ -17,6 +17,8 @@ Technical documentation for the SSA-Opt library implementation.
 |----------|-------------|
 | [FORECAST.md](FORECAST.md) | R-forecast (LRF) and V-forecast methods |
 | [ESPRIT.md](ESPRIT.md) | Automatic frequency/period detection |
+| [CADZOW.md](CADZOW.md) | Iterative denoising for exact rank-r |
+| [GAPFILL.md](GAPFILL.md) | Handling missing values (NaN) |
 
 ## Quick Reference
 
@@ -33,6 +35,8 @@ Technical documentation for the SSA-Opt library implementation.
 | Forecast (R) | O(L) per step | Precomputed LRF |
 | Forecast (V) | O(n · L) per step | Per-step projection |
 | ESPRIT | O(r³) | r = components analyzed |
+| Cadzow | O(iter · N log N) | iter ≈ 10-30 |
+| Gap filling | O(iter · N log N) | iter ≈ 5-20 |
 
 ### Memory Usage
 
