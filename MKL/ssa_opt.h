@@ -2482,7 +2482,7 @@ extern "C"
     // Helper: check if value is NaN
     static inline int ssa_is_nan(double x)
     {
-        return x != x; // NaN != NaN
+        return isnan(x);
     }
 
     // Helper: linear interpolation for initial gap filling
