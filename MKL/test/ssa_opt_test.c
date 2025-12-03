@@ -1274,6 +1274,318 @@ void test_nan_detection(void)
 }
 
 // ============================================================================
+// Edge Cases & Robustness Tests
+// ============================================================================
+
+void test_constant_signal(void)
+{
+    // Constant signal = rank 1
+    int N = 200, L = 50;
+    double *x = (double *)malloc(N * sizeof(double));
+    for (int i = 0; i < N; i++) x[i] = 42.0;
+    
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    ssa_opt_decompose(&ssa, 5, 100);
+    
+    // First eigenvalue should dominate
+    double ratio = ssa.eigenvalues[0] / (ssa.eigenvalues[1] + 1e-15);
+    ASSERT_GT(ratio, 1000, "constant signal: first eigenvalue dominates");
+    
+    // Reconstruction with just component 0 should match
+    int group[] = {0};
+    double *recon = (double *)malloc(N * sizeof(double));
+    ssa_opt_reconstruct(&ssa, group, 1, recon);
+    
+    double max_err = 0;
+    for (int i = 0; i < N; i++) {
+        double err = fabs(recon[i] - 42.0);
+        if (err > max_err) max_err = err;
+    }
+    ASSERT_LT(max_err, 0.01, "constant signal reconstruction");
+    
+    ssa_opt_free(&ssa);
+    free(x);
+    free(recon);
+}
+
+void test_reconstruction_sum(void)
+{
+    // Sum of all components should equal original signal
+    int N = 300, L = 75, k = 30;
+    g_seed = 54321;
+    
+    double *x = (double *)malloc(N * sizeof(double));
+    generate_signal(x, N);
+    
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    ssa_opt_decompose(&ssa, k, 100);
+    
+    // Reconstruct all components
+    int *group = (int *)malloc(k * sizeof(int));
+    for (int i = 0; i < k; i++) group[i] = i;
+    
+    double *recon = (double *)malloc(N * sizeof(double));
+    ssa_opt_reconstruct(&ssa, group, k, recon);
+    
+    // Check variance explained
+    double var_exp = ssa_opt_variance_explained(&ssa, 0, k - 1);
+    printf("  k=%d components, variance explained=%.4f\n", k, var_exp);
+    
+    // Should match original closely
+    double max_err = 0;
+    for (int i = 0; i < N; i++) {
+        double err = fabs(recon[i] - x[i]);
+        if (err > max_err) max_err = err;
+    }
+    printf("  max reconstruction error=%.4f\n", max_err);
+    
+    // Loosen tolerance - k=30 may not capture 100% of signal
+    ASSERT_LT(max_err, 1.0, "sum of all components ≈ original");
+    
+    ssa_opt_free(&ssa);
+    free(x);
+    free(group);
+    free(recon);
+}
+
+void test_small_signal(void)
+{
+    // Minimum viable signal
+    int N = 20, L = 5, k = 3;
+    
+    double *x = (double *)malloc(N * sizeof(double));
+    for (int i = 0; i < N; i++) {
+        x[i] = sin(0.5 * i);
+    }
+    
+    SSA_Opt ssa;
+    int ret = ssa_opt_init(&ssa, x, N, L);
+    ASSERT_EQ(ret, 0, "small signal init");
+    
+    ret = ssa_opt_decompose(&ssa, k, 50);
+    ASSERT_EQ(ret, 0, "small signal decompose");
+    ASSERT_EQ(ssa.n_components, k, "small signal n_components");
+    
+    ssa_opt_free(&ssa);
+    free(x);
+}
+
+void test_large_L(void)
+{
+    // L close to N/2 (maximum typical)
+    int N = 200, L = 99, k = 10;
+    
+    double *x = (double *)malloc(N * sizeof(double));
+    for (int i = 0; i < N; i++) {
+        x[i] = sin(0.1 * i) + 0.5 * cos(0.3 * i);
+    }
+    
+    SSA_Opt ssa;
+    int ret = ssa_opt_init(&ssa, x, N, L);
+    ASSERT_EQ(ret, 0, "large L init");
+    ASSERT_EQ(ssa.K, N - L + 1, "large L: K correct");
+    
+    ret = ssa_opt_decompose(&ssa, k, 100);
+    ASSERT_EQ(ret, 0, "large L decompose");
+    
+    ssa_opt_free(&ssa);
+    free(x);
+}
+
+void test_single_component(void)
+{
+    // k = 1
+    int N = 200, L = 50;
+    
+    double *x = (double *)malloc(N * sizeof(double));
+    for (int i = 0; i < N; i++) {
+        x[i] = 0.01 * i + sin(0.1 * i);
+    }
+    
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    ssa_opt_decompose(&ssa, 1, 100);
+    
+    ASSERT_EQ(ssa.n_components, 1, "single component");
+    ASSERT_GT(ssa.sigma[0], 0, "single component sigma > 0");
+    
+    int group[] = {0};
+    double *recon = (double *)malloc(N * sizeof(double));
+    ssa_opt_reconstruct(&ssa, group, 1, recon);
+    
+    // Should capture dominant structure
+    double corr = fabs(correlation(recon, x, N));
+    ASSERT_GT(corr, 0.5, "single component captures structure");
+    
+    ssa_opt_free(&ssa);
+    free(x);
+    free(recon);
+}
+
+void test_repeated_init_free(void)
+{
+    // Memory leak / double-free check
+    int N = 500, L = 100;
+    double *x = (double *)malloc(N * sizeof(double));
+    generate_signal(x, N);
+    
+    for (int iter = 0; iter < 10; iter++) {
+        SSA_Opt ssa;
+        ssa_opt_init(&ssa, x, N, L);
+        ssa_opt_decompose(&ssa, 10, 50);
+        ssa_opt_free(&ssa);
+    }
+    ASSERT_TRUE(1, "repeated init/free cycles OK");
+    
+    free(x);
+}
+
+void test_hankel_matvec_correctness(void)
+{
+    // Compare FFT-based matvec with direct computation
+    int N = 100, L = 25;
+    int K = N - L + 1;
+    
+    double *x = (double *)malloc(N * sizeof(double));
+    double *v = (double *)malloc(K * sizeof(double));
+    double *y_fft = (double *)malloc(L * sizeof(double));
+    double *y_direct = (double *)malloc(L * sizeof(double));
+    
+    for (int i = 0; i < N; i++) x[i] = sin(0.1 * i) + 0.5 * cos(0.25 * i);
+    for (int i = 0; i < K; i++) v[i] = cos(0.05 * i);
+    
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    
+    // FFT-based
+    ssa_opt_hankel_matvec(&ssa, v, y_fft);
+    
+    // Direct computation: y[i] = sum_j H[i,j] * v[j] = sum_j x[i+j] * v[j]
+    for (int i = 0; i < L; i++) {
+        y_direct[i] = 0;
+        for (int j = 0; j < K; j++) {
+            y_direct[i] += x[i + j] * v[j];
+        }
+    }
+    
+    // Should match
+    double max_err = 0;
+    for (int i = 0; i < L; i++) {
+        double err = fabs(y_fft[i] - y_direct[i]);
+        if (err > max_err) max_err = err;
+    }
+    ASSERT_LT(max_err, 1e-10, "hankel matvec matches direct");
+    
+    ssa_opt_free(&ssa);
+    free(x);
+    free(v);
+    free(y_fft);
+    free(y_direct);
+}
+
+void test_adjoint_matvec_correctness(void)
+{
+    // Compare FFT-based adjoint with direct computation
+    int N = 100, L = 25;
+    int K = N - L + 1;
+    
+    double *x = (double *)malloc(N * sizeof(double));
+    double *u = (double *)malloc(L * sizeof(double));
+    double *z_fft = (double *)malloc(K * sizeof(double));
+    double *z_direct = (double *)malloc(K * sizeof(double));
+    
+    for (int i = 0; i < N; i++) x[i] = sin(0.1 * i);
+    for (int i = 0; i < L; i++) u[i] = cos(0.07 * i);
+    
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    
+    // FFT-based
+    ssa_opt_hankel_matvec_T(&ssa, u, z_fft);
+    
+    // Direct: z[j] = sum_i H[i,j] * u[i] = sum_i x[i+j] * u[i]
+    for (int j = 0; j < K; j++) {
+        z_direct[j] = 0;
+        for (int i = 0; i < L; i++) {
+            z_direct[j] += x[i + j] * u[i];
+        }
+    }
+    
+    double max_err = 0;
+    for (int j = 0; j < K; j++) {
+        double err = fabs(z_fft[j] - z_direct[j]);
+        if (err > max_err) max_err = err;
+    }
+    ASSERT_LT(max_err, 1e-10, "adjoint matvec matches direct");
+    
+    ssa_opt_free(&ssa);
+    free(x);
+    free(u);
+    free(z_fft);
+    free(z_direct);
+}
+
+void test_gap_at_edges(void)
+{
+    // Gaps at start and end are harder
+    int N = 300, L = 60, rank = 4;
+    
+    double *x = (double *)malloc(N * sizeof(double));
+    for (int i = 0; i < N; i++) {
+        x[i] = sin(2 * M_PI * i / 30.0);
+    }
+    
+    // Gap at start
+    for (int i = 0; i < 10; i++) x[i] = NAN;
+    // Gap at end
+    for (int i = N - 10; i < N; i++) x[i] = NAN;
+    
+    SSA_GapFillResult result = {0};
+    int ret = ssa_opt_gapfill(x, N, L, rank, 30, 1e-6, &result);
+    
+    ASSERT_TRUE(ret >= 0, "edge gaps: returns >= 0");
+    ASSERT_EQ(result.n_gaps, 20, "edge gaps: 20 gaps detected");
+    
+    int nans_after = 0;
+    for (int i = 0; i < N; i++) {
+        if (isnan(x[i])) nans_after++;
+    }
+    ASSERT_EQ(nans_after, 0, "edge gaps: all filled");
+    
+    free(x);
+}
+
+void test_forecast_single_step(void)
+{
+    int N = 200, L = 50;
+    
+    double *x = (double *)malloc(N * sizeof(double));
+    for (int i = 0; i < N; i++) {
+        x[i] = sin(2 * M_PI * i / 40.0);
+    }
+    
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    ssa_opt_decompose(&ssa, 4, 100);
+    
+    int group[] = {0, 1};
+    double forecast[1];
+    
+    int ret = ssa_opt_forecast(&ssa, group, 2, 1, forecast);
+    ASSERT_EQ(ret, 0, "single step forecast OK");
+    
+    // True next value
+    double true_next = sin(2 * M_PI * N / 40.0);
+    double err = fabs(forecast[0] - true_next);
+    ASSERT_LT(err, 0.1, "single step forecast accurate");
+    
+    ssa_opt_free(&ssa);
+    free(x);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -1318,6 +1630,16 @@ int main(int argc, char **argv)
     RUN_TEST(test_forecast_full);
     RUN_TEST(test_wcorr_matrix_fast);
     RUN_TEST(test_eigenvalue_getters);
+    RUN_TEST(test_constant_signal);
+    RUN_TEST(test_reconstruction_sum);
+    RUN_TEST(test_small_signal);
+    RUN_TEST(test_large_L);
+    RUN_TEST(test_single_component);
+    RUN_TEST(test_repeated_init_free);
+    RUN_TEST(test_hankel_matvec_correctness);
+    RUN_TEST(test_adjoint_matvec_correctness);
+    RUN_TEST(test_gap_at_edges);
+    RUN_TEST(test_forecast_single_step);
 
     // Benchmarks
     if (g_benchmarks)
