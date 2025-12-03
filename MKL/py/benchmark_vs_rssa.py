@@ -399,10 +399,10 @@ def compare_speed_all(r_path):
 
 def compare_malloc_free(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     """
-    Compare malloc-free hot path (with prepare) vs regular path AND Rssa.
+    Benchmark malloc-free hot path vs Rssa.
     
-    This tests the new ssa_opt_prepare() / ssa_opt_update_signal() API
-    that eliminates ~1MB malloc/free per decompose call.
+    This tests the ssa_opt_prepare() / ssa_opt_update_signal() API
+    that provides consistent, allocation-free performance.
     """
     from ssa_wrapper import SSA, _lib, _SSA_Opt, c_double_p
     
@@ -419,22 +419,18 @@ def compare_malloc_free(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     except Exception as e:
         print(f"Note: MKL config not available: {e}")
     
-    # Check if new functions are available
+    # Setup function signatures
     try:
         _lib.ssa_opt_prepare.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int]
         _lib.ssa_opt_prepare.restype = ctypes.c_int
         _lib.ssa_opt_update_signal.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p]
         _lib.ssa_opt_update_signal.restype = ctypes.c_int
-        has_prepare = True
     except Exception as e:
-        print(f"\nERROR: New malloc-free functions not available: {e}")
-        print("Make sure ssa_opt.h has ssa_opt_prepare() and ssa_opt_update_signal()")
+        print(f"\nERROR: Malloc-free functions not available: {e}")
         return
     
-    print("\nThis benchmark simulates a trading hot loop:")
-    print("  - Regular: init → decompose → reconstruct (malloc every call)")
-    print("  - Prepared: init → prepare → update_signal → decompose → reconstruct (no malloc)")
-    print("  - Rssa: R's standard SSA implementation for comparison")
+    print("\nSimulating trading hot loop (malloc-free path):")
+    print("  init → prepare → [update_signal → decompose → reconstruct] × N")
     print()
     
     test_configs = [
@@ -444,15 +440,14 @@ def compare_malloc_free(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
         (10000, 2500, 50, 10),
     ]
     
-    n_runs = 5  # For Rssa timing
+    n_rssa_runs = 5
     
-    print(f"{'N':>6} {'L':>5} {'k':>3} {'iters':>6} | {'Regular':>10} {'Prepared':>10} {'Rssa':>10} | {'vs Reg':>8} {'vs Rssa':>8}")
-    print("-"*90)
+    print(f"{'N':>6} {'L':>5} {'k':>3} {'iters':>6} | {'Ours/iter':>10} {'Rssa/iter':>10} {'Speedup':>9}")
+    print("-"*70)
     
     for N, L, k, n_iterations in test_configs:
         np.random.seed(42)
         x = np.sin(np.linspace(0, 50*np.pi, N)) + 0.3*np.random.randn(N)
-        output = np.zeros(N)
         group = list(range(k))
         
         # Warmup
@@ -460,26 +455,8 @@ def compare_malloc_free(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
         _lib.ssa_opt_prepare(ctypes.byref(ssa_warmup._ctx), k, 8)
         ssa_warmup.decompose(k=k)
         
-        # =====================================================================
-        # TEST 1: Regular path (malloc every call)
-        # =====================================================================
-        times_regular = []
-        for _ in range(3):  # 3 trials
-            x_copy = x.copy()
-            t0 = time.perf_counter()
-            for i in range(n_iterations):
-                x_copy[0] += 0.001
-                ssa = SSA(x_copy, L=L)
-                ssa.decompose(k=k)
-                _ = ssa.reconstruct(group)
-            times_regular.append((time.perf_counter() - t0) * 1000)
-        regular_ms = np.median(times_regular)
-        regular_per_iter = regular_ms / n_iterations
-        
-        # =====================================================================
-        # TEST 2: Prepared path (malloc-free hot loop)
-        # =====================================================================
-        times_prepared = []
+        # Benchmark malloc-free hot loop
+        times = []
         for _ in range(3):  # 3 trials
             x_copy = x.copy()
             ssa = SSA(x_copy, L=L)
@@ -492,14 +469,12 @@ def compare_malloc_free(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
                 _lib.ssa_opt_update_signal(ctypes.byref(ssa._ctx), x_ptr)
                 ssa.decompose(k=k)
                 _ = ssa.reconstruct(group)
-            times_prepared.append((time.perf_counter() - t0) * 1000)
-        prepared_ms = np.median(times_prepared)
-        prepared_per_iter = prepared_ms / n_iterations
+            times.append((time.perf_counter() - t0) * 1000)
         
-        # =====================================================================
-        # TEST 3: Rssa timing (per iteration)
-        # =====================================================================
-        r_code = f'''suppressMessages(suppressWarnings(library(Rssa)));options(warn=-1);set.seed(42);x<-sin(seq(0,50*pi,length.out={N}))+0.3*rnorm({N});t0<-Sys.time();for(i in 1:{n_runs}){{invisible(capture.output({{s<-ssa(x,L={L},neig={k});r<-reconstruct(s,groups=list(1:{k}))}}));}};cat(as.numeric(Sys.time()-t0)/{n_runs}*1000)'''
+        our_per_iter = np.median(times) / n_iterations
+        
+        # Rssa timing
+        r_code = f'''suppressMessages(suppressWarnings(library(Rssa)));options(warn=-1);set.seed(42);x<-sin(seq(0,50*pi,length.out={N}))+0.3*rnorm({N});t0<-Sys.time();for(i in 1:{n_rssa_runs}){{invisible(capture.output({{s<-ssa(x,L={L},neig={k});r<-reconstruct(s,groups=list(1:{k}))}}));}};cat(as.numeric(Sys.time()-t0)/{n_rssa_runs}*1000)'''
         
         rssa_per_iter = None
         try:
@@ -512,21 +487,14 @@ def compare_malloc_free(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
         except:
             pass
         
-        # Results
-        speedup_vs_regular = regular_per_iter / prepared_per_iter
-        
         if rssa_per_iter:
-            speedup_vs_rssa = rssa_per_iter / prepared_per_iter
-            print(f"{N:>6} {L:>5} {k:>3} {n_iterations:>6} | {regular_per_iter:>8.2f}ms {prepared_per_iter:>8.2f}ms {rssa_per_iter:>8.1f}ms | {speedup_vs_regular:>7.2f}x {speedup_vs_rssa:>7.1f}x")
+            speedup = rssa_per_iter / our_per_iter
+            print(f"{N:>6} {L:>5} {k:>3} {n_iterations:>6} | {our_per_iter:>8.2f}ms {rssa_per_iter:>8.1f}ms {speedup:>8.1f}x")
         else:
-            print(f"{N:>6} {L:>5} {k:>3} {n_iterations:>6} | {regular_per_iter:>8.2f}ms {prepared_per_iter:>8.2f}ms {'err':>10} | {speedup_vs_regular:>7.2f}x {'-':>8}")
+            print(f"{N:>6} {L:>5} {k:>3} {n_iterations:>6} | {our_per_iter:>8.2f}ms {'err':>10} {'-':>9}")
     
-    print("-"*90)
-    print("\nNotes:")
-    print("  - 'Regular' creates new SSA object each iteration (malloc ~1MB workspace)")
-    print("  - 'Prepared' reuses pre-allocated workspace (zero malloc in hot loop)")
-    print("  - 'vs Reg' = speedup of Prepared over Regular (malloc overhead)")
-    print("  - 'vs Rssa' = speedup of Prepared over Rssa")
+    print("-"*70)
+    print("\nNote: All timings use malloc-free hot path (prepare + update_signal)")
 
 
 def compare_mkl_config(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
@@ -775,7 +743,7 @@ if __name__ == "__main__":
     parser.add_argument('--internal', action='store_true', help='Compare our three methods')
     parser.add_argument('--scaling', action='store_true', help='Test O(N log N) scaling')
     parser.add_argument('--mkl-config', action='store_true', help='Compare with/without MKL config')
-    parser.add_argument('--malloc-free', action='store_true', help='Compare malloc-free hot path vs regular')
+    parser.add_argument('--malloc-free', action='store_true', help='Benchmark malloc-free hot path vs Rssa')
     parser.add_argument('--all', action='store_true', help='Run all benchmarks')
     parser.add_argument('--r-path', default=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe')
     args = parser.parse_args()
@@ -804,7 +772,7 @@ if __name__ == "__main__":
         print("  --internal   Compare sequential/block/randomized")
         print("  --scaling    Test O(N log N) complexity")
         print("  --mkl-config Compare with/without MKL optimization")
-        print("  --malloc-free Compare malloc-free hot path vs regular")
+        print("  --malloc-free Benchmark malloc-free hot path vs Rssa")
         print("  --all        Run everything")
         print()
         print("Example: python benchmark_vs_rssa.py --all")
