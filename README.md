@@ -48,8 +48,7 @@ Unlike Fourier analysis, SSA is non-parametric and adapts to your data's structu
 
 Benchmarked with `benchmark_vs_rssa.py` on Intel Core i9-14900KF, MKL 2025.0.3:
 
-<img width="2374" height="1029" alt="benchmark_final" src="https://github.com/user-attachments/assets/6ea3d779-c915-46b5-8dc5-46c7b62ae24a" />
-<img width="1484" height="882" alt="chart2_speedup" src="https://github.com/user-attachments/assets/6cebc565-7fe7-4c2f-8feb-8875e6dfa462" />
+<img width="2079" height="1631" alt="benchmark_2x2" src="https://github.com/user-attachments/assets/023881b9-f309-4b06-bcf0-3b4ae5dca2b3" />
 
 | N | L | k | SSA-Opt (ms) | Rssa (ms) | Speedup | Correlation |
 |------:|-----:|---:|-------------:|----------:|--------:|------------:|
