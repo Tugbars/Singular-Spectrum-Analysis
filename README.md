@@ -85,13 +85,40 @@ The `mkl_config.h` header auto-detects hybrid CPUs (Intel 12th-14th gen) and pin
 
 ## 4. Features
 
-- **Python bindings** - Full ctypes wrapper with NumPy integration
-- **3 decomposition methods** - Sequential, block, and randomized SVD
-- **FFT-accelerated** - O(N log N) Hankel matrix operations
-- **Forecasting (LRF)** - Linear Recurrent Formula prediction
-- **MSSA** - Multivariate SSA for correlated series
-- **MKL-optimized** - Hybrid CPU auto-configuration
-- **Header-only** - Just `#include "ssa_opt_r2c.h"`
+### Core SSA
+* **3 Decomposition Methods** - Sequential power iteration, block power iteration, and randomized SVD
+* **FFT-Accelerated** - O(N log N) Hankel matrix-vector products via convolution theorem
+* **R2C Optimization** - Real-to-complex FFT exploits Hermitian symmetry (50% memory savings)
+* **Malloc-Free Hot Path** - `prepare()` + `decompose_randomized()` for zero-allocation streaming
+
+### Analysis & Reconstruction
+* **Grouped Reconstruction** - Combine arbitrary component subsets
+* **W-Correlation Matrix** - Fast DSYRK-based weighted correlation for component grouping
+* **Automatic Pair Detection** - Find sine/cosine pairs via singular value + W-correlation matching
+* **Variance Explained** - Per-component and cumulative variance statistics
+* **Component Statistics** - Scree plot data, gap detection, automatic rank selection
+
+### Forecasting & Prediction
+* **R-Forecast (LRF)** - Linear Recurrent Formula for extrapolation
+* **V-Forecast** - Alternative vector forecast method
+* **Verticality Check** - Stability indicator for forecast reliability
+
+### Advanced Features
+* **ESPRIT** - Frequency/period estimation from eigenvectors
+* **Cadzow Iterations** - Iterative rank reduction for enhanced denoising
+* **Gap Filling** - Missing value imputation (iterative + simple methods)
+* **MSSA** - Multivariate SSA for multi-channel/correlated series
+
+### Performance
+* **MKL-Optimized** - Intel MKL for FFT, BLAS, LAPACK, and RNG
+* **Batched FFT** - Process multiple vectors in single MKL call
+* **Cached FFTs** - Pre-computed eigenvector FFTs for fast reconstruction
+* **OpenMP Ready** - Parallel-friendly design
+
+### Integration
+* **Header-Only** - Single `#include "ssa_opt.h"`
+* **Python Bindings** - Full ctypes wrapper with NumPy integration
+* **Minimal Dependencies** - Just Intel MKL (or compatible BLAS/LAPACK)
 
 ## 5. Quick Start
 
