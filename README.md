@@ -44,19 +44,25 @@ Unlike Fourier analysis, SSA is non-parametric and adapts to your data's structu
 
 ## 3. Benchmarks
 
-### 3.1 Speed: SSA-Opt vs Rssa
+### 3.1 Speed: SSA-Opt vs Rssa(Golden Standard for SSA)
 
 Benchmarked with `benchmark_vs_rssa.py` on Intel Core i9-14900KF, MKL 2025.0.3:
+- **Components:** k = 50
+- **Window length:** L = N/4 (standard SSA choice)
+- **Signal:** Synthetic (trend + periodic + noise)
 
 <img width="2079" height="1631" alt="benchmark_2x2" src="https://github.com/user-attachments/assets/023881b9-f309-4b06-bcf0-3b4ae5dca2b3" />
 
 | N | L | k | SSA-Opt (ms) | Rssa (ms) | Speedup | Correlation |
 |------:|-----:|---:|-------------:|----------:|--------:|------------:|
-| 500 | 125 | 30 | 1.2 | 23.8 | **20.3×** | 0.9895 |
-| 1000 | 250 | 30 | 2.1 | 36.9 | **17.2×** | 0.9973 |
-| 5000 | 1250 | 30 | 8.9 | 118.1 | **13.3×** | 0.9996 |
-| 10000 | 2500 | 50 | 20.7 | 368.4 | **17.8×** | 0.9999 |
-| 20000 | 5000 | 50 | 36.1 | 620.3 | **17.2×** | 1.0000 |
+| 500 | 125 | 50 | 2.0 | 33.9 | **17.0×** | 0.9767 |
+| 1000 | 250 | 50 | 1.6 | 46.8 | **28.5×** | 0.9938 |
+| 2000 | 500 | 50 | 2.5 | 64.3 | **25.3×** | 0.9982 |
+| 5000 | 1250 | 50 | 7.2 | 148.3 | **20.5×** | 0.9995 |
+| 10000 | 2500 | 50 | 12.2 | 370.8 | **30.5×** | 0.9999 |
+| 20000 | 5000 | 50 | 26.3 | 618.9 | **23.6×** | 1.0000 |
+
+**Summary:** Average **24×** speedup, peak **30.5×** at N=10,000. Throughput: **625 SSA/sec** at N=1000.
 
 *Rssa uses PROPACK (Lanczos bidiagonalization). SSA-Opt uses randomized SVD with MKL.*
 
