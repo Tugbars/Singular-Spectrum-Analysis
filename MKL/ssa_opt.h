@@ -447,18 +447,22 @@ extern "C"
     // End SIMD helpers
     // ========================================================================
 
-    // Hankel matvec via R2C FFT
+    // Hankel matvec via R2C FFT: y = H·v where H[i,j] = x[i+j]
+    // Exploits: H·v = conv(x, flip(v))[K-1 : K-1+L]
+    // See docs/HANKEL_MATVEC.md for derivation
     static void ssa_opt_hankel_matvec(SSA_Opt *ssa, const double *v, double *y)
     {
         int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
         ssa_opt_zero(ssa->ws_real, fft_len);
-        ssa_opt_reverse_copy(v, ssa->ws_real, K);
-        DftiComputeForward(ssa->fft_r2c, ssa->ws_real, ssa->ws_complex);
-        ssa_opt_complex_mul_r2c(ssa->fft_x, ssa->ws_complex, ssa->ws_complex, r2c_len);
-        DftiComputeBackward(ssa->fft_c2r, ssa->ws_complex, ssa->ws_real);
-        memcpy(y, ssa->ws_real + (K - 1), L * sizeof(double));
+        ssa_opt_reverse_copy(v, ssa->ws_real, K);                                       // flip(v) for correlation
+        DftiComputeForward(ssa->fft_r2c, ssa->ws_real, ssa->ws_complex);                // FFT(flip(v))
+        ssa_opt_complex_mul_r2c(ssa->fft_x, ssa->ws_complex, ssa->ws_complex, r2c_len); // FFT(x) ⊙ FFT(flip(v))
+        DftiComputeBackward(ssa->fft_c2r, ssa->ws_complex, ssa->ws_real);               // IFFT → conv result
+        memcpy(y, ssa->ws_real + (K - 1), L * sizeof(double));                          // extract [K-1, K-1+L)
     }
 
+    // Adjoint Hankel matvec: z = Hᵀ·u
+    // Exploits: Hᵀ·u = conv(x, flip(u))[L-1 : L-1+K]
     static void ssa_opt_hankel_matvec_T(SSA_Opt *ssa, const double *u, double *y)
     {
         int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
@@ -467,9 +471,11 @@ extern "C"
         DftiComputeForward(ssa->fft_r2c, ssa->ws_real, ssa->ws_complex);
         ssa_opt_complex_mul_r2c(ssa->fft_x, ssa->ws_complex, ssa->ws_complex, r2c_len);
         DftiComputeBackward(ssa->fft_c2r, ssa->ws_complex, ssa->ws_real);
-        memcpy(y, ssa->ws_real + (L - 1), K * sizeof(double));
+        memcpy(y, ssa->ws_real + (L - 1), K * sizeof(double)); // extract [L-1, L-1+K)
     }
 
+    // Block Hankel matvec: Y = H·V where V is K×b, Y is L×b
+    // Batches up to SSA_BATCH_SIZE vectors per MKL FFT call for efficiency
     static void ssa_opt_hankel_matvec_block(SSA_Opt *ssa, const double *V_block, double *Y_block, int b)
     {
         int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
@@ -479,12 +485,13 @@ extern "C"
         {
             int batch_count = ssa_opt_min(SSA_BATCH_SIZE, b - col);
             if (batch_count < 2)
-            {
+            { // Fallback for tiny batches
                 for (int i = 0; i < batch_count; i++)
                     ssa_opt_hankel_matvec(ssa, &V_block[(col + i) * K], &Y_block[(col + i) * L]);
                 col += batch_count;
                 continue;
             }
+            // Pack reversed vectors contiguously for batched FFT
             memset(ws_real, 0, SSA_BATCH_SIZE * fft_len * sizeof(double));
             for (int i = 0; i < batch_count; i++)
             {
@@ -493,19 +500,20 @@ extern "C"
                 for (int j = 0; j < K; j++)
                     dst[j] = v[K - 1 - j];
             }
-            DftiComputeForward(ssa->fft_r2c_batch, ws_real, ws_complex);
+            DftiComputeForward(ssa->fft_r2c_batch, ws_real, ws_complex); // Batched FFT (single MKL call)
             for (int i = 0; i < batch_count; i++)
             {
                 double *fft_v = ws_complex + i * 2 * r2c_len;
                 ssa_opt_complex_mul_r2c(ssa->fft_x, fft_v, fft_v, r2c_len);
             }
-            DftiComputeBackward(ssa->fft_c2r_batch, ws_complex, ws_real);
+            DftiComputeBackward(ssa->fft_c2r_batch, ws_complex, ws_real); // Batched IFFT
             for (int i = 0; i < batch_count; i++)
                 memcpy(&Y_block[(col + i) * L], ws_real + i * fft_len + (K - 1), L * sizeof(double));
             col += batch_count;
         }
     }
 
+    // Block adjoint Hankel matvec: Z = Hᵀ·U where U is L×b, Z is K×b
     static void ssa_opt_hankel_matvec_T_block(SSA_Opt *ssa, const double *U_block, double *Y_block, int b)
     {
         int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
@@ -920,22 +928,27 @@ extern "C"
         return 0;
     }
 
+    // ========================================================================
+    // Randomized SVD Decomposition
+    // Algorithm: Y=H·Ω → Q=qr(Y) → B=Qᵀ·H → SVD(B) → U=Q·Uᵦ
+    // See docs/RANDOMIZED_SVD.md for full derivation
+    // ========================================================================
     int ssa_opt_decompose_randomized(SSA_Opt *ssa, int k, int oversampling)
     {
         if (!ssa || !ssa->initialized || k < 1)
             return -1;
         ssa_opt_free_cached_ffts(ssa);
         int L = ssa->L, K = ssa->K;
-        int p = (oversampling <= 0) ? 8 : oversampling;
+        int p = (oversampling <= 0) ? 8 : oversampling; // p=8 default oversampling
         int kp = k + p;
         kp = ssa_opt_min(kp, ssa_opt_min(L, K));
         k = ssa_opt_min(k, kp);
 
-        // Require prepare() to be called first
+        // Require prepare() for malloc-free hot path
         if (!ssa->prepared || kp > ssa->prepared_kp)
             return -1;
 
-        // Use pre-allocated workspace (no malloc in hot path)
+        // Use pre-allocated workspace (zero allocations from here)
         double *Omega = ssa->decomp_Omega;
         double *Y = ssa->decomp_Y;
         double *Q = ssa->decomp_Q;
@@ -948,7 +961,7 @@ extern "C"
         int *iwork = ssa->decomp_iwork;
         int lwork = ssa->prepared_lwork;
 
-        // Allocate/reallocate results (only if size changed)
+        // Allocate result arrays (only if size changed)
         if (!ssa->U || !ssa->V || !ssa->sigma || ssa->n_components != k)
         {
             ssa_opt_free_ptr(ssa->U);
@@ -965,25 +978,37 @@ extern "C"
         ssa->n_components = k;
         ssa->total_variance = 0.0;
 
-        // === SVD COMPUTATION ===
+        // Step 1: Random projection Y = H·Ω (captures column space of H)
         vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, ssa->rng, K * kp, Omega, 0.0, 1.0);
         ssa_opt_hankel_matvec_block(ssa, Omega, Y, kp);
+
+        // Step 2: QR factorization Q = orth(Y)
         cblas_dcopy(L * kp, Y, 1, Q, 1);
         LAPACKE_dgeqrf(LAPACK_COL_MAJOR, L, kp, Q, L, tau);
         LAPACKE_dorgqr(LAPACK_COL_MAJOR, L, kp, kp, Q, L, tau);
+
+        // Step 3: Project to small matrix B = Hᵀ·Q (kp×K matrix, but stored K×kp)
         ssa_opt_hankel_matvec_T_block(ssa, Q, B, kp);
+
+        // Step 4: SVD of small matrix B = Uᵦ·Σ·Vᵀ (GESDD divide-and-conquer)
         int info = LAPACKE_dgesdd_work(LAPACK_COL_MAJOR, 'S', K, kp, B, K, S_svd, B_left, K, B_right_T, kp, work, lwork, iwork);
         if (info != 0)
             return -1;
+
+        // Step 5: Recover U = Q·Vᵦᵀ (rotate Q by right singular vectors of B)
         cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans, L, k, kp, 1.0, Q, L, B_right_T, kp, 0.0, ssa->U, L);
         for (int i = 0; i < k; i++)
             cblas_dcopy(K, &B_left[i * K], 1, &ssa->V[i * K], 1);
+
+        // Store singular values and eigenvalues (σ² for variance)
         for (int i = 0; i < k; i++)
         {
             ssa->sigma[i] = S_svd[i];
             ssa->eigenvalues[i] = S_svd[i] * S_svd[i];
             ssa->total_variance += ssa->eigenvalues[i];
         }
+
+        // Fix sign convention: ensure sum(U[:,i]) > 0 for reproducibility
         for (int i = 0; i < k; i++)
         {
             double sum = 0;
@@ -1516,6 +1541,12 @@ extern "C"
         return 0;
     }
 
+    // ========================================================================
+    // W-Correlation Matrix (Fast Path)
+    // Computes W[i,j] = ⟨Xᵢ,Xⱼ⟩_w / (||Xᵢ||_w · ||Xⱼ||_w) for all pairs
+    // Key optimization: Use DSYRK instead of O(n²) pairwise correlations
+    // See docs/WCORR.md for full derivation
+    // ========================================================================
     int ssa_opt_wcorr_matrix_fast(const SSA_Opt *ssa, double *W)
     {
         int N, n, fft_len, r2c_len, i, t, k, ii, jj;
@@ -1528,6 +1559,9 @@ extern "C"
         fft_len = ssa->fft_len;
         r2c_len = ssa->r2c_len;
         double *all_ws_complex = ssa->wcorr_ws_complex, *all_h = ssa->wcorr_h, *G = ssa->wcorr_G, *sqrt_inv_c = ssa->wcorr_sqrt_inv_c;
+
+// Step 1: Compute FFT(uᵢ) ⊙ FFT(vᵢ) for all components (parallel)
+// Uses pre-cached U_fft, V_fft from ssa_opt_cache_ffts()
 #pragma omp parallel for private(k)
         for (i = 0; i < n; i++)
         {
@@ -1540,22 +1574,30 @@ extern "C"
                 ws[2 * k + 1] = ar * bi + ai * br;
             }
         }
+
+        // Step 2: Batched IFFT for all n components (single MKL call)
         {
             MKL_LONG status = DftiComputeBackward(ssa->fft_c2r_wcorr, all_ws_complex, all_h);
             if (status != 0)
                 return -1;
         }
+
+// Step 3: Normalize and weight: G[i,t] = (σᵢ/||hᵢ||_w) · hᵢ[t] · √w[t]
+// AVX2-optimized weighted_norm_sq and scale_weighted
 #pragma omp parallel for private(t)
         for (i = 0; i < n; i++)
         {
             double *h = &all_h[i * fft_len], sigma = ssa->sigma[i], norm_sq, norm, scale, *g_row;
-            norm_sq = ssa_opt_weighted_norm_sq(h, ssa->inv_diag_count, N);
+            norm_sq = ssa_opt_weighted_norm_sq(h, ssa->inv_diag_count, N); // ||hᵢ||²_w
             norm_sq *= sigma * sigma;
             norm = sqrt(norm_sq);
             scale = (norm > 1e-12) ? sigma / norm : 0.0;
             g_row = &G[i * N];
             ssa_opt_scale_weighted(h, sqrt_inv_c, scale, g_row, N);
         }
+
+        // Step 4: W = G·Gᵀ via DSYRK (upper triangle only, then mirror)
+        // DSYRK is O(n²·N/2) with BLAS3 cache efficiency vs O(n²·N) naive
         cblas_dsyrk(CblasRowMajor, CblasUpper, CblasNoTrans, n, N, 1.0, G, N, 0.0, W, n);
         for (ii = 0; ii < n; ii++)
             for (jj = ii + 1; jj < n; jj++)
@@ -1563,6 +1605,7 @@ extern "C"
         return 0;
     }
 
+    // Single-pair W-correlation (for selective queries)
     double ssa_opt_wcorr_pair(const SSA_Opt *ssa, int i, int j)
     {
         if (!ssa || !ssa->decomposed || i < 0 || i >= ssa->n_components || j < 0 || j >= ssa->n_components)
