@@ -11,6 +11,8 @@ add_executable(ssa_block_test test/ssa_block_test.c)
 add_executable(ssa_forecast_test test/test_ssa_forecast.c)
 add_executable(mssa_test test/test_mssa.c)
 add_executable(wcorr_parallel_bench test/wcorr_parallel_bench.c)
+add_executable(ssa_vforecast_test test/ssa_vforecast_test.c)
+add_executable(ssa_cadzow_test test/ssa_cadzow_test.c)
 
 
 # All test executables
@@ -20,6 +22,8 @@ set(TEST_TARGETS
     ssa_forecast_test
     mssa_test
     wcorr_parallel_bench
+    ssa_vforecast_test
+    ssa_cadzow_test
 )
 
 # Include MKL directory so tests can find ssa_opt.h and mkl_config.h

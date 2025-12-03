@@ -18,3 +18,7 @@ MKL/py/linkedin_mssa.png
 MKL/py/linkedin_hero.png
 MKL/py/linkedin_decomposition.png
 MKL/py/linkedin_performance.png
+MKL/py/denoise_chirp_signal.png
+MKL/py/denoise_ecg-like_spikes.png
+MKL/py/denoise_sinusoidal_rank_4.png
+MKL/py/denoise_trend_+_seasonal.png

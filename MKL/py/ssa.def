@@ -39,6 +39,16 @@ EXPORTS
     ssa_opt_update_signal
     ssa_opt_free_prepared
     
+    ; === NEW: Vector Forecast ===
+    ssa_opt_vforecast
+    ssa_opt_vforecast_full
+    ssa_opt_vforecast_fast
+    
+    ; === NEW: Cadzow Iterations ===
+    ssa_opt_cadzow
+    ssa_opt_cadzow_weighted
+    ssa_opt_cadzow_inplace
+    
     ; === NEW: MKL Configuration Functions ===
     ssa_mkl_init
     ssa_mkl_init_14900kf
@@ -48,5 +58,3 @@ EXPORTS
     ssa_mkl_get_cpu_info
     ssa_mkl_set_p_core_affinity
     ssa_mkl_disable_affinity
-
-
