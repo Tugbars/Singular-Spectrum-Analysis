@@ -148,6 +148,20 @@ extern "C"
     int ssa_opt_get_noise(const SSA_Opt *ssa, int noise_start, double *output);
     double ssa_opt_variance_explained(const SSA_Opt *ssa, int start, int end);
 
+    // Cadzow iterations - iterative finite-rank signal approximation
+    typedef struct
+    {
+        int iterations;    // Iterations performed
+        double final_diff; // Final relative difference
+        double converged;  // 1.0 if converged, 0.0 if hit max_iter
+    } SSA_CadzowResult;
+
+    int ssa_opt_cadzow(const double *x, int N, int L, int rank, int max_iter, double tol,
+                       double *output, SSA_CadzowResult *result);
+    int ssa_opt_cadzow_weighted(const double *x, int N, int L, int rank, int max_iter,
+                                double tol, double alpha, double *output, SSA_CadzowResult *result);
+    int ssa_opt_cadzow_inplace(SSA_Opt *ssa, int rank, int max_iter, double tol, SSA_CadzowResult *result);
+
 #ifdef SSA_OPT_IMPLEMENTATION
 
     static inline int ssa_opt_next_pow2(int n)
@@ -1852,6 +1866,303 @@ extern "C"
         for (int i = start; i <= end; i++)
             sum += ssa->eigenvalues[i];
         return sum / ssa->total_variance;
+    }
+
+    // ========================================================================
+    // Cadzow Iterations (Finite-Rank Signal Approximation)
+    // ========================================================================
+    // Iteratively projects signal onto the space of signals with exactly
+    // rank-r trajectory matrices. Each iteration:
+    //   1. Form trajectory matrix
+    //   2. SVD → keep rank r (low-rank projection)
+    //   3. Hankel averaging → back to signal (Hankel projection)
+    //
+    // Converges to signal whose trajectory matrix is EXACTLY rank r.
+    // Useful for:
+    //   - Denoising (cleaner than single-pass SSA)
+    //   - Enforcing exact periodicity structure
+    //   - Signal recovery from corrupted data
+    //
+    // Returns: number of iterations performed, or -1 on error
+    // ========================================================================
+
+    int ssa_opt_cadzow(const double *x, int N, int L, int rank, int max_iter, double tol,
+                       double *output, SSA_CadzowResult *result)
+    {
+        if (!x || !output || N < 4 || L < 2 || L > N - 1 || rank < 1 || max_iter < 1)
+            return -1;
+
+        // Working buffers
+        double *y = (double *)ssa_opt_alloc(N * sizeof(double));
+        double *y_new = (double *)ssa_opt_alloc(N * sizeof(double));
+        int *group = (int *)malloc(rank * sizeof(int));
+        if (!y || !y_new || !group)
+        {
+            ssa_opt_free_ptr(y);
+            ssa_opt_free_ptr(y_new);
+            free(group);
+            return -1;
+        }
+
+        // Group = [0, 1, ..., rank-1]
+        for (int i = 0; i < rank; i++)
+            group[i] = i;
+
+        // Initialize y = x
+        memcpy(y, x, N * sizeof(double));
+
+        // Compute initial signal norm for relative tolerance
+        double y_norm = cblas_dnrm2(N, y, 1);
+        if (y_norm < 1e-15)
+            y_norm = 1.0;
+
+        int iter;
+        double diff = 0.0;
+        bool converged = false;
+
+        for (iter = 0; iter < max_iter; iter++)
+        {
+            // Initialize SSA with current signal
+            SSA_Opt ssa = {0};
+            if (ssa_opt_init(&ssa, y, N, L) != 0)
+            {
+                ssa_opt_free_ptr(y);
+                ssa_opt_free_ptr(y_new);
+                free(group);
+                return -1;
+            }
+
+            // Decompose to get rank components
+            // Use randomized for speed if rank is small relative to L
+            int K = N - L + 1;
+            int use_randomized = (rank + 8 < ssa_opt_min(L, K) / 2);
+
+            if (use_randomized)
+            {
+                if (ssa_opt_prepare(&ssa, rank, 8) != 0 ||
+                    ssa_opt_decompose_randomized(&ssa, rank, 8) != 0)
+                {
+                    ssa_opt_free(&ssa);
+                    // Fallback to block method
+                    use_randomized = 0;
+                }
+            }
+
+            if (!use_randomized)
+            {
+                if (ssa_opt_decompose_block(&ssa, rank, ssa_opt_min(rank, 16), 3) != 0)
+                {
+                    ssa_opt_free(&ssa);
+                    ssa_opt_free_ptr(y);
+                    ssa_opt_free_ptr(y_new);
+                    free(group);
+                    return -1;
+                }
+            }
+
+            // Reconstruct with rank components (Hankel averaging)
+            if (ssa_opt_reconstruct(&ssa, group, rank, y_new) != 0)
+            {
+                ssa_opt_free(&ssa);
+                ssa_opt_free_ptr(y);
+                ssa_opt_free_ptr(y_new);
+                free(group);
+                return -1;
+            }
+
+            ssa_opt_free(&ssa);
+
+            // Compute difference ||y_new - y||
+            double diff_sq = 0.0;
+            for (int i = 0; i < N; i++)
+            {
+                double d = y_new[i] - y[i];
+                diff_sq += d * d;
+            }
+            diff = sqrt(diff_sq) / y_norm;
+
+            // Swap buffers
+            double *tmp = y;
+            y = y_new;
+            y_new = tmp;
+
+            // Check convergence
+            if (diff < tol)
+            {
+                converged = true;
+                iter++; // Count this iteration
+                break;
+            }
+        }
+
+        // Copy result to output
+        memcpy(output, y, N * sizeof(double));
+
+        // Fill result struct if provided
+        if (result)
+        {
+            result->iterations = iter;
+            result->final_diff = diff;
+            result->converged = converged ? 1.0 : 0.0;
+        }
+
+        ssa_opt_free_ptr(y);
+        ssa_opt_free_ptr(y_new);
+        free(group);
+
+        return iter;
+    }
+
+    // Weighted Cadzow with alpha blending (for regularization)
+    // output = alpha * cadzow_result + (1-alpha) * original
+    int ssa_opt_cadzow_weighted(const double *x, int N, int L, int rank, int max_iter,
+                                double tol, double alpha, double *output, SSA_CadzowResult *result)
+    {
+        if (alpha <= 0.0 || alpha > 1.0)
+            return -1;
+
+        int ret = ssa_opt_cadzow(x, N, L, rank, max_iter, tol, output, result);
+        if (ret < 0)
+            return ret;
+
+        // Blend if alpha < 1
+        if (alpha < 1.0)
+        {
+            double beta = 1.0 - alpha;
+            for (int i = 0; i < N; i++)
+            {
+                output[i] = alpha * output[i] + beta * x[i];
+            }
+        }
+
+        return ret;
+    }
+
+    // In-place Cadzow using existing SSA object (faster for repeated calls)
+    // Modifies the SSA object's signal and redecomposes
+    int ssa_opt_cadzow_inplace(SSA_Opt *ssa, int rank, int max_iter, double tol, SSA_CadzowResult *result)
+    {
+        if (!ssa || !ssa->initialized || rank < 1 || max_iter < 1)
+            return -1;
+        int N = ssa->N, L = ssa->L;
+
+        double *y_new = (double *)ssa_opt_alloc(N * sizeof(double));
+        double *y_current = (double *)ssa_opt_alloc(N * sizeof(double));
+        int *group = (int *)malloc(rank * sizeof(int));
+        if (!y_new || !y_current || !group)
+        {
+            ssa_opt_free_ptr(y_new);
+            ssa_opt_free_ptr(y_current);
+            free(group);
+            return -1;
+        }
+
+        for (int i = 0; i < rank; i++)
+            group[i] = i;
+
+        // Get initial signal from FFT (inverse of what init does)
+        // Actually we need to store original signal - use ws_real2 as temp
+        // Simpler: reconstruct all components to get current signal approximation
+        // But for first iter, we need original signal...
+
+        // Let's use a different approach: caller should have original signal
+        // We'll extract it by doing full reconstruction if already decomposed
+
+        double y_norm = 1.0;
+        int iter;
+        double diff = 0.0;
+        bool converged = false;
+
+        for (iter = 0; iter < max_iter; iter++)
+        {
+            // Decompose (or re-decompose)
+            int K = N - L + 1;
+            int use_randomized = (rank + 8 < ssa_opt_min(L, K) / 2);
+
+            // Clear previous decomposition
+            ssa->decomposed = false;
+            ssa->n_components = 0;
+            ssa->total_variance = 0.0;
+            ssa_opt_free_cached_ffts(ssa);
+
+            if (use_randomized && ssa->prepared && rank + 8 <= ssa->prepared_kp)
+            {
+                if (ssa_opt_decompose_randomized(ssa, rank, 8) != 0)
+                {
+                    use_randomized = 0;
+                }
+            }
+
+            if (!use_randomized || !ssa->decomposed)
+            {
+                if (ssa_opt_decompose_block(ssa, rank, ssa_opt_min(rank, 16), 3) != 0)
+                {
+                    ssa_opt_free_ptr(y_new);
+                    ssa_opt_free_ptr(y_current);
+                    free(group);
+                    return -1;
+                }
+            }
+
+            // Save current reconstruction for comparison
+            if (iter > 0)
+            {
+                memcpy(y_current, y_new, N * sizeof(double));
+            }
+
+            // Reconstruct
+            if (ssa_opt_reconstruct(ssa, group, rank, y_new) != 0)
+            {
+                ssa_opt_free_ptr(y_new);
+                ssa_opt_free_ptr(y_current);
+                free(group);
+                return -1;
+            }
+
+            if (iter == 0)
+            {
+                y_norm = cblas_dnrm2(N, y_new, 1);
+                if (y_norm < 1e-15)
+                    y_norm = 1.0;
+            }
+            else
+            {
+                // Compute difference
+                double diff_sq = 0.0;
+                for (int i = 0; i < N; i++)
+                {
+                    double d = y_new[i] - y_current[i];
+                    diff_sq += d * d;
+                }
+                diff = sqrt(diff_sq) / y_norm;
+
+                if (diff < tol)
+                {
+                    converged = true;
+                    iter++;
+                    break;
+                }
+            }
+
+            // Update signal for next iteration
+            if (iter < max_iter - 1)
+            {
+                ssa_opt_update_signal(ssa, y_new);
+            }
+        }
+
+        if (result)
+        {
+            result->iterations = iter;
+            result->final_diff = diff;
+            result->converged = converged ? 1.0 : 0.0;
+        }
+
+        ssa_opt_free_ptr(y_new);
+        ssa_opt_free_ptr(y_current);
+        free(group);
+
+        return iter;
     }
 
     // MSSA Implementation

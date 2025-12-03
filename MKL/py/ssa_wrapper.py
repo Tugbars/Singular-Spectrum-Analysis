@@ -5,13 +5,21 @@ SSA Python Wrapper
 Ctypes wrapper for ssa_opt.h MKL-optimized SSA implementation.
 
 Usage:
-    from ssa_wrapper import SSA, MSSA
+    from ssa_wrapper import SSA, MSSA, cadzow, CadzowResult
     
     # Univariate SSA
     ssa = SSA(signal, L=100)
     ssa.decompose(k=20)
     trend = ssa.reconstruct([0])
     forecast = ssa.forecast([0, 1, 2], n_forecast=50)
+    vforecast = ssa.vforecast([0, 1, 2], n_forecast=50)  # Alternative forecast
+    
+    # Cadzow denoising
+    result = cadzow(noisy_signal, L=100, rank=6)
+    clean = result.signal
+    
+    # Or via SSA object
+    result = ssa.cadzow(rank=6)
     
     # Multivariate SSA
     mssa = MSSA(X, L=100)  # X is (M, N) array
@@ -97,6 +105,14 @@ class _SSA_ComponentStats(ctypes.Structure):
     """Opaque wrapper for SSA_ComponentStats C struct."""
     _fields_ = [("_opaque", ctypes.c_char * 512)]
 
+class _SSA_CadzowResult(ctypes.Structure):
+    """Result struct for Cadzow iterations."""
+    _fields_ = [
+        ("iterations", ctypes.c_int),
+        ("final_diff", ctypes.c_double),
+        ("converged", ctypes.c_double)
+    ]
+
 # ============================================================================
 # Function signatures
 # ============================================================================
@@ -137,6 +153,16 @@ _lib.ssa_opt_forecast.restype = ctypes.c_int
 _lib.ssa_opt_forecast_full.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, ctypes.c_int, c_double_p]
 _lib.ssa_opt_forecast_full.restype = ctypes.c_int
 
+# Vector forecast (V-forecast) - alternative to recurrent forecast
+_lib.ssa_opt_vforecast.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, ctypes.c_int, c_double_p]
+_lib.ssa_opt_vforecast.restype = ctypes.c_int
+
+_lib.ssa_opt_vforecast_full.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, ctypes.c_int, c_double_p]
+_lib.ssa_opt_vforecast_full.restype = ctypes.c_int
+
+_lib.ssa_opt_vforecast_fast.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, c_double_p, ctypes.c_int, ctypes.c_int, c_double_p]
+_lib.ssa_opt_vforecast_fast.restype = ctypes.c_int
+
 _lib.ssa_opt_wcorr_matrix.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p]
 _lib.ssa_opt_wcorr_matrix.restype = ctypes.c_int
 
@@ -157,6 +183,21 @@ _lib.ssa_opt_get_noise.restype = ctypes.c_int
 
 _lib.ssa_opt_free.argtypes = [ctypes.POINTER(_SSA_Opt)]
 _lib.ssa_opt_free.restype = None
+
+# --- Cadzow iterations ---
+_lib.ssa_opt_cadzow.argtypes = [c_double_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, 
+                                ctypes.c_int, ctypes.c_double, c_double_p, 
+                                ctypes.POINTER(_SSA_CadzowResult)]
+_lib.ssa_opt_cadzow.restype = ctypes.c_int
+
+_lib.ssa_opt_cadzow_weighted.argtypes = [c_double_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_int, ctypes.c_double, ctypes.c_double, 
+                                         c_double_p, ctypes.POINTER(_SSA_CadzowResult)]
+_lib.ssa_opt_cadzow_weighted.restype = ctypes.c_int
+
+_lib.ssa_opt_cadzow_inplace.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int, 
+                                        ctypes.c_double, ctypes.POINTER(_SSA_CadzowResult)]
+_lib.ssa_opt_cadzow_inplace.restype = ctypes.c_int
 
 # --- MSSA functions ---
 _lib.mssa_opt_init.argtypes = [ctypes.POINTER(_MSSA_Opt), c_double_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -195,6 +236,95 @@ def _to_c_int_array(arr: List[int]) -> Tuple[ctypes.Array, np.ndarray]:
     arr = np.ascontiguousarray(arr, dtype=np.int32)
     ptr = arr.ctypes.data_as(c_int_p)
     return ptr, arr
+
+# ============================================================================
+# Cadzow Iterations (Standalone Function)
+# ============================================================================
+
+class CadzowResult:
+    """Result of Cadzow iterations."""
+    def __init__(self, signal: np.ndarray, iterations: int, final_diff: float, converged: bool):
+        self.signal = signal
+        self.iterations = iterations
+        self.final_diff = final_diff
+        self.converged = converged
+    
+    def __repr__(self):
+        return (f"CadzowResult(iterations={self.iterations}, "
+                f"final_diff={self.final_diff:.2e}, converged={self.converged})")
+
+def cadzow(x: np.ndarray, L: int, rank: int, max_iter: int = 20, tol: float = 1e-9,
+           alpha: float = 1.0) -> CadzowResult:
+    """
+    Cadzow iterations for finite-rank signal approximation.
+    
+    Iteratively projects signal onto the space of signals with exactly
+    rank-r trajectory matrices. Converges to a signal that is exactly
+    representable as a sum of `rank` exponentials/sinusoids.
+    
+    Parameters
+    ----------
+    x : ndarray
+        Input signal of length N
+    L : int  
+        Window length (embedding dimension)
+    rank : int
+        Target rank (number of components to keep)
+    max_iter : int, default 20
+        Maximum number of iterations
+    tol : float, default 1e-9
+        Convergence tolerance (relative change in signal)
+    alpha : float, default 1.0
+        Blending parameter: output = alpha * cadzow + (1-alpha) * original
+        Use alpha < 1 for regularization (less aggressive denoising)
+    
+    Returns
+    -------
+    result : CadzowResult
+        - signal: denoised signal
+        - iterations: number of iterations performed
+        - final_diff: final relative difference
+        - converged: True if converged before max_iter
+    
+    Examples
+    --------
+    >>> # Simple denoising
+    >>> x_noisy = signal + noise
+    >>> result = cadzow(x_noisy, L=100, rank=6)
+    >>> x_clean = result.signal
+    
+    >>> # Conservative denoising with blending
+    >>> result = cadzow(x_noisy, L=100, rank=6, alpha=0.8)
+    """
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    N = len(x)
+    output = np.zeros(N, dtype=np.float64)
+    c_result = _SSA_CadzowResult()
+    
+    if alpha == 1.0:
+        ret = _lib.ssa_opt_cadzow(
+            x.ctypes.data_as(c_double_p),
+            N, L, rank, max_iter, tol,
+            output.ctypes.data_as(c_double_p),
+            ctypes.byref(c_result)
+        )
+    else:
+        ret = _lib.ssa_opt_cadzow_weighted(
+            x.ctypes.data_as(c_double_p),
+            N, L, rank, max_iter, tol, alpha,
+            output.ctypes.data_as(c_double_p),
+            ctypes.byref(c_result)
+        )
+    
+    if ret < 0:
+        raise RuntimeError("Cadzow iterations failed")
+    
+    return CadzowResult(
+        signal=output,
+        iterations=c_result.iterations,
+        final_diff=c_result.final_diff,
+        converged=bool(c_result.converged > 0.5)
+    )
 
 # ============================================================================
 # SSA Class (Univariate)
@@ -441,6 +571,113 @@ class SSA:
         
         return output
     
+    def vforecast(self, group: List[int], n_forecast: int) -> np.ndarray:
+        """
+        Vector forecast (V-forecast) - alternative to recurrent forecast.
+        
+        Projects onto eigenvector subspace at each step instead of using
+        precomputed LRR coefficients. Can be more numerically stable for
+        long forecast horizons.
+        
+        Parameters
+        ----------
+        group : list of int
+            Component indices to use for forecasting
+        n_forecast : int
+            Number of future points to predict
+        
+        Returns
+        -------
+        forecast : ndarray of shape (n_forecast,)
+        """
+        if not self._decomposed:
+            raise RuntimeError("Call decompose() first")
+        
+        output = np.zeros(n_forecast, dtype=np.float64)
+        group_arr = np.ascontiguousarray(group, dtype=np.int32)
+        
+        ret = _lib.ssa_opt_vforecast(
+            ctypes.byref(self._ctx),
+            group_arr.ctypes.data_as(c_int_p),
+            len(group),
+            n_forecast,
+            output.ctypes.data_as(c_double_p)
+        )
+        
+        if ret != 0:
+            raise RuntimeError("V-forecast failed (verticality >= 1?)")
+        
+        return output
+    
+    def vforecast_full(self, group: List[int], n_forecast: int) -> np.ndarray:
+        """
+        Get reconstruction + V-forecast concatenated.
+        
+        Returns
+        -------
+        full : ndarray of shape (N + n_forecast,)
+        """
+        if not self._decomposed:
+            raise RuntimeError("Call decompose() first")
+        
+        output = np.zeros(self.N + n_forecast, dtype=np.float64)
+        group_arr = np.ascontiguousarray(group, dtype=np.int32)
+        
+        ret = _lib.ssa_opt_vforecast_full(
+            ctypes.byref(self._ctx),
+            group_arr.ctypes.data_as(c_int_p),
+            len(group),
+            n_forecast,
+            output.ctypes.data_as(c_double_p)
+        )
+        
+        if ret != 0:
+            raise RuntimeError("V-forecast failed")
+        
+        return output
+    
+    def vforecast_fast(self, group: List[int], base_signal: np.ndarray, n_forecast: int) -> np.ndarray:
+        """
+        Fast V-forecast from arbitrary base signal (for hot loops).
+        
+        Uses BLAS for inner products. Does not require reconstruction -
+        you provide the base signal directly.
+        
+        Parameters
+        ----------
+        group : list of int
+            Component indices to use for forecasting
+        base_signal : ndarray
+            Signal to forecast from (must be at least L-1 long)
+        n_forecast : int
+            Number of future points to predict
+        
+        Returns
+        -------
+        forecast : ndarray of shape (n_forecast,)
+        """
+        if not self._decomposed:
+            raise RuntimeError("Call decompose() first")
+        
+        base = np.ascontiguousarray(base_signal, dtype=np.float64)
+        output = np.zeros(n_forecast, dtype=np.float64)
+        group_arr = np.ascontiguousarray(group, dtype=np.int32)
+        
+        ret = _lib.ssa_opt_vforecast_fast(
+            ctypes.byref(self._ctx),
+            group_arr.ctypes.data_as(c_int_p),
+            len(group),
+            base.ctypes.data_as(c_double_p),
+            len(base),
+            n_forecast,
+            output.ctypes.data_as(c_double_p)
+        )
+        
+        if ret != 0:
+            raise RuntimeError("V-forecast fast failed")
+        
+        return output
+    
     def get_trend(self) -> np.ndarray:
         """Extract trend (component 0 only)."""
         if not self._decomposed:
@@ -473,6 +710,41 @@ class SSA:
             raise RuntimeError("get_noise failed")
         
         return output
+    
+    def cadzow(self, rank: int, max_iter: int = 20, tol: float = 1e-9, 
+               alpha: float = 1.0) -> 'CadzowResult':
+        """
+        Apply Cadzow iterations for finite-rank signal approximation.
+        
+        Uses this SSA object's signal and window length. Returns denoised
+        signal whose trajectory matrix is exactly rank-r.
+        
+        Parameters
+        ----------
+        rank : int
+            Target rank (number of components to keep)
+        max_iter : int, default 20
+            Maximum number of iterations
+        tol : float, default 1e-9
+            Convergence tolerance (relative change in signal)
+        alpha : float, default 1.0
+            Blending: output = alpha * cadzow + (1-alpha) * original
+        
+        Returns
+        -------
+        result : CadzowResult
+            - signal: denoised signal
+            - iterations: number performed
+            - final_diff: final relative difference  
+            - converged: True if converged
+        
+        Examples
+        --------
+        >>> ssa = SSA(noisy_signal, L=250)
+        >>> result = ssa.cadzow(rank=6)
+        >>> clean_signal = result.signal
+        """
+        return cadzow(self._x, self.L, rank, max_iter, tol, alpha)
     
     def wcorr_matrix(self) -> np.ndarray:
         """
