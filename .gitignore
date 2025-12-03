@@ -22,3 +22,6 @@ MKL/py/denoise_chirp_signal.png
 MKL/py/denoise_ecg-like_spikes.png
 MKL/py/denoise_sinusoidal_rank_4.png
 MKL/py/denoise_trend_+_seasonal.png
+MKL/py/gapfill_demo.png
+MKL/py/cadzow_comparison.png
+MKL/py/forecast_finance.png
