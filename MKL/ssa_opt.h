@@ -192,6 +192,33 @@ extern "C"
     int ssa_opt_parestimate(const SSA_Opt *ssa, const int *group, int n_group, SSA_ParEstimate *result);
     void ssa_opt_parestimate_free(SSA_ParEstimate *result);
 
+    // Gap Filling - handle missing values in time series
+    // Iteratively fills gaps using SSA reconstruction
+    typedef struct
+    {
+        int iterations;    // Iterations performed
+        double final_diff; // Final relative change in gap values
+        int converged;     // 1 if converged, 0 if hit max_iter
+        int n_gaps;        // Number of gap positions filled
+    } SSA_GapFillResult;
+
+    // Iterative gap filling using SSA
+    // x: input signal with NaN for missing values (will be modified in place)
+    // N: signal length
+    // L: window length
+    // rank: number of components for reconstruction
+    // max_iter: maximum iterations (typical: 10-50)
+    // tol: convergence tolerance (typical: 1e-6)
+    // result: output statistics (can be NULL if not needed)
+    // Returns 0 on success, filled signal in x
+    int ssa_opt_gapfill(double *x, int N, int L, int rank, int max_iter, double tol,
+                        SSA_GapFillResult *result);
+
+    // Simple gap filling using forecast/backcast
+    // Fills each gap by averaging forward forecast and backward forecast
+    // Faster but less accurate than iterative method
+    int ssa_opt_gapfill_simple(double *x, int N, int L, int rank, SSA_GapFillResult *result);
+
 #ifdef SSA_OPT_IMPLEMENTATION
 
     static inline int ssa_opt_next_pow2(int n)
@@ -2403,6 +2430,442 @@ extern "C"
         free(group);
 
         return iter;
+    }
+
+    // ========================================================================
+    // Gap Filling - Handle Missing Values in Time Series
+    // ========================================================================
+
+    // Helper: check if value is NaN
+    static inline int ssa_is_nan(double x)
+    {
+        return x != x; // NaN != NaN
+    }
+
+    // Helper: linear interpolation for initial gap filling
+    static void ssa_linear_interp_gaps(double *x, const int *gap_mask, int N)
+    {
+        int i = 0;
+        while (i < N)
+        {
+            if (gap_mask[i])
+            {
+                // Find gap boundaries
+                int gap_start = i;
+                while (i < N && gap_mask[i])
+                    i++;
+                int gap_end = i; // exclusive
+
+                // Find left and right valid values
+                double left_val = 0.0, right_val = 0.0;
+                int left_idx = gap_start - 1;
+                int right_idx = gap_end;
+
+                if (left_idx >= 0)
+                    left_val = x[left_idx];
+                else
+                    left_val = (right_idx < N) ? x[right_idx] : 0.0;
+
+                if (right_idx < N)
+                    right_val = x[right_idx];
+                else
+                    right_val = left_val;
+
+                // Linear interpolation
+                int gap_len = gap_end - gap_start;
+                for (int j = 0; j < gap_len; j++)
+                {
+                    double t = (gap_len > 1) ? (double)(j + 1) / (gap_len + 1) : 0.5;
+                    x[gap_start + j] = left_val + t * (right_val - left_val);
+                }
+            }
+            else
+            {
+                i++;
+            }
+        }
+    }
+
+    int ssa_opt_gapfill(double *x, int N, int L, int rank, int max_iter, double tol,
+                        SSA_GapFillResult *result)
+    {
+        if (!x || N < 4 || L < 2 || L > N - 1 || rank < 1)
+            return -1;
+
+        // Identify gaps (NaN positions)
+        int *gap_mask = (int *)calloc(N, sizeof(int));
+        if (!gap_mask)
+            return -1;
+
+        int n_gaps = 0;
+        for (int i = 0; i < N; i++)
+        {
+            if (ssa_is_nan(x[i]))
+            {
+                gap_mask[i] = 1;
+                n_gaps++;
+            }
+        }
+
+        // No gaps to fill
+        if (n_gaps == 0)
+        {
+            free(gap_mask);
+            if (result)
+            {
+                result->iterations = 0;
+                result->final_diff = 0.0;
+                result->converged = 1;
+                result->n_gaps = 0;
+            }
+            return 0;
+        }
+
+        // Check we have enough non-gap data
+        if (N - n_gaps < L + rank)
+        {
+            free(gap_mask);
+            return -1; // Not enough data for SSA
+        }
+
+        // Initialize gaps with linear interpolation
+        ssa_linear_interp_gaps(x, gap_mask, N);
+
+        // Save gap values for convergence check
+        double *gap_values_old = (double *)ssa_opt_alloc(n_gaps * sizeof(double));
+        double *gap_values_new = (double *)ssa_opt_alloc(n_gaps * sizeof(double));
+        if (!gap_values_old || !gap_values_new)
+        {
+            free(gap_mask);
+            if (gap_values_old)
+                ssa_opt_free_ptr(gap_values_old);
+            if (gap_values_new)
+                ssa_opt_free_ptr(gap_values_new);
+            return -1;
+        }
+
+        // Extract initial gap values
+        int gi = 0;
+        for (int i = 0; i < N; i++)
+        {
+            if (gap_mask[i])
+                gap_values_old[gi++] = x[i];
+        }
+
+        // Allocate reconstruction buffer
+        double *recon = (double *)ssa_opt_alloc(N * sizeof(double));
+        if (!recon)
+        {
+            free(gap_mask);
+            ssa_opt_free_ptr(gap_values_old);
+            ssa_opt_free_ptr(gap_values_new);
+            return -1;
+        }
+
+        // Iterative gap filling
+        int iter;
+        double diff = 1e10;
+        int converged = 0;
+
+        // Create component group
+        int *group = (int *)malloc(rank * sizeof(int));
+        if (!group)
+        {
+            free(gap_mask);
+            ssa_opt_free_ptr(gap_values_old);
+            ssa_opt_free_ptr(gap_values_new);
+            ssa_opt_free_ptr(recon);
+            return -1;
+        }
+        for (int i = 0; i < rank; i++)
+            group[i] = i;
+
+        for (iter = 0; iter < max_iter; iter++)
+        {
+            // SSA decomposition on current signal
+            SSA_Opt ssa;
+            if (ssa_opt_init(&ssa, x, N, L) != 0)
+            {
+                free(gap_mask);
+                free(group);
+                ssa_opt_free_ptr(gap_values_old);
+                ssa_opt_free_ptr(gap_values_new);
+                ssa_opt_free_ptr(recon);
+                return -1;
+            }
+
+            // Prepare and decompose
+            ssa_opt_prepare(&ssa, rank, 8);
+            if (ssa_opt_decompose_randomized(&ssa, rank, 8) != 0)
+            {
+                ssa_opt_free(&ssa);
+                free(gap_mask);
+                free(group);
+                ssa_opt_free_ptr(gap_values_old);
+                ssa_opt_free_ptr(gap_values_new);
+                ssa_opt_free_ptr(recon);
+                return -1;
+            }
+
+            // Reconstruct
+            if (ssa_opt_reconstruct(&ssa, group, rank, recon) != 0)
+            {
+                ssa_opt_free(&ssa);
+                free(gap_mask);
+                free(group);
+                ssa_opt_free_ptr(gap_values_old);
+                ssa_opt_free_ptr(gap_values_new);
+                ssa_opt_free_ptr(recon);
+                return -1;
+            }
+
+            ssa_opt_free(&ssa);
+
+            // Update only gap positions
+            gi = 0;
+            for (int i = 0; i < N; i++)
+            {
+                if (gap_mask[i])
+                {
+                    gap_values_new[gi++] = recon[i];
+                    x[i] = recon[i];
+                }
+            }
+
+            // Check convergence: relative change in gap values
+            double sum_sq_diff = 0.0, sum_sq_old = 0.0;
+            for (int i = 0; i < n_gaps; i++)
+            {
+                double d = gap_values_new[i] - gap_values_old[i];
+                sum_sq_diff += d * d;
+                sum_sq_old += gap_values_old[i] * gap_values_old[i];
+            }
+
+            diff = (sum_sq_old > 1e-12) ? sqrt(sum_sq_diff / sum_sq_old) : sqrt(sum_sq_diff);
+
+            if (diff < tol)
+            {
+                converged = 1;
+                iter++; // Count this iteration
+                break;
+            }
+
+            // Swap old/new
+            memcpy(gap_values_old, gap_values_new, n_gaps * sizeof(double));
+        }
+
+        // Fill result
+        if (result)
+        {
+            result->iterations = iter;
+            result->final_diff = diff;
+            result->converged = converged;
+            result->n_gaps = n_gaps;
+        }
+
+        // Cleanup
+        free(gap_mask);
+        free(group);
+        ssa_opt_free_ptr(gap_values_old);
+        ssa_opt_free_ptr(gap_values_new);
+        ssa_opt_free_ptr(recon);
+
+        return 0;
+    }
+
+    int ssa_opt_gapfill_simple(double *x, int N, int L, int rank, SSA_GapFillResult *result)
+    {
+        if (!x || N < 4 || L < 2 || L > N - 1 || rank < 1)
+            return -1;
+
+        // Identify gaps
+        int *gap_mask = (int *)calloc(N, sizeof(int));
+        if (!gap_mask)
+            return -1;
+
+        int n_gaps = 0;
+        for (int i = 0; i < N; i++)
+        {
+            if (ssa_is_nan(x[i]))
+            {
+                gap_mask[i] = 1;
+                n_gaps++;
+            }
+        }
+
+        if (n_gaps == 0)
+        {
+            free(gap_mask);
+            if (result)
+            {
+                result->iterations = 1;
+                result->final_diff = 0.0;
+                result->converged = 1;
+                result->n_gaps = 0;
+            }
+            return 0;
+        }
+
+        // Find contiguous segments without gaps
+        // For each gap, forecast from left and backcast from right
+
+        // Create group
+        int *group = (int *)malloc(rank * sizeof(int));
+        if (!group)
+        {
+            free(gap_mask);
+            return -1;
+        }
+        for (int i = 0; i < rank; i++)
+            group[i] = i;
+
+        // Process each contiguous gap region
+        int i = 0;
+        while (i < N)
+        {
+            if (!gap_mask[i])
+            {
+                i++;
+                continue;
+            }
+
+            // Found gap start
+            int gap_start = i;
+            while (i < N && gap_mask[i])
+                i++;
+            int gap_end = i; // exclusive
+            int gap_len = gap_end - gap_start;
+
+            // Get left segment (before gap)
+            int left_len = gap_start;
+            // Get right segment (after gap)
+            int right_start = gap_end;
+            int right_len = N - gap_end;
+
+            double *forecast_left = NULL;
+            double *forecast_right = NULL;
+
+            // Forward forecast from left segment (if long enough)
+            if (left_len >= L + rank)
+            {
+                SSA_Opt ssa_left;
+                double *left_data = (double *)ssa_opt_alloc(left_len * sizeof(double));
+                if (left_data)
+                {
+                    memcpy(left_data, x, left_len * sizeof(double));
+
+                    if (ssa_opt_init(&ssa_left, left_data, left_len, L) == 0)
+                    {
+                        ssa_opt_prepare(&ssa_left, rank, 8);
+                        if (ssa_opt_decompose_randomized(&ssa_left, rank, 8) == 0)
+                        {
+                            forecast_left = (double *)ssa_opt_alloc(gap_len * sizeof(double));
+                            if (forecast_left)
+                            {
+                                ssa_opt_forecast(&ssa_left, group, rank, gap_len, forecast_left);
+                            }
+                        }
+                        ssa_opt_free(&ssa_left);
+                    }
+                    ssa_opt_free_ptr(left_data);
+                }
+            }
+
+            // Backward forecast from right segment (if long enough)
+            if (right_len >= L + rank)
+            {
+                SSA_Opt ssa_right;
+                // Reverse the right segment for backward forecasting
+                double *right_data = (double *)ssa_opt_alloc(right_len * sizeof(double));
+                if (right_data)
+                {
+                    // Copy reversed
+                    for (int j = 0; j < right_len; j++)
+                    {
+                        right_data[j] = x[N - 1 - j];
+                    }
+
+                    if (ssa_opt_init(&ssa_right, right_data, right_len, L) == 0)
+                    {
+                        ssa_opt_prepare(&ssa_right, rank, 8);
+                        if (ssa_opt_decompose_randomized(&ssa_right, rank, 8) == 0)
+                        {
+                            double *backcast_rev = (double *)ssa_opt_alloc(gap_len * sizeof(double));
+                            if (backcast_rev)
+                            {
+                                ssa_opt_forecast(&ssa_right, group, rank, gap_len, backcast_rev);
+                                // Reverse backcast to get forward order
+                                forecast_right = (double *)ssa_opt_alloc(gap_len * sizeof(double));
+                                if (forecast_right)
+                                {
+                                    for (int j = 0; j < gap_len; j++)
+                                    {
+                                        forecast_right[j] = backcast_rev[gap_len - 1 - j];
+                                    }
+                                }
+                                ssa_opt_free_ptr(backcast_rev);
+                            }
+                        }
+                        ssa_opt_free(&ssa_right);
+                    }
+                    ssa_opt_free_ptr(right_data);
+                }
+            }
+
+            // Fill gap with weighted average of forecasts
+            for (int j = 0; j < gap_len; j++)
+            {
+                double val = 0.0;
+                double weight = 0.0;
+
+                if (forecast_left)
+                {
+                    // Weight decreases with distance from left
+                    double w = (double)(gap_len - j) / gap_len;
+                    val += w * forecast_left[j];
+                    weight += w;
+                }
+
+                if (forecast_right)
+                {
+                    // Weight increases with distance from left (closer to right)
+                    double w = (double)(j + 1) / gap_len;
+                    val += w * forecast_right[j];
+                    weight += w;
+                }
+
+                if (weight > 0)
+                {
+                    x[gap_start + j] = val / weight;
+                }
+                else
+                {
+                    // Fallback: simple average of neighbors
+                    double left_val = (gap_start > 0) ? x[gap_start - 1] : 0.0;
+                    double right_val = (gap_end < N) ? x[gap_end] : left_val;
+                    x[gap_start + j] = (left_val + right_val) / 2.0;
+                }
+            }
+
+            if (forecast_left)
+                ssa_opt_free_ptr(forecast_left);
+            if (forecast_right)
+                ssa_opt_free_ptr(forecast_right);
+        }
+
+        // Result
+        if (result)
+        {
+            result->iterations = 1;
+            result->final_diff = 0.0;
+            result->converged = 1;
+            result->n_gaps = n_gaps;
+        }
+
+        free(gap_mask);
+        free(group);
+
+        return 0;
     }
 
     // MSSA Implementation

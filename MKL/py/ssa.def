@@ -56,6 +56,10 @@ EXPORTS
     ssa_opt_parestimate
     ssa_opt_parestimate_free
     
+    ; === NEW: Gap Filling ===
+    ssa_opt_gapfill
+    ssa_opt_gapfill_simple
+    
     ; === NEW: MKL Configuration Functions ===
     ssa_mkl_init
     ssa_mkl_init_14900kf

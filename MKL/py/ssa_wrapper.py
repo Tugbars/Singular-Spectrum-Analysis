@@ -245,6 +245,29 @@ try:
 except AttributeError:
     pass  # DLL doesn't have ESPRIT yet
 
+# --- Gap Filling ---
+class _SSA_GapFillResult(ctypes.Structure):
+    _fields_ = [
+        ("iterations", ctypes.c_int),
+        ("final_diff", ctypes.c_double),
+        ("converged", ctypes.c_int),
+        ("n_gaps", ctypes.c_int)
+    ]
+
+_HAS_GAPFILL = False
+try:
+    _lib.ssa_opt_gapfill.argtypes = [c_double_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_double, 
+                                      ctypes.POINTER(_SSA_GapFillResult)]
+    _lib.ssa_opt_gapfill.restype = ctypes.c_int
+    
+    _lib.ssa_opt_gapfill_simple.argtypes = [c_double_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                             ctypes.POINTER(_SSA_GapFillResult)]
+    _lib.ssa_opt_gapfill_simple.restype = ctypes.c_int
+    _HAS_GAPFILL = True
+except AttributeError:
+    pass  # DLL doesn't have gapfill yet
+
 # --- MSSA functions ---
 _lib.mssa_opt_init.argtypes = [ctypes.POINTER(_MSSA_Opt), c_double_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 _lib.mssa_opt_init.restype = ctypes.c_int
@@ -464,6 +487,111 @@ def cadzow(x: np.ndarray, L: int, rank: int, max_iter: int = 20, tol: float = 1e
         final_diff=c_result.final_diff,
         converged=bool(c_result.converged > 0.5)
     )
+
+
+# ============================================================================
+# Gap Filling (Standalone Function)
+# ============================================================================
+
+class GapFillResult:
+    """Result of gap filling operation."""
+    def __init__(self, signal: np.ndarray, iterations: int, final_diff: float, 
+                 converged: bool, n_gaps: int):
+        self.signal = signal
+        self.iterations = iterations
+        self.final_diff = final_diff
+        self.converged = converged
+        self.n_gaps = n_gaps
+    
+    def __repr__(self):
+        return (f"GapFillResult(n_gaps={self.n_gaps}, iterations={self.iterations}, "
+                f"converged={self.converged})")
+
+
+def gapfill(x: np.ndarray, L: int, rank: int, max_iter: int = 20, tol: float = 1e-6,
+            method: str = "iterative") -> GapFillResult:
+    """
+    Fill missing values (NaN) in time series using SSA.
+    
+    Two methods available:
+    - "iterative": Iteratively applies SSA reconstruction, updating only gap
+      positions until convergence. More accurate but slower.
+    - "simple": Uses forward forecast from left segment and backward forecast
+      from right segment, blended together. Faster but less accurate.
+    
+    Parameters
+    ----------
+    x : ndarray
+        Input signal with NaN for missing values
+    L : int
+        Window length (embedding dimension)
+    rank : int
+        Number of components for reconstruction
+    max_iter : int, default 20
+        Maximum iterations (iterative method only)
+    tol : float, default 1e-6
+        Convergence tolerance (iterative method only)
+    method : str, default "iterative"
+        "iterative" or "simple"
+    
+    Returns
+    -------
+    result : GapFillResult
+        - signal: filled signal (no NaN)
+        - iterations: number of iterations performed
+        - final_diff: final relative change
+        - converged: True if converged (iterative) or always True (simple)
+        - n_gaps: number of gap positions filled
+    
+    Examples
+    --------
+    >>> # Create signal with gaps
+    >>> x = np.sin(np.linspace(0, 4*np.pi, 200))
+    >>> x[50:60] = np.nan  # Gap from 50-59
+    >>> x[120:125] = np.nan  # Gap from 120-124
+    >>> 
+    >>> # Fill gaps
+    >>> result = gapfill(x, L=50, rank=2)
+    >>> x_filled = result.signal
+    >>> print(f"Filled {result.n_gaps} values in {result.iterations} iterations")
+    
+    >>> # Simple method (faster)
+    >>> result = gapfill(x, L=50, rank=2, method="simple")
+    """
+    if not _HAS_GAPFILL:
+        raise RuntimeError("gapfill not available - rebuild DLL with updated ssa_opt.h")
+    
+    # Make a copy since C function modifies in place
+    x_filled = np.ascontiguousarray(x.copy(), dtype=np.float64)
+    N = len(x_filled)
+    c_result = _SSA_GapFillResult()
+    
+    if method == "iterative":
+        ret = _lib.ssa_opt_gapfill(
+            x_filled.ctypes.data_as(c_double_p),
+            N, L, rank, max_iter, tol,
+            ctypes.byref(c_result)
+        )
+    elif method == "simple":
+        ret = _lib.ssa_opt_gapfill_simple(
+            x_filled.ctypes.data_as(c_double_p),
+            N, L, rank,
+            ctypes.byref(c_result)
+        )
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'iterative' or 'simple'")
+    
+    if ret != 0:
+        raise RuntimeError(f"Gap filling failed (ret={ret})")
+    
+    return GapFillResult(
+        signal=x_filled,
+        iterations=c_result.iterations,
+        final_diff=c_result.final_diff,
+        converged=bool(c_result.converged),
+        n_gaps=c_result.n_gaps
+    )
+
 
 # ============================================================================
 # SSA Class (Univariate)
