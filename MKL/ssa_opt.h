@@ -547,6 +547,85 @@ extern "C"
         }
     }
 
+    /**
+     * SIMD Complex multiply-accumulate: acc += u * v (fused, no intermediate storage)
+     * Replaces: ssa_opt_complex_mul_r2c() + cblas_daxpy() with single fused operation
+     */
+    static inline void ssa_opt_complex_mul_acc(
+        const double *__restrict u_fft,
+        const double *__restrict v_fft,
+        double *__restrict acc,
+        int n)
+    {
+#ifdef SSA_SIMD_AVX2
+        int i = 0;
+
+        // Main loop: process 2 complex numbers (4 doubles) per iteration
+        for (; i + 1 < n; i += 2)
+        {
+            __m256d u = _mm256_loadu_pd(&u_fft[2 * i]);
+            __m256d v = _mm256_loadu_pd(&v_fft[2 * i]);
+            __m256d a = _mm256_loadu_pd(&acc[2 * i]);
+
+            __m256d u_swap = _mm256_permute_pd(u, 0b0101);
+            __m256d v_re = _mm256_unpacklo_pd(v, v);
+            __m256d v_im = _mm256_unpackhi_pd(v, v);
+
+            __m256d prod1 = _mm256_mul_pd(u, v_re);
+            __m256d prod2 = _mm256_mul_pd(u_swap, v_im);
+            __m256d result = _mm256_addsub_pd(prod1, prod2);
+
+            a = _mm256_add_pd(a, result);
+            _mm256_storeu_pd(&acc[2 * i], a);
+        }
+
+        // Scalar cleanup
+        for (; i < n; i++)
+        {
+            double u_re = u_fft[2 * i];
+            double u_im = u_fft[2 * i + 1];
+            double v_re = v_fft[2 * i];
+            double v_im = v_fft[2 * i + 1];
+            acc[2 * i] += u_re * v_re - u_im * v_im;
+            acc[2 * i + 1] += u_re * v_im + u_im * v_re;
+        }
+
+#elif defined(SSA_SIMD_SSE2)
+        for (int i = 0; i < n; i++)
+        {
+            __m128d u = _mm_loadu_pd(&u_fft[2 * i]);
+            __m128d v = _mm_loadu_pd(&v_fft[2 * i]);
+            __m128d a = _mm_loadu_pd(&acc[2 * i]);
+
+            __m128d u_swap = _mm_shuffle_pd(u, u, 0b01);
+            __m128d v_re = _mm_unpacklo_pd(v, v);
+            __m128d v_im = _mm_unpackhi_pd(v, v);
+
+            __m128d prod1 = _mm_mul_pd(u, v_re);
+            __m128d prod2 = _mm_mul_pd(u_swap, v_im);
+
+            __m128d sign = _mm_set_pd(1.0, -1.0);
+            prod2 = _mm_mul_pd(prod2, sign);
+            __m128d result = _mm_add_pd(prod1, prod2);
+
+            a = _mm_add_pd(a, result);
+            _mm_storeu_pd(&acc[2 * i], a);
+        }
+
+#else
+        // Scalar fallback
+        for (int i = 0; i < n; i++)
+        {
+            double u_re = u_fft[2 * i];
+            double u_im = u_fft[2 * i + 1];
+            double v_re = v_fft[2 * i];
+            double v_im = v_fft[2 * i + 1];
+            acc[2 * i] += u_re * v_re - u_im * v_im;
+            acc[2 * i + 1] += u_re * v_im + u_im * v_re;
+        }
+#endif
+    }
+
     // ========================================================================
     // End SIMD helpers
     // ========================================================================
@@ -1672,14 +1751,6 @@ extern "C"
      * @param ssa  Decomposed SSA structure
      * @return     0 on success, -1 on failure
      *
-     * Usage:
-     *   ssa_opt_decompose(&ssa, k, 100);
-     *   ssa_opt_cache_ffts(&ssa);  // Optional: speeds up subsequent operations
-     *
-     *   // Now these are faster:
-     *   ssa_opt_reconstruct(&ssa, group1, n1, out1);
-     *   ssa_opt_reconstruct(&ssa, group2, n2, out2);
-     *   ssa_opt_wcorr_matrix_fast(&ssa, W);
      */
     int ssa_opt_cache_ffts(SSA_Opt *ssa)
     {
@@ -1827,49 +1898,76 @@ extern "C"
     {
         if (!ssa || !ssa->decomposed || !group || !output || n_group < 1)
             return -1;
-        int N = ssa->N, L = ssa->L, K = ssa->K, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
+
+        int N = ssa->N, L = ssa->L, K = ssa->K;
+        int fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
         SSA_Opt *ssa_mut = (SSA_Opt *)ssa;
+
+        // Use batch workspace as accumulator
         double *freq_accum = ssa_mut->ws_batch_complex;
         ssa_opt_zero(freq_accum, 2 * r2c_len);
+
         if (ssa->fft_cached && ssa->U_fft && ssa->V_fft)
         {
+            // ===================================================================
+            // FAST PATH: Use cached FFTs with SIMD fused multiply-accumulate
+            // Replaces: complex_mul + daxpy with single fused operation
+            // ===================================================================
             for (int g = 0; g < n_group; g++)
             {
                 int idx = group[g];
                 if (idx < 0 || idx >= ssa->n_components)
                     continue;
+
                 const double *u_fft_cached = &ssa->U_fft[idx * 2 * r2c_len];
                 const double *v_fft_cached = &ssa->V_fft[idx * 2 * r2c_len];
-                ssa_opt_complex_mul_r2c(u_fft_cached, v_fft_cached, ssa_mut->ws_complex, r2c_len);
-                cblas_daxpy(2 * r2c_len, 1.0, ssa_mut->ws_complex, 1, freq_accum, 1);
+
+                // SIMD fused multiply-accumulate: freq_accum += u_fft * v_fft
+                ssa_opt_complex_mul_acc(u_fft_cached, v_fft_cached, freq_accum, r2c_len);
             }
         }
         else
         {
+            // ===================================================================
+            // SLOW PATH: Compute FFTs on-the-fly (no cache)
+            // Still uses SIMD accumulate
+            // ===================================================================
             double *temp_fft2 = ssa_mut->ws_batch_complex + 2 * r2c_len;
+
             for (int g = 0; g < n_group; g++)
             {
                 int idx = group[g];
                 if (idx < 0 || idx >= ssa->n_components)
                     continue;
+
                 double sigma = ssa->sigma[idx];
                 const double *u_vec = &ssa->U[idx * L];
                 const double *v_vec = &ssa->V[idx * K];
+
+                // Compute FFT(σ * u)
                 ssa_opt_zero(ssa_mut->ws_real, fft_len);
                 for (int i = 0; i < L; i++)
                     ssa_mut->ws_real[i] = sigma * u_vec[i];
                 DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, ssa_mut->ws_complex);
+
+                // Compute FFT(v)
                 ssa_opt_zero(ssa_mut->ws_real2, fft_len);
                 for (int i = 0; i < K; i++)
                     ssa_mut->ws_real2[i] = v_vec[i];
                 DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real2, temp_fft2);
-                ssa_opt_complex_mul_r2c(ssa_mut->ws_complex, temp_fft2, ssa_mut->ws_complex, r2c_len);
-                cblas_daxpy(2 * r2c_len, 1.0, ssa_mut->ws_complex, 1, freq_accum, 1);
+
+                // SIMD fused multiply-accumulate: freq_accum += ws_complex * temp_fft2
+                ssa_opt_complex_mul_acc(ssa_mut->ws_complex, temp_fft2, freq_accum, r2c_len);
             }
         }
+
+        // Inverse FFT to get time-domain result
         DftiComputeBackward(ssa_mut->fft_c2r, freq_accum, ssa_mut->ws_real);
+
+        // Copy and apply diagonal averaging weights
         memcpy(output, ssa_mut->ws_real, N * sizeof(double));
         vdMul(N, output, ssa->inv_diag_count, output);
+
         return 0;
     }
 
