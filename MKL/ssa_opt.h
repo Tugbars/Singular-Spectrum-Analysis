@@ -1500,6 +1500,7 @@ extern "C"
         ssa->decomposed = true;
         return 0;
     }
+
     int ssa_opt_extend(SSA_Opt *ssa, int additional_k, int max_iter)
     {
         if (!ssa || !ssa->decomposed || additional_k < 1)
@@ -1645,65 +1646,171 @@ extern "C"
         ssa->wcorr_sqrt_inv_c = NULL;
     }
 
+    /**
+     * Pre-compute and cache FFTs of eigenvectors for fast reconstruction and W-correlation.
+     *
+     * This is an optional optimization. After decomposition, reconstruction requires:
+     *   x_i[t] = diagonal_average(σᵢ · uᵢ · vᵢᵀ)
+     *
+     * With frequency-domain accumulation, this becomes:
+     *   FFT(x_reconstructed) = Σᵢ FFT(σᵢ·uᵢ) ⊙ FFT(vᵢ)
+     *
+     * By caching FFT(σᵢ·uᵢ) and FFT(vᵢ), reconstruction reduces to:
+     *   - n complex element-wise multiplies (cached FFTs)
+     *   - 1 inverse FFT (instead of n forward + n inverse)
+     *
+     * For n=50 components, this is ~100× faster than naive reconstruction.
+     *
+     * Also pre-allocates W-correlation workspace for ssa_opt_wcorr_matrix_fast().
+     *
+     * Call this after decomposition if you plan to:
+     *   - Call ssa_opt_reconstruct() multiple times with different groups
+     *   - Call ssa_opt_wcorr_matrix_fast()
+     *
+     * Memory cost: ~4 * k * fft_len doubles (typically 1-5 MB)
+     *
+     * @param ssa  Decomposed SSA structure
+     * @return     0 on success, -1 on failure
+     *
+     * Usage:
+     *   ssa_opt_decompose(&ssa, k, 100);
+     *   ssa_opt_cache_ffts(&ssa);  // Optional: speeds up subsequent operations
+     *
+     *   // Now these are faster:
+     *   ssa_opt_reconstruct(&ssa, group1, n1, out1);
+     *   ssa_opt_reconstruct(&ssa, group2, n2, out2);
+     *   ssa_opt_wcorr_matrix_fast(&ssa, W);
+     */
     int ssa_opt_cache_ffts(SSA_Opt *ssa)
     {
         if (!ssa || !ssa->decomposed)
             return -1;
+
+        // Free any existing cache (allows re-caching after new decomposition)
         ssa_opt_free_cached_ffts(ssa);
-        int N = ssa->N, L = ssa->L, K = ssa->K, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len, k = ssa->n_components;
+
+        int N = ssa->N, L = ssa->L, K = ssa->K;
+        int fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
+        int k = ssa->n_components;
+
+        // === Allocate FFT Cache Arrays ===
+        // Each cached FFT is r2c_len complex numbers = 2 * r2c_len doubles
+        // Total: k cached FFTs for U, k cached FFTs for V
         size_t cache_size = 2 * r2c_len * k * sizeof(double);
+
+        // U_fft[i] = FFT(σᵢ · U[:,i]) - scaled left singular vectors
+        // Pre-multiplying by σᵢ saves one multiply per component during reconstruction
         ssa->U_fft = (double *)ssa_opt_alloc(cache_size);
+
+        // V_fft[i] = FFT(V[:,i]) - right singular vectors
         ssa->V_fft = (double *)ssa_opt_alloc(cache_size);
+
         if (!ssa->U_fft || !ssa->V_fft)
         {
             ssa_opt_free_cached_ffts(ssa);
             return -1;
         }
+
+        // === Compute FFT of Each Scaled Left Singular Vector ===
+        // U_fft[i] = FFT(σᵢ · uᵢ)
+        // The σᵢ scaling is baked in so reconstruction just needs element-wise multiply
         for (int i = 0; i < k; i++)
         {
             double sigma = ssa->sigma[i];
-            const double *u_vec = &ssa->U[i * L];
-            double *dst = &ssa->U_fft[i * 2 * r2c_len];
+            const double *u_vec = &ssa->U[i * L];       // u_i has length L
+            double *dst = &ssa->U_fft[i * 2 * r2c_len]; // Destination in cache
+
+            // Zero-pad to FFT length and scale by σᵢ
             ssa_opt_zero(ssa->ws_real, fft_len);
             for (int j = 0; j < L; j++)
                 ssa->ws_real[j] = sigma * u_vec[j];
+
+            // Forward FFT directly into cache
             DftiComputeForward(ssa->fft_r2c, ssa->ws_real, dst);
         }
+
+        // === Compute FFT of Each Right Singular Vector ===
+        // V_fft[i] = FFT(vᵢ)
         for (int i = 0; i < k; i++)
         {
-            const double *v_vec = &ssa->V[i * K];
-            double *dst = &ssa->V_fft[i * 2 * r2c_len];
+            const double *v_vec = &ssa->V[i * K];       // v_i has length K
+            double *dst = &ssa->V_fft[i * 2 * r2c_len]; // Destination in cache
+
+            // Zero-pad to FFT length (no scaling needed for V)
             ssa_opt_zero(ssa->ws_real, fft_len);
             for (int j = 0; j < K; j++)
                 ssa->ws_real[j] = v_vec[j];
+
+            // Forward FFT directly into cache
             DftiComputeForward(ssa->fft_r2c, ssa->ws_real, dst);
         }
-        { // wcorr workspace
+
+        // === Allocate W-Correlation Workspace ===
+        // W-correlation matrix W[i,j] = weighted correlation between components i and j
+        // Fast computation uses DSYRK: W = G · Gᵀ where G is pre-computed weighted matrix
+        // This block pre-allocates all workspace needed by ssa_opt_wcorr_matrix_fast()
+        {
             MKL_LONG status;
-            double scale = 1.0 / fft_len;
+            double scale = 1.0 / fft_len; // IFFT normalization
+
+            // wcorr_ws_complex: workspace for batched FFT output
+            // Holds k complex vectors of length r2c_len
             ssa->wcorr_ws_complex = (double *)ssa_opt_alloc(k * 2 * r2c_len * sizeof(double));
+
+            // wcorr_h: reconstructed components before weighting, k × fft_len
+            // Each row is IFFT(U_fft[i] ⊙ V_fft[i]) = diagonal sums for component i
             ssa->wcorr_h = (double *)ssa_opt_alloc(k * fft_len * sizeof(double));
+
+            // wcorr_G: weighted/normalized matrix for DSYRK, k × N
+            // G[i,t] = (hᵢ[t] / ||hᵢ||_w) · √w[t]
+            // Then W = G · Gᵀ gives the W-correlation matrix directly
             ssa->wcorr_G = (double *)ssa_opt_alloc(k * N * sizeof(double));
+
+            // wcorr_sqrt_inv_c: precomputed √(1/count[t]) for fast weighting
+            // Used to convert raw diagonal sums to weighted values
             ssa->wcorr_sqrt_inv_c = (double *)ssa_opt_alloc(N * sizeof(double));
-            if (!ssa->wcorr_ws_complex || !ssa->wcorr_h || !ssa->wcorr_G || !ssa->wcorr_sqrt_inv_c)
+
+            if (!ssa->wcorr_ws_complex || !ssa->wcorr_h ||
+                !ssa->wcorr_G || !ssa->wcorr_sqrt_inv_c)
             {
                 ssa_opt_free_cached_ffts(ssa);
                 return -1;
             }
+
+            // Pre-compute √(1/count) for each position
+            // count[t] = number of anti-diagonal elements at position t
+            // inv_diag_count[t] = 1/count[t] (already computed in init)
             for (int t = 0; t < N; t++)
                 ssa->wcorr_sqrt_inv_c[t] = sqrt(ssa->inv_diag_count[t]);
+
+            // === Create Batched IFFT Descriptor for W-correlation ===
+            // This descriptor computes k IFFTs in a single MKL call
+            // Used to transform all k component products simultaneously
             status = DftiCreateDescriptor(&ssa->fft_c2r_wcorr, DFTI_DOUBLE, DFTI_REAL, 1, fft_len);
             if (status != 0)
             {
                 ssa_opt_free_cached_ffts(ssa);
                 return -1;
             }
+
+            // Configure as batched C2R (complex-to-real) transform
             DftiSetValue(ssa->fft_c2r_wcorr, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
             DftiSetValue(ssa->fft_c2r_wcorr, DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
+
+            // NUMBER_OF_TRANSFORMS: process all k components in one call
             DftiSetValue(ssa->fft_c2r_wcorr, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)k);
+
+            // INPUT_DISTANCE: stride between consecutive complex inputs
+            // Each input is r2c_len complex numbers (interleaved re/im)
             DftiSetValue(ssa->fft_c2r_wcorr, DFTI_INPUT_DISTANCE, (MKL_LONG)r2c_len);
+
+            // OUTPUT_DISTANCE: stride between consecutive real outputs
+            // Each output is fft_len real numbers
             DftiSetValue(ssa->fft_c2r_wcorr, DFTI_OUTPUT_DISTANCE, (MKL_LONG)fft_len);
+
+            // Apply 1/N scaling to inverse FFT
             DftiSetValue(ssa->fft_c2r_wcorr, DFTI_BACKWARD_SCALE, scale);
+
             status = DftiCommitDescriptor(ssa->fft_c2r_wcorr);
             if (status != 0)
             {
@@ -1711,6 +1818,7 @@ extern "C"
                 return -1;
             }
         }
+
         ssa->fft_cached = true;
         return 0;
     }
@@ -1994,6 +2102,7 @@ extern "C"
         double denom = sqrt(norm_i_sq) * sqrt(norm_j_sq);
         return (denom > 1e-12) ? inner / denom : 0.0;
     }
+
     int ssa_opt_component_stats(const SSA_Opt *ssa, SSA_ComponentStats *stats)
     {
         if (!ssa || !ssa->decomposed || !stats)
@@ -2057,40 +2166,63 @@ extern "C"
         memset(stats, 0, sizeof(SSA_ComponentStats));
     }
 
-    int ssa_opt_find_periodic_pairs(const SSA_Opt *ssa, int *pairs, int max_pairs, double sv_tol, double wcorr_thresh)
+    int ssa_opt_find_periodic_pairs(const SSA_Opt *ssa, int *pairs, int max_pairs,
+                                    double sv_tol, double wcorr_thresh)
     {
         if (!ssa || !ssa->decomposed || !pairs || max_pairs < 1)
             return 0;
+
+        // Default tolerances if not specified
         if (sv_tol <= 0)
-            sv_tol = 0.1;
+            sv_tol = 0.1; // 10% singular value difference allowed
         if (wcorr_thresh <= 0)
-            wcorr_thresh = 0.5;
+            wcorr_thresh = 0.5; // 50% W-correlation minimum
+
         int n = ssa->n_components, n_pairs = 0;
+
+        // Track which components have been paired (each can only be in one pair)
         bool *used = (bool *)calloc(n, sizeof(bool));
         if (!used)
             return 0;
+
+        // Greedy pairing: scan components in order of decreasing singular value
+        // (components are already sorted by σ descending)
         for (int i = 0; i < n - 1 && n_pairs < max_pairs; i++)
         {
             if (used[i])
-                continue;
+                continue; // Already paired
+
+            // Look for a partner among remaining components
             for (int j = i + 1; j < n && n_pairs < max_pairs; j++)
             {
                 if (used[j])
-                    continue;
+                    continue; // Already paired
+
+                // === Test 1: Singular Value Similarity ===
+                // Sine/cosine pairs have nearly equal energy (σᵢ ≈ σⱼ)
+                // Ratio should be close to 1.0
                 double sv_ratio = ssa->sigma[j] / (ssa->sigma[i] + 1e-300);
                 if (fabs(1.0 - sv_ratio) > sv_tol)
-                    continue;
+                    continue; // Singular values too different, not a pair
+
+                // === Test 2: W-Correlation ===
+                // Components representing the same frequency have high W-correlation
+                // (they're "similar" in the weighted inner product sense)
                 double wcorr = fabs(ssa_opt_wcorr_pair(ssa, i, j));
                 if (wcorr < wcorr_thresh)
-                    continue;
+                    continue; // Not correlated enough, not a pair
+
+                // === Found a Pair ===
                 pairs[2 * n_pairs] = i;
                 pairs[2 * n_pairs + 1] = j;
                 used[i] = true;
                 used[j] = true;
                 n_pairs++;
-                break;
+
+                break; // Move to next i (each component pairs with at most one other)
             }
         }
+
         free(used);
         return n_pairs;
     }
@@ -3247,27 +3379,54 @@ extern "C"
 
     int mssa_opt_init(MSSA_Opt *mssa, const double *X, int M, int N, int L)
     {
+        // === Parameter Validation ===
+        // M >= 1: at least one series (M=1 degenerates to standard SSA)
+        // N >= 4: minimum viable length
+        // L >= 2, L <= N-1: same constraints as standard SSA
         if (!mssa || !X || M < 1 || N < 4 || L < 2 || L > N - 1)
             return -1;
+
+        // Zero-initialize entire structure
         memset(mssa, 0, sizeof(MSSA_Opt));
-        mssa->M = M;
-        mssa->N = N;
-        mssa->L = L;
-        mssa->K = N - L + 1;
-        int conv_len = N + mssa->K - 1, fft_n = ssa_opt_next_pow2(conv_len);
+
+        // === Store Dimensions ===
+        mssa->M = M;         // Number of series
+        mssa->N = N;         // Length of each series
+        mssa->L = L;         // Window length
+        mssa->K = N - L + 1; // Number of lagged copies (same for all series)
+
+        // FFT length: same calculation as SSA
+        // Convolution result has length N + K - 1, round to power of 2
+        int conv_len = N + mssa->K - 1;
+        int fft_n = ssa_opt_next_pow2(conv_len);
         mssa->fft_len = fft_n;
-        mssa->r2c_len = fft_n / 2 + 1;
+        mssa->r2c_len = fft_n / 2 + 1; // Hermitian symmetry
+
+        // === Allocate Workspaces ===
+        // Single-vector workspaces (same as SSA)
         mssa->ws_real = (double *)ssa_opt_alloc(fft_n * sizeof(double));
         mssa->ws_complex = (double *)ssa_opt_alloc(2 * mssa->r2c_len * sizeof(double));
+
+        // Batched workspaces: sized for M series (not SSA_BATCH_SIZE)
+        // Used for parallel FFT across all M channels
         mssa->ws_batch_real = (double *)ssa_opt_alloc(M * fft_n * sizeof(double));
         mssa->ws_batch_complex = (double *)ssa_opt_alloc(M * 2 * mssa->r2c_len * sizeof(double));
+
+        // Pre-computed FFT of all M signals
+        // fft_x[m] = FFT(X[m, :]) for each series m
         mssa->fft_x = (double *)ssa_opt_alloc(M * 2 * mssa->r2c_len * sizeof(double));
-        if (!mssa->ws_real || !mssa->ws_complex || !mssa->ws_batch_real || !mssa->ws_batch_complex || !mssa->fft_x)
+
+        if (!mssa->ws_real || !mssa->ws_complex || !mssa->ws_batch_real ||
+            !mssa->ws_batch_complex || !mssa->fft_x)
         {
             mssa_opt_free(mssa);
             return -1;
         }
+
+        // === Create FFT Descriptors ===
         MKL_LONG status;
+
+        // --- Single-vector R2C (for one series at a time) ---
         status = DftiCreateDescriptor(&mssa->fft_r2c, DFTI_DOUBLE, DFTI_REAL, 1, fft_n);
         if (status != 0)
         {
@@ -3281,6 +3440,8 @@ extern "C"
             mssa_opt_free(mssa);
             return -1;
         }
+
+        // --- Single-vector C2R (inverse) ---
         status = DftiCreateDescriptor(&mssa->fft_c2r, DFTI_DOUBLE, DFTI_REAL, 1, fft_n);
         if (status != 0)
         {
@@ -3295,6 +3456,9 @@ extern "C"
             mssa_opt_free(mssa);
             return -1;
         }
+
+        // --- Batched R2C: process all M series in one MKL call ---
+        // Used for parallel Hankel matvec across all channels
         status = DftiCreateDescriptor(&mssa->fft_r2c_batch, DFTI_DOUBLE, DFTI_REAL, 1, fft_n);
         if (status != 0)
         {
@@ -3303,6 +3467,7 @@ extern "C"
         }
         DftiSetValue(mssa->fft_r2c_batch, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
         DftiSetValue(mssa->fft_r2c_batch, DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
+        // NUMBER_OF_TRANSFORMS = M (one FFT per series)
         DftiSetValue(mssa->fft_r2c_batch, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)M);
         DftiSetValue(mssa->fft_r2c_batch, DFTI_INPUT_DISTANCE, (MKL_LONG)fft_n);
         DftiSetValue(mssa->fft_r2c_batch, DFTI_OUTPUT_DISTANCE, (MKL_LONG)mssa->r2c_len);
@@ -3311,6 +3476,8 @@ extern "C"
             mssa_opt_free(mssa);
             return -1;
         }
+
+        // --- Batched C2R: inverse for all M series ---
         status = DftiCreateDescriptor(&mssa->fft_c2r_batch, DFTI_DOUBLE, DFTI_REAL, 1, fft_n);
         if (status != 0)
         {
@@ -3328,18 +3495,33 @@ extern "C"
             mssa_opt_free(mssa);
             return -1;
         }
+
+        // === Pre-compute FFT of All M Signals ===
+        // Each series gets its own cached FFT for fast Hankel matvec
+        // fft_x layout: [FFT(X₀), FFT(X₁), ..., FFT(Xₘ₋₁)]
         for (int m = 0; m < M; m++)
         {
-            double *fft_xm = mssa->fft_x + m * 2 * mssa->r2c_len;
+            double *fft_xm = mssa->fft_x + m * 2 * mssa->r2c_len; // Destination for series m
+
+            // Zero-pad and copy series m
             ssa_opt_zero(mssa->ws_real, fft_n);
-            memcpy(mssa->ws_real, X + m * N, N * sizeof(double));
+            memcpy(mssa->ws_real, X + m * N, N * sizeof(double)); // X[m, :]
+
+            // Compute and store FFT
             DftiComputeForward(mssa->fft_r2c, mssa->ws_real, fft_xm);
         }
+
+        // === Initialize RNG ===
+        // MT19937 for randomized SVD (different BRNG than SSA for variety)
         if (vslNewStream(&mssa->rng, VSL_BRNG_MT19937, 42) != 0)
         {
             mssa_opt_free(mssa);
             return -1;
         }
+
+        // === Pre-compute Diagonal Averaging Weights ===
+        // Same formula as SSA - reconstruction uses same diagonal averaging
+        // (weights are identical for all M series since they have same N, L, K)
         mssa->inv_diag_count = (double *)ssa_opt_alloc(N * sizeof(double));
         if (!mssa->inv_diag_count)
         {
@@ -3351,6 +3533,7 @@ extern "C"
             int count = ssa_opt_min(ssa_opt_min(t + 1, L), ssa_opt_min(mssa->K, N - t));
             mssa->inv_diag_count[t] = (count > 0) ? 1.0 / count : 0.0;
         }
+
         mssa->initialized = true;
         return 0;
     }
