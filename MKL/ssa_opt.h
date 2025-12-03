@@ -102,10 +102,18 @@ extern "C"
     void ssa_opt_free(SSA_Opt *ssa);
     int ssa_opt_decompose(SSA_Opt *ssa, int k, int max_iter);
     int ssa_opt_decompose_block(SSA_Opt *ssa, int k, int block_size, int max_iter);
+
+    // Randomized SVD decomposition - REQUIRES ssa_opt_prepare() first!
+    // Returns -1 if prepare() was not called or if k+oversampling > prepared_kp
     int ssa_opt_decompose_randomized(SSA_Opt *ssa, int k, int oversampling);
+
+    // Pre-allocate workspace for malloc-free hot path (call once before streaming loop)
     int ssa_opt_prepare(SSA_Opt *ssa, int max_k, int oversampling);
     void ssa_opt_free_prepared(SSA_Opt *ssa);
+
+    // Update signal data without reallocation (just memcpy + 1 FFT)
     int ssa_opt_update_signal(SSA_Opt *ssa, const double *new_x);
+
     int ssa_opt_extend(SSA_Opt *ssa, int additional_k, int max_iter);
     int ssa_opt_reconstruct(const SSA_Opt *ssa, const int *group, int n_group, double *output);
     int ssa_opt_cache_ffts(SSA_Opt *ssa);
@@ -648,60 +656,22 @@ extern "C"
         kp = ssa_opt_min(kp, ssa_opt_min(L, K));
         k = ssa_opt_min(k, kp);
 
-        // Check if we can use pre-allocated workspace (HOT PATH - no malloc!)
-        int use_prepared = (ssa->prepared && kp <= ssa->prepared_kp);
+        // Require prepare() to be called first
+        if (!ssa->prepared || kp > ssa->prepared_kp)
+            return -1;
 
-        double *Omega, *Y, *Q, *B, *tau, *B_left, *B_right_T, *S_svd, *work;
-        int *iwork;
-        int lwork;
-
-        if (use_prepared)
-        {
-            // HOT PATH: Reuse pre-allocated workspace
-            Omega = ssa->decomp_Omega;
-            Y = ssa->decomp_Y;
-            Q = ssa->decomp_Q;
-            B = ssa->decomp_B;
-            tau = ssa->decomp_tau;
-            B_left = ssa->decomp_B_left;
-            B_right_T = ssa->decomp_B_right_T;
-            S_svd = ssa->decomp_S;
-            work = ssa->decomp_work;
-            iwork = ssa->decomp_iwork;
-            lwork = ssa->prepared_lwork;
-        }
-        else
-        {
-            // COLD PATH: Allocate workspace
-            Omega = (double *)ssa_opt_alloc(K * kp * sizeof(double));
-            Y = (double *)ssa_opt_alloc(L * kp * sizeof(double));
-            Q = (double *)ssa_opt_alloc(L * kp * sizeof(double));
-            B = (double *)ssa_opt_alloc(K * kp * sizeof(double));
-            tau = (double *)ssa_opt_alloc(kp * sizeof(double));
-            B_left = (double *)ssa_opt_alloc(K * kp * sizeof(double));
-            B_right_T = (double *)ssa_opt_alloc(kp * kp * sizeof(double));
-            S_svd = (double *)ssa_opt_alloc(kp * sizeof(double));
-            iwork = (int *)ssa_opt_alloc(8 * kp * sizeof(int));
-            double work_query;
-            lwork = -1;
-            LAPACKE_dgesdd_work(LAPACK_COL_MAJOR, 'S', K, kp, B, K, S_svd, B_left, K, B_right_T, kp, &work_query, lwork, iwork);
-            lwork = (int)work_query + 1;
-            work = (double *)ssa_opt_alloc(lwork * sizeof(double));
-            if (!Omega || !Y || !Q || !B || !tau || !B_left || !B_right_T || !S_svd || !iwork || !work)
-            {
-                ssa_opt_free_ptr(Omega);
-                ssa_opt_free_ptr(Y);
-                ssa_opt_free_ptr(Q);
-                ssa_opt_free_ptr(B);
-                ssa_opt_free_ptr(tau);
-                ssa_opt_free_ptr(B_left);
-                ssa_opt_free_ptr(B_right_T);
-                ssa_opt_free_ptr(S_svd);
-                ssa_opt_free_ptr(iwork);
-                ssa_opt_free_ptr(work);
-                return -1;
-            }
-        }
+        // Use pre-allocated workspace (no malloc in hot path)
+        double *Omega = ssa->decomp_Omega;
+        double *Y = ssa->decomp_Y;
+        double *Q = ssa->decomp_Q;
+        double *B = ssa->decomp_B;
+        double *tau = ssa->decomp_tau;
+        double *B_left = ssa->decomp_B_left;
+        double *B_right_T = ssa->decomp_B_right_T;
+        double *S_svd = ssa->decomp_S;
+        double *work = ssa->decomp_work;
+        int *iwork = ssa->decomp_iwork;
+        int lwork = ssa->prepared_lwork;
 
         // Allocate/reallocate results (only if size changed)
         if (!ssa->U || !ssa->V || !ssa->sigma || ssa->n_components != k)
@@ -715,27 +685,12 @@ extern "C"
             ssa->sigma = (double *)ssa_opt_alloc(k * sizeof(double));
             ssa->eigenvalues = (double *)ssa_opt_alloc(k * sizeof(double));
             if (!ssa->U || !ssa->V || !ssa->sigma || !ssa->eigenvalues)
-            {
-                if (!use_prepared)
-                {
-                    ssa_opt_free_ptr(Omega);
-                    ssa_opt_free_ptr(Y);
-                    ssa_opt_free_ptr(Q);
-                    ssa_opt_free_ptr(B);
-                    ssa_opt_free_ptr(tau);
-                    ssa_opt_free_ptr(B_left);
-                    ssa_opt_free_ptr(B_right_T);
-                    ssa_opt_free_ptr(S_svd);
-                    ssa_opt_free_ptr(iwork);
-                    ssa_opt_free_ptr(work);
-                }
                 return -1;
-            }
         }
         ssa->n_components = k;
         ssa->total_variance = 0.0;
 
-        // === ACTUAL SVD COMPUTATION (same as before) ===
+        // === SVD COMPUTATION ===
         vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, ssa->rng, K * kp, Omega, 0.0, 1.0);
         ssa_opt_hankel_matvec_block(ssa, Omega, Y, kp);
         cblas_dcopy(L * kp, Y, 1, Q, 1);
@@ -744,22 +699,7 @@ extern "C"
         ssa_opt_hankel_matvec_T_block(ssa, Q, B, kp);
         int info = LAPACKE_dgesdd_work(LAPACK_COL_MAJOR, 'S', K, kp, B, K, S_svd, B_left, K, B_right_T, kp, work, lwork, iwork);
         if (info != 0)
-        {
-            if (!use_prepared)
-            {
-                ssa_opt_free_ptr(Omega);
-                ssa_opt_free_ptr(Y);
-                ssa_opt_free_ptr(Q);
-                ssa_opt_free_ptr(B);
-                ssa_opt_free_ptr(tau);
-                ssa_opt_free_ptr(B_left);
-                ssa_opt_free_ptr(B_right_T);
-                ssa_opt_free_ptr(S_svd);
-                ssa_opt_free_ptr(iwork);
-                ssa_opt_free_ptr(work);
-            }
             return -1;
-        }
         cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans, L, k, kp, 1.0, Q, L, B_right_T, kp, 0.0, ssa->U, L);
         for (int i = 0; i < k; i++)
             cblas_dcopy(K, &B_left[i * K], 1, &ssa->V[i * K], 1);
@@ -781,20 +721,6 @@ extern "C"
             }
         }
 
-        // Only free if we allocated (COLD PATH)
-        if (!use_prepared)
-        {
-            ssa_opt_free_ptr(Omega);
-            ssa_opt_free_ptr(Y);
-            ssa_opt_free_ptr(Q);
-            ssa_opt_free_ptr(B);
-            ssa_opt_free_ptr(tau);
-            ssa_opt_free_ptr(B_left);
-            ssa_opt_free_ptr(B_right_T);
-            ssa_opt_free_ptr(S_svd);
-            ssa_opt_free_ptr(iwork);
-            ssa_opt_free_ptr(work);
-        }
         ssa->decomposed = true;
         return 0;
     }

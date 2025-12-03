@@ -30,32 +30,6 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Union, Tuple
 
-print(f"Python: {sys.version}")
-print(f"Platform: {sys.platform}")
-
-# Check if ssa.dll exists
-dll_path = Path(__file__).parent / "ssa.dll"
-print(f"Looking for: {dll_path}")
-print(f"Exists: {dll_path.exists()}")
-
-# Check MKL paths
-mkl_paths = [
-    r"C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin",
-    r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin",
-]
-for p in mkl_paths:
-    print(f"MKL path {p}: exists={os.path.exists(p)}")
-    if os.path.exists(p):
-        os.add_dll_directory(p)
-
-# Try loading directly
-import ctypes
-try:
-    lib = ctypes.CDLL(str(dll_path))
-    print("SUCCESS!")
-except OSError as e:
-    print(f"FAILED: {e}")
-
 # ============================================================================
 # Windows MKL DLL paths (must be set BEFORE loading the library)
 # ============================================================================
@@ -143,6 +117,16 @@ _lib.ssa_opt_decompose_block.restype = ctypes.c_int
 
 _lib.ssa_opt_decompose_randomized.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int]
 _lib.ssa_opt_decompose_randomized.restype = ctypes.c_int
+
+# Malloc-free hot path functions
+_lib.ssa_opt_prepare.argtypes = [ctypes.POINTER(_SSA_Opt), ctypes.c_int, ctypes.c_int]
+_lib.ssa_opt_prepare.restype = ctypes.c_int
+
+_lib.ssa_opt_update_signal.argtypes = [ctypes.POINTER(_SSA_Opt), c_double_p]
+_lib.ssa_opt_update_signal.restype = ctypes.c_int
+
+_lib.ssa_opt_free_prepared.argtypes = [ctypes.POINTER(_SSA_Opt)]
+_lib.ssa_opt_free_prepared.restype = None
 
 _lib.ssa_opt_reconstruct.argtypes = [ctypes.POINTER(_SSA_Opt), c_int_p, ctypes.c_int, c_double_p]
 _lib.ssa_opt_reconstruct.restype = ctypes.c_int
@@ -254,6 +238,9 @@ class SSA:
         self.K = self.N - L + 1
         self.n_components = 0
         self._decomposed = False
+        self._prepared = False
+        self._prepared_k = 0
+        self._prepared_oversampling = 0
         
         x_ptr = self._x.ctypes.data_as(c_double_p)
         ret = _lib.ssa_opt_init(ctypes.byref(self._ctx), x_ptr, self.N, L)
@@ -263,6 +250,59 @@ class SSA:
     def __del__(self):
         if hasattr(self, '_ctx'):
             _lib.ssa_opt_free(ctypes.byref(self._ctx))
+    
+    def prepare(self, max_k: int, oversampling: int = 8) -> "SSA":
+        """
+        Pre-allocate workspace for malloc-free hot path.
+        
+        Call this once before a streaming loop to eliminate allocations
+        from decompose_randomized(). Workspace supports k <= max_k.
+        
+        Parameters
+        ----------
+        max_k : int
+            Maximum number of components to support
+        oversampling : int
+            Oversampling parameter (default 8)
+        
+        Returns
+        -------
+        self : for method chaining
+        """
+        ret = _lib.ssa_opt_prepare(ctypes.byref(self._ctx), max_k, oversampling)
+        if ret != 0:
+            raise RuntimeError(f"prepare() failed (max_k={max_k})")
+        self._prepared = True
+        self._prepared_k = max_k
+        self._prepared_oversampling = oversampling
+        return self
+    
+    def update_signal(self, new_x: np.ndarray) -> "SSA":
+        """
+        Update signal data without reallocation.
+        
+        For streaming applications: just memcpy + 1 FFT, no malloc.
+        
+        Parameters
+        ----------
+        new_x : array-like
+            New signal data (must be same length as original)
+        
+        Returns
+        -------
+        self : for method chaining
+        """
+        new_x = np.ascontiguousarray(new_x, dtype=np.float64)
+        if len(new_x) != self.N:
+            raise ValueError(f"Signal length mismatch: {len(new_x)} vs {self.N}")
+        
+        x_ptr = new_x.ctypes.data_as(c_double_p)
+        ret = _lib.ssa_opt_update_signal(ctypes.byref(self._ctx), x_ptr)
+        if ret != 0:
+            raise RuntimeError("update_signal() failed")
+        
+        self._x = new_x
+        return self
     
     def decompose(self, k: int, method: str = "randomized", **kwargs) -> "SSA":
         """
@@ -285,6 +325,12 @@ class SSA:
         """
         if method == "randomized":
             oversampling = kwargs.get("oversampling", 8)
+            
+            # Auto-prepare if not already done or if k+oversampling exceeds prepared size
+            kp = k + oversampling
+            if not self._prepared or kp > self._prepared_k + self._prepared_oversampling:
+                self.prepare(k, oversampling)
+            
             ret = _lib.ssa_opt_decompose_randomized(ctypes.byref(self._ctx), k, oversampling)
         elif method == "block":
             block_size = kwargs.get("block_size", min(k, 32))
@@ -699,12 +745,19 @@ if __name__ == "__main__":
     pairs = ssa.find_periodic_pairs()
     print(f"  Periodic pairs found: {pairs}")
     
+    # Test streaming update
+    print("\n  Testing streaming updates...")
+    new_signal = signal + 0.1 * np.random.randn(500)
+    ssa.update_signal(new_signal)
+    ssa.decompose(k=20)
+    print(f"  After update - variance explained: {ssa.variance_explained(0, 2):.2%}")
+    
     # Test MSSA
     X = np.array([signal, 0.9*signal + 0.3*np.random.randn(500)])
     mssa = MSSA(X, L=100)
     mssa.decompose(k=10)
     
-    print(f"  MSSA variance explained (first 3): {mssa.variance_explained(0, 2):.2%}")
+    print(f"\n  MSSA variance explained (first 3): {mssa.variance_explained(0, 2):.2%}")
     
     contrib = mssa.series_contributions()
     print(f"  Series contributions shape: {contrib.shape}")

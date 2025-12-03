@@ -17,6 +17,7 @@
 
 #define SSA_OPT_IMPLEMENTATION
 #include "ssa_opt.h"
+#include "mkl_config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -247,10 +248,12 @@ void test_decomposition_randomized(void)
 
     SSA_Opt ssa;
     ssa_opt_init(&ssa, x, N, L);
+    ssa_opt_prepare(&ssa, k, 8);  // Pre-allocate workspace
     int ret = ssa_opt_decompose_randomized(&ssa, k, 8);
 
     ASSERT_EQ(ret, 0, "decompose_randomized returns 0");
     ASSERT_TRUE(ssa.decomposed, "decomposed flag set");
+    ASSERT_TRUE(ssa.prepared, "prepared flag set");
     ASSERT_EQ(ssa.n_components, k, "n_components correct");
 
     // Singular values should be positive and sorted
@@ -809,10 +812,11 @@ void benchmark_decomposition_methods(void)
         ssa_opt_free(&ssa);
     }
 
-    // Randomized SVD
+    // Randomized SVD (with prepared workspace)
     {
         SSA_Opt ssa;
         ssa_opt_init(&ssa, x, N, L);
+        ssa_opt_prepare(&ssa, k, 8);  // Pre-allocate workspace
         double t0 = get_time_ms();
         ssa_opt_decompose_randomized(&ssa, k, 8);
         double t1 = get_time_ms();
@@ -822,6 +826,63 @@ void benchmark_decomposition_methods(void)
     }
 
     free(x);
+}
+
+void benchmark_streaming(void)
+{
+    if (!g_benchmarks)
+        return;
+
+    printf("\n  === Streaming Updates (Malloc-Free Hot Path) ===\n");
+
+    int N = 10000;
+    int L = N / 4;
+    int k = 30;
+    int n_iterations = 100;
+
+    g_seed = 22222;
+    double *x = (double *)malloc(N * sizeof(double));
+    generate_signal(x, N);
+    double *output = (double *)malloc(N * sizeof(double));
+    int *group = (int *)malloc(k * sizeof(int));
+    for (int i = 0; i < k; i++) group[i] = i;
+
+    printf("  N=%d, L=%d, k=%d, iterations=%d\n\n", N, L, k, n_iterations);
+
+    // Setup once with prepare
+    SSA_Opt ssa;
+    ssa_opt_init(&ssa, x, N, L);
+    ssa_opt_prepare(&ssa, k, 8);
+
+    // Warmup
+    ssa_opt_decompose_randomized(&ssa, k, 8);
+    ssa_opt_reconstruct(&ssa, group, k, output);
+
+    // Timed streaming loop
+    double t0 = get_time_ms();
+    for (int iter = 0; iter < n_iterations; iter++)
+    {
+        // Simulate new data arriving
+        x[0] += 0.001;
+
+        ssa_opt_update_signal(&ssa, x);
+        ssa_opt_decompose_randomized(&ssa, k, 8);
+        ssa_opt_reconstruct(&ssa, group, k, output);
+    }
+    double t1 = get_time_ms();
+
+    double total_ms = t1 - t0;
+    double per_iter = total_ms / n_iterations;
+    double throughput = 1000.0 / per_iter;
+
+    printf("  Total time: %.1f ms\n", total_ms);
+    printf("  Per iteration: %.3f ms\n", per_iter);
+    printf("  Throughput: %.0f updates/sec\n", throughput);
+
+    ssa_opt_free(&ssa);
+    free(x);
+    free(output);
+    free(group);
 }
 
 // ============================================================================
@@ -841,6 +902,10 @@ int main(int argc, char **argv)
     printf("==========================================\n");
     printf("   SSA R2C Optimized Test (Intel MKL)\n");
     printf("==========================================\n");
+
+    // Initialize MKL with optimal settings
+    printf("\n--- MKL Configuration ---\n");
+    mkl_config_ssa_full(1);  // Verbose output
 
     // Functional tests
     RUN_TEST(test_initialization);
@@ -863,6 +928,7 @@ int main(int argc, char **argv)
         printf("\n=== Benchmarks ===");
         benchmark_decomposition();
         benchmark_decomposition_methods();
+        benchmark_streaming();
         benchmark_matvec_throughput();
         benchmark_reconstruction_scaling();
         benchmark_memory_efficiency();

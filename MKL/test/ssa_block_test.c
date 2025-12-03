@@ -86,7 +86,7 @@ int main(void)
     // Step 1: Initialize MKL with optimal settings
     // =========================================================================
     printf("--- MKL Configuration ---\n");
-    mkl_config_ssa_full(1);  // Verbose output
+    mkl_config_ssa_full(1); // Verbose output
 
     // =========================================================================
     // Step 2: Setup test parameters
@@ -106,7 +106,7 @@ int main(void)
     printf("block_size = %d\n", block_size);
     printf("max_iter = %d\n", max_iter);
     printf("oversampling = %d\n", oversampling);
-    
+
     // Check if problem fits in cache
     size_t mem_est = mkl_config_ssa_memory_estimate(N, L, k);
     printf("\nEstimated memory: %.2f MB\n", mem_est / (1024.0 * 1024.0));
@@ -145,7 +145,7 @@ int main(void)
     // Test 1: Sequential Decomposition
     // =========================================================================
     printf("=== Test 1: Sequential Power Iteration ===\n");
-    
+
     SSA_Opt ssa_seq = {0};
     ssa_opt_init(&ssa_seq, x, N, L);
 
@@ -167,7 +167,7 @@ int main(void)
     // Test 2: Block Decomposition
     // =========================================================================
     printf("=== Test 2: Block Power Iteration ===\n");
-    
+
     SSA_Opt ssa_block = {0};
     ssa_opt_init(&ssa_block, x, N, L);
 
@@ -190,9 +190,10 @@ int main(void)
     // Test 3: Randomized SVD
     // =========================================================================
     printf("=== Test 3: Randomized SVD ===\n");
-    
+
     SSA_Opt ssa_rand = {0};
     ssa_opt_init(&ssa_rand, x, N, L);
+    ssa_opt_prepare(&ssa_rand, k, oversampling); // Required for randomized SVD
 
     t0 = get_time_ms();
     ssa_opt_decompose_randomized(&ssa_rand, k, oversampling);
@@ -213,7 +214,7 @@ int main(void)
     // Test 4: W-Correlation with/without cached FFTs
     // =========================================================================
     printf("=== Test 4: W-Correlation (Cached FFT Optimization) ===\n");
-    
+
     double *W = (double *)mkl_malloc(k * k * sizeof(double), 64);
 
     // Without cache
@@ -239,7 +240,8 @@ int main(void)
     for (int i = 0; i < k; i++)
     {
         double err = fabs(W[i * k + i] - 1.0);
-        if (err > max_diag_err) max_diag_err = err;
+        if (err > max_diag_err)
+            max_diag_err = err;
     }
     printf("W-correlation diagonal max error: %.2e\n\n", max_diag_err);
 
@@ -247,31 +249,32 @@ int main(void)
     // Test 5: Multiple W-correlation calls (cache benefit)
     // =========================================================================
     printf("=== Test 5: Repeated W-Correlation (Cache Stress Test) ===\n");
-    
+
     int n_repeats = 10;
-    
+
     // Fresh SSA without cache
     SSA_Opt ssa_fresh = {0};
     ssa_opt_init(&ssa_fresh, x, N, L);
+    ssa_opt_prepare(&ssa_fresh, k, oversampling); // Required for randomized SVD
     ssa_opt_decompose_randomized(&ssa_fresh, k, oversampling);
-    
+
     t0 = get_time_ms();
     for (int r = 0; r < n_repeats; r++)
     {
         ssa_opt_wcorr_matrix(&ssa_fresh, W);
     }
     double t_nocache_total = get_time_ms() - t0;
-    
+
     // With cache
     ssa_opt_cache_ffts(&ssa_fresh);
-    
+
     t0 = get_time_ms();
     for (int r = 0; r < n_repeats; r++)
     {
         ssa_opt_wcorr_matrix(&ssa_fresh, W);
     }
     double t_cached_total = get_time_ms() - t0;
-    
+
     printf("%d W-correlation calls (no cache): %.2f ms\n", n_repeats, t_nocache_total);
     printf("%d W-correlation calls (cached):   %.2f ms\n", n_repeats, t_cached_total);
     printf("Total speedup: %.2fx\n\n", t_nocache_total / t_cached_total);
@@ -282,31 +285,31 @@ int main(void)
     // Test 6: Streaming Updates (Malloc-Free Hot Path)
     // =========================================================================
     printf("=== Test 6: Streaming Updates ===\n");
-    
+
     int n_hot_iterations = 100;
     double *x_copy = (double *)mkl_malloc(N * sizeof(double), 64);
     memcpy(x_copy, x, N * sizeof(double));
-    
+
     // Setup once with prepare
     SSA_Opt ssa_hot = {0};
     ssa_opt_init(&ssa_hot, x_copy, N, L);
-    ssa_opt_prepare(&ssa_hot, k, oversampling);  // Pre-allocate workspace
-    
+    ssa_opt_prepare(&ssa_hot, k, oversampling); // Pre-allocate workspace
+
     t0 = get_time_ms();
     for (int iter = 0; iter < n_hot_iterations; iter++)
     {
         // Simulate new data arriving
         x_copy[0] += 0.001;
-        
-        ssa_opt_update_signal(&ssa_hot, x_copy);  // Just memcpy + 1 FFT
-        ssa_opt_decompose_randomized(&ssa_hot, k, oversampling);  // Reuses workspace
+
+        ssa_opt_update_signal(&ssa_hot, x_copy);                 // Just memcpy + 1 FFT
+        ssa_opt_decompose_randomized(&ssa_hot, k, oversampling); // Reuses workspace
         ssa_opt_reconstruct(&ssa_hot, group_all, k, recon_rand);
     }
     double t_streaming = get_time_ms() - t0;
-    printf("Streaming updates (%d iterations): %.2f ms (%.3f ms/iter)\n", 
+    printf("Streaming updates (%d iterations): %.2f ms (%.3f ms/iter)\n",
            n_hot_iterations, t_streaming, t_streaming / n_hot_iterations);
     printf("Throughput: %.1f updates/sec\n\n", n_hot_iterations / (t_streaming / 1000.0));
-    
+
     ssa_opt_free(&ssa_hot);
     mkl_free(x_copy);
 
@@ -319,22 +322,22 @@ int main(void)
     printf("%-25s %10s %10s %10s\n", "Method", "Time (ms)", "Speedup", "Corr");
     printf("------------------------------------------------------------\n");
     printf("%-25s %10.2f %10s %10.6f\n", "Sequential", t_seq, "1.00x", corr_seq);
-    printf("%-25s %10.2f %10.2fx %10.6f\n", "Block", t_block, t_seq/t_block, corr_block);
-    printf("%-25s %10.2f %10.2fx %10.6f\n", "Randomized", t_rand, t_seq/t_rand, corr_rand);
+    printf("%-25s %10.2f %10.2fx %10.6f\n", "Block", t_block, t_seq / t_block, corr_block);
+    printf("%-25s %10.2f %10.2fx %10.6f\n", "Randomized", t_rand, t_seq / t_rand, corr_rand);
     printf("------------------------------------------------------------\n");
     printf("%-25s %10.2f %10s\n", "W-corr (no cache)", t_wcorr_nocache, "-");
-    printf("%-25s %10.2f %10.2fx\n", "W-corr (cached)", t_wcorr_cached, t_wcorr_nocache/t_wcorr_cached);
+    printf("%-25s %10.2f %10.2fx\n", "W-corr (cached)", t_wcorr_cached, t_wcorr_nocache / t_wcorr_cached);
     printf("------------------------------------------------------------\n");
-    printf("%-25s %10.2f %10s\n", "Streaming (per iter)", t_streaming/n_hot_iterations, "-");
+    printf("%-25s %10.2f %10s\n", "Streaming (per iter)", t_streaming / n_hot_iterations, "-");
     printf("============================================================\n\n");
 
     // =========================================================================
     // Verification
     // =========================================================================
     printf("--- Verification ---\n");
-    
+
     int pass = 1;
-    
+
     // Check reconstruction correlations
     if (corr_seq < 0.99)
     {
@@ -351,36 +354,36 @@ int main(void)
         printf("[FAIL] Randomized reconstruction correlation < 0.99\n");
         pass = 0;
     }
-    
+
     // Check method agreement
     double corr_seq_block = correlation(recon_seq, recon_block, N);
     double corr_seq_rand = correlation(recon_seq, recon_rand, N);
-    
+
     if (corr_seq_block < 0.999)
     {
         printf("[FAIL] Sequential vs Block correlation < 0.999 (%.6f)\n", corr_seq_block);
         pass = 0;
     }
-    if (corr_seq_rand < 0.99)  // Randomized has more variance
+    if (corr_seq_rand < 0.99) // Randomized has more variance
     {
         printf("[FAIL] Sequential vs Randomized correlation < 0.99 (%.6f)\n", corr_seq_rand);
         pass = 0;
     }
-    
+
     // Check W-correlation validity
     if (max_diag_err > 1e-6)
     {
         printf("[FAIL] W-correlation diagonal error > 1e-6\n");
         pass = 0;
     }
-    
+
     // Check speedups are positive
     if (t_seq / t_rand < 1.5)
     {
         printf("[WARN] Randomized SVD speedup < 1.5x (may be expected for small k)\n");
     }
-    
-    
+
+
     if (pass)
     {
         printf("[PASS] All tests passed!\n");
@@ -392,7 +395,7 @@ int main(void)
     ssa_opt_free(&ssa_seq);
     ssa_opt_free(&ssa_block);
     ssa_opt_free(&ssa_rand);
-    
+
     mkl_free(x);
     mkl_free(recon_seq);
     mkl_free(recon_block);
