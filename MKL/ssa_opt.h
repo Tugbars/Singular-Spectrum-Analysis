@@ -129,6 +129,14 @@ extern "C"
     int ssa_opt_forecast(const SSA_Opt *ssa, const int *group, int n_group, int n_forecast, double *output);
     int ssa_opt_forecast_full(const SSA_Opt *ssa, const int *group, int n_group, int n_forecast, double *output);
     int ssa_opt_forecast_with_lrf(const SSA_LRF *lrf, const double *base_signal, int base_len, int n_forecast, double *output);
+
+    // Vector forecast (V-forecast) - alternative to recurrent forecast
+    // Projects onto eigenvector subspace at each step instead of using LRR
+    int ssa_opt_vforecast(const SSA_Opt *ssa, const int *group, int n_group, int n_forecast, double *output);
+    int ssa_opt_vforecast_full(const SSA_Opt *ssa, const int *group, int n_group, int n_forecast, double *output);
+    int ssa_opt_vforecast_fast(const SSA_Opt *ssa, const int *group, int n_group,
+                               const double *base_signal, int base_len, int n_forecast, double *output);
+
     int mssa_opt_init(MSSA_Opt *mssa, const double *X, int M, int N, int L);
     int mssa_opt_decompose(MSSA_Opt *mssa, int k, int oversampling);
     int mssa_opt_reconstruct(const MSSA_Opt *mssa, int series_idx, const int *group, int n_group, double *output);
@@ -1609,6 +1617,205 @@ extern "C"
         int result = ssa_opt_forecast_with_lrf(&lrf, output, N, n_forecast, output + N);
         ssa_opt_lrf_free(&lrf);
         return result;
+    }
+
+    // ========================================================================
+    // Vector Forecast (V-forecast)
+    // ========================================================================
+    // Alternative to recurrent forecast. Instead of precomputing LRR coefficients,
+    // V-forecast projects directly onto eigenvector subspace at each step.
+    //
+    // Formula: x_new = (1/(1-ν²)) * Σ_i π_i * (U_trunc_i · z)
+    // where:
+    //   z = last L-1 values of signal
+    //   U_trunc_i = eigenvector i without last element
+    //   π_i = last element of eigenvector i
+    //   ν² = Σ π_i²
+    //
+    // Advantages over R-forecast:
+    //   - Can be more numerically stable for long forecasts
+    //   - Natural extension to weighted/oblique variants
+    //   - No need to store LRR coefficients
+    // ========================================================================
+
+    int ssa_opt_vforecast(const SSA_Opt *ssa, const int *group, int n_group, int n_forecast, double *output)
+    {
+        if (!ssa || !ssa->decomposed || !group || !output || n_group < 1 || n_forecast < 1)
+            return -1;
+        int N = ssa->N, L = ssa->L;
+
+        // Compute verticality ν² = Σ π_i²
+        double nu_sq = 0.0;
+        for (int g = 0; g < n_group; g++)
+        {
+            int idx = group[g];
+            if (idx < 0 || idx >= ssa->n_components)
+                return -1;
+            double pi_i = ssa->U[idx * L + (L - 1)];
+            nu_sq += pi_i * pi_i;
+        }
+        if (nu_sq >= 1.0 - 1e-10)
+            return -1; // Not forecastable (vertical eigenvectors)
+        double scale = 1.0 / (1.0 - nu_sq);
+
+        // Get reconstructed signal and allocate space for forecasts
+        double *signal = (double *)ssa_opt_alloc((N + n_forecast) * sizeof(double));
+        if (!signal)
+            return -1;
+        if (ssa_opt_reconstruct(ssa, group, n_group, signal) != 0)
+        {
+            ssa_opt_free_ptr(signal);
+            return -1;
+        }
+
+        // V-forecast loop
+        for (int h = 0; h < n_forecast; h++)
+        {
+            double *z = &signal[N + h - (L - 1)]; // Last L-1 values
+            double x_new = 0.0;
+
+            // For each component in group: x_new += π_i * (U_trunc_i · z)
+            for (int g = 0; g < n_group; g++)
+            {
+                int idx = group[g];
+                const double *u_col = &ssa->U[idx * L];
+                double pi_i = u_col[L - 1];
+
+                // Inner product of U_trunc (first L-1 elements) with z
+                double dot = 0.0;
+                for (int j = 0; j < L - 1; j++)
+                {
+                    dot += u_col[j] * z[j];
+                }
+                x_new += pi_i * dot;
+            }
+            x_new *= scale;
+
+            signal[N + h] = x_new;
+            output[h] = x_new;
+        }
+
+        ssa_opt_free_ptr(signal);
+        return 0;
+    }
+
+    int ssa_opt_vforecast_full(const SSA_Opt *ssa, const int *group, int n_group, int n_forecast, double *output)
+    {
+        if (!ssa || !ssa->decomposed || !group || !output || n_group < 1 || n_forecast < 1)
+            return -1;
+        int N = ssa->N, L = ssa->L;
+
+        // Compute verticality
+        double nu_sq = 0.0;
+        for (int g = 0; g < n_group; g++)
+        {
+            int idx = group[g];
+            if (idx < 0 || idx >= ssa->n_components)
+                return -1;
+            double pi_i = ssa->U[idx * L + (L - 1)];
+            nu_sq += pi_i * pi_i;
+        }
+        if (nu_sq >= 1.0 - 1e-10)
+            return -1;
+        double scale = 1.0 / (1.0 - nu_sq);
+
+        // Reconstruct into output buffer (first N values)
+        if (ssa_opt_reconstruct(ssa, group, n_group, output) != 0)
+            return -1;
+
+        // V-forecast loop (appending to output)
+        for (int h = 0; h < n_forecast; h++)
+        {
+            double *z = &output[N + h - (L - 1)];
+            double x_new = 0.0;
+
+            for (int g = 0; g < n_group; g++)
+            {
+                int idx = group[g];
+                const double *u_col = &ssa->U[idx * L];
+                double pi_i = u_col[L - 1];
+
+                double dot = 0.0;
+                for (int j = 0; j < L - 1; j++)
+                {
+                    dot += u_col[j] * z[j];
+                }
+                x_new += pi_i * dot;
+            }
+            x_new *= scale;
+            output[N + h] = x_new;
+        }
+
+        return 0;
+    }
+
+    // Optimized V-forecast for hot path - uses BLAS for inner products
+    int ssa_opt_vforecast_fast(const SSA_Opt *ssa, const int *group, int n_group,
+                               const double *base_signal, int base_len, int n_forecast, double *output)
+    {
+        if (!ssa || !ssa->decomposed || !group || !base_signal || !output)
+            return -1;
+        if (n_group < 1 || n_forecast < 1 || base_len < ssa->L - 1)
+            return -1;
+        int L = ssa->L;
+
+        // Precompute π values and ν²
+        double *pi = (double *)ssa_opt_alloc(n_group * sizeof(double));
+        if (!pi)
+            return -1;
+        double nu_sq = 0.0;
+        for (int g = 0; g < n_group; g++)
+        {
+            int idx = group[g];
+            if (idx < 0 || idx >= ssa->n_components)
+            {
+                ssa_opt_free_ptr(pi);
+                return -1;
+            }
+            pi[g] = ssa->U[idx * L + (L - 1)];
+            nu_sq += pi[g] * pi[g];
+        }
+        if (nu_sq >= 1.0 - 1e-10)
+        {
+            ssa_opt_free_ptr(pi);
+            return -1;
+        }
+        double scale = 1.0 / (1.0 - nu_sq);
+
+        // Working buffer for signal extension
+        int window = L - 1;
+        double *buffer = (double *)ssa_opt_alloc((window + n_forecast) * sizeof(double));
+        if (!buffer)
+        {
+            ssa_opt_free_ptr(pi);
+            return -1;
+        }
+
+        // Copy last L-1 values of base signal
+        memcpy(buffer, &base_signal[base_len - window], window * sizeof(double));
+
+        // V-forecast loop with BLAS
+        for (int h = 0; h < n_forecast; h++)
+        {
+            double *z = &buffer[h];
+            double x_new = 0.0;
+
+            for (int g = 0; g < n_group; g++)
+            {
+                int idx = group[g];
+                // BLAS dot product: U_trunc · z
+                double dot = cblas_ddot(window, &ssa->U[idx * L], 1, z, 1);
+                x_new += pi[g] * dot;
+            }
+            x_new *= scale;
+
+            buffer[window + h] = x_new;
+            output[h] = x_new;
+        }
+
+        ssa_opt_free_ptr(pi);
+        ssa_opt_free_ptr(buffer);
+        return 0;
     }
 
     int ssa_opt_get_trend(const SSA_Opt *ssa, double *output)
