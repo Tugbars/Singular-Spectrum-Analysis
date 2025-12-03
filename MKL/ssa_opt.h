@@ -947,53 +947,166 @@ extern "C"
         ssa->prepared = false;
     }
 
+    /**
+     * Pre-allocate all workspace for randomized SVD decomposition.
+     *
+     * This enables the "malloc-free hot path" - after calling prepare(),
+     * subsequent calls to ssa_opt_decompose_randomized() do ZERO memory
+     * allocations. This is critical for:
+     *   - Real-time trading systems (no allocation jitter)
+     *   - Streaming applications (deterministic latency)
+     *   - High-frequency repeated decomposition
+     *
+     * The workspace is sized for the randomized SVD algorithm:
+     *   1. Random projection: Y = H·Ω  where Ω is K×(k+p) Gaussian
+     *   2. QR factorization: Q = orth(Y)
+     *   3. Small projection: B = Hᵀ·Q
+     *   4. Small SVD: B = U_B·Σ·V_Bᵀ via LAPACK DGESDD
+     *   5. Recovery: U = Q·V_B
+     *
+     * @param ssa          Initialized SSA structure
+     * @param max_k        Maximum number of components to extract
+     * @param oversampling Extra random vectors for accuracy (default 8 if <=0)
+     * @return             0 on success, -1 on failure
+     *
+     * Usage:
+     *   ssa_opt_init(&ssa, x, N, L);
+     *   ssa_opt_prepare(&ssa, 30, 8);  // Prepare for up to k=30 components
+     *
+     *   // Streaming loop - no malloc in this loop
+     *   while (new_data_available()) {
+     *       ssa_opt_update_signal(&ssa, new_x);
+     *       ssa_opt_decompose_randomized(&ssa, 30, 8);  // Uses pre-allocated buffers
+     *       ssa_opt_reconstruct(&ssa, group, n, output);
+     *   }
+     */
     int ssa_opt_prepare(SSA_Opt *ssa, int max_k, int oversampling)
     {
+        // === Validation ===
         if (!ssa || !ssa->initialized || max_k < 1)
             return -1;
+
+        // Free any previous preparation (allows re-prepare with different k)
         ssa_opt_free_prepared(ssa);
+
         int L = ssa->L, K = ssa->K;
+
+        // === Compute Dimensions ===
+        // Oversampling p: extra random vectors beyond k for numerical stability
+        // Theory says p=5-10 gives near-optimal accuracy; default to 8
         int p = (oversampling <= 0) ? 8 : oversampling;
+
+        // Total random vectors: k + p
+        // But can't exceed matrix rank = min(L, K)
         int kp = max_k + p;
         kp = ssa_opt_min(kp, ssa_opt_min(L, K));
+
+        // Actual k we can compute (may be less than requested if kp was clamped)
         int actual_k = ssa_opt_min(max_k, kp);
-        // Allocate all decompose workspace
+
+        // === Allocate Randomized SVD Workspace ===
+        // These buffers hold intermediate results during decomposition
+
+        // decomp_Omega: Random Gaussian matrix, K × (k+p)
+        // Each column is an independent sample from N(0,1)
+        // Used to probe the column space of H via Y = H·Ω
         ssa->decomp_Omega = (double *)ssa_opt_alloc(K * kp * sizeof(double));
+
+        // decomp_Y: Random projection result, L × (k+p)
+        // Y = H·Ω captures (with high probability) the top-k column space of H
+        // Computed via batched FFT-accelerated Hankel matvec
         ssa->decomp_Y = (double *)ssa_opt_alloc(L * kp * sizeof(double));
+
+        // decomp_Q: Orthonormal basis from QR(Y), L × (k+p)
+        // Q spans the same subspace as Y but with orthonormal columns
+        // Computed via Householder QR (LAPACK DGEQRF + DORGQR)
         ssa->decomp_Q = (double *)ssa_opt_alloc(L * kp * sizeof(double));
+
+        // decomp_B: Projected small matrix, K × (k+p)
+        // B = Hᵀ·Q projects H onto the subspace Q
+        // B has same top singular values as H (key insight of algorithm)
         ssa->decomp_B = (double *)ssa_opt_alloc(K * kp * sizeof(double));
+
+        // decomp_tau: Householder reflector coefficients from QR, length (k+p)
+        // Internal to LAPACK's QR factorization
         ssa->decomp_tau = (double *)ssa_opt_alloc(kp * sizeof(double));
+
+        // decomp_B_left: Left singular vectors of B, K × (k+p)
+        // Output from DGESDD (divide-and-conquer SVD)
         ssa->decomp_B_left = (double *)ssa_opt_alloc(K * kp * sizeof(double));
+
+        // decomp_B_right_T: Right singular vectors of B (transposed), (k+p) × (k+p)
+        // Used to rotate Q back to original coordinates: U = Q · V_B
         ssa->decomp_B_right_T = (double *)ssa_opt_alloc(kp * kp * sizeof(double));
+
+        // decomp_S: Singular values of B, length (k+p)
+        // These are the final singular values (same as H's top singular values)
         ssa->decomp_S = (double *)ssa_opt_alloc(kp * sizeof(double));
+
+        // decomp_iwork: Integer workspace for DGESDD, length 8*(k+p)
+        // LAPACK's divide-and-conquer SVD needs integer scratch space
         ssa->decomp_iwork = (int *)ssa_opt_alloc(8 * kp * sizeof(int));
-        // Query optimal LAPACK workspace size
+
+        // === Query LAPACK Workspace Size ===
+        // LAPACK routines need workspace whose size depends on problem dimensions
+        // We query the optimal size (lwork = -1 triggers query mode)
         double work_query;
         int lwork = -1;
-        LAPACKE_dgesdd_work(LAPACK_COL_MAJOR, 'S', K, kp, ssa->decomp_B, K, ssa->decomp_S,
-                            ssa->decomp_B_left, K, ssa->decomp_B_right_T, kp, &work_query, lwork, ssa->decomp_iwork);
+        LAPACKE_dgesdd_work(LAPACK_COL_MAJOR, 'S',     // 'S' = economy SVD
+                            K, kp,                     // Matrix dimensions
+                            ssa->decomp_B, K,          // Input matrix (will be overwritten)
+                            ssa->decomp_S,             // Singular values output
+                            ssa->decomp_B_left, K,     // Left singular vectors
+                            ssa->decomp_B_right_T, kp, // Right singular vectors (transposed)
+                            &work_query, lwork,        // Query mode: returns optimal size in work_query
+                            ssa->decomp_iwork);
+
+        // Allocate optimal workspace (+1 for safety margin)
         lwork = (int)work_query + 1;
         ssa->decomp_work = (double *)ssa_opt_alloc(lwork * sizeof(double));
         ssa->prepared_lwork = lwork;
-        // Pre-allocate results for max_k (truly malloc-free hot path)
+
+        // === Pre-allocate Result Arrays ===
+        // U, V, sigma, eigenvalues are the final outputs
+        // By allocating here, decompose_randomized() needs zero allocations
+
+        // Free any existing result arrays (from previous decomposition)
         ssa_opt_free_ptr(ssa->U);
         ssa_opt_free_ptr(ssa->V);
         ssa_opt_free_ptr(ssa->sigma);
         ssa_opt_free_ptr(ssa->eigenvalues);
+
+        // U: Left singular vectors of H, L × k
+        // Each column U[:,i] is an "empirical orthogonal function"
         ssa->U = (double *)ssa_opt_alloc(L * actual_k * sizeof(double));
+
+        // V: Right singular vectors of H, K × k
+        // Each column V[:,i] is the corresponding "principal component"
         ssa->V = (double *)ssa_opt_alloc(K * actual_k * sizeof(double));
+
+        // sigma: Singular values, length k
+        // σ₀ ≥ σ₁ ≥ ... ≥ σₖ₋₁ (descending order)
         ssa->sigma = (double *)ssa_opt_alloc(actual_k * sizeof(double));
+
+        // eigenvalues: λᵢ = σᵢ², length k
+        // Eigenvalues of HᵀH (variance captured by each component)
         ssa->eigenvalues = (double *)ssa_opt_alloc(actual_k * sizeof(double));
+
+        // Set n_components now so caller knows capacity
         ssa->n_components = actual_k;
+
+        // === Verify All Allocations ===
         if (!ssa->decomp_Omega || !ssa->decomp_Y || !ssa->decomp_Q || !ssa->decomp_B ||
             !ssa->decomp_tau || !ssa->decomp_B_left || !ssa->decomp_B_right_T ||
             !ssa->decomp_S || !ssa->decomp_iwork || !ssa->decomp_work ||
             !ssa->U || !ssa->V || !ssa->sigma || !ssa->eigenvalues)
         {
-            ssa_opt_free_prepared(ssa);
+            ssa_opt_free_prepared(ssa); // Clean up partial allocations
             return -1;
         }
-        ssa->prepared_kp = kp;
+
+        // === Mark as Prepared ===
+        ssa->prepared_kp = kp; // Remember capacity for validation in decompose
         ssa->prepared = true;
         return 0;
     }
@@ -1165,21 +1278,9 @@ extern "C"
         double *work = ssa->decomp_work;
         int *iwork = ssa->decomp_iwork;
         int lwork = ssa->prepared_lwork;
-
-        // Allocate result arrays (only if size changed)
-        if (!ssa->U || !ssa->V || !ssa->sigma || ssa->n_components != k)
-        {
-            ssa_opt_free_ptr(ssa->U);
-            ssa_opt_free_ptr(ssa->V);
-            ssa_opt_free_ptr(ssa->sigma);
-            ssa_opt_free_ptr(ssa->eigenvalues);
-            ssa->U = (double *)ssa_opt_alloc(L * k * sizeof(double));
-            ssa->V = (double *)ssa_opt_alloc(K * k * sizeof(double));
-            ssa->sigma = (double *)ssa_opt_alloc(k * sizeof(double));
-            ssa->eigenvalues = (double *)ssa_opt_alloc(k * sizeof(double));
-            if (!ssa->U || !ssa->V || !ssa->sigma || !ssa->eigenvalues)
-                return -1;
-        }
+        
+        // U, V, sigma, eigenvalues already allocated by prepare()
+        // Just update count to reflect actual k being used
         ssa->n_components = k;
         ssa->total_variance = 0.0;
 
