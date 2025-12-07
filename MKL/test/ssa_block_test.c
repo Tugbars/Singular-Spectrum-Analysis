@@ -49,7 +49,7 @@ static double get_time_ms(void)
 }
 #endif
 
-static double correlation(const double *a, const double *b, int n)
+static double correlation(const ssa_real *a, const ssa_real *b, int n)
 {
     double sum_a = 0, sum_b = 0, sum_ab = 0, sum_a2 = 0, sum_b2 = 0;
     for (int i = 0; i < n; i++)
@@ -65,7 +65,7 @@ static double correlation(const double *a, const double *b, int n)
     return num / (den + 1e-15);
 }
 
-static double rmse(const double *a, const double *b, int n)
+static double rmse(const ssa_real *a, const ssa_real *b, int n)
 {
     double sum = 0;
     for (int i = 0; i < n; i++)
@@ -116,7 +116,7 @@ int main(void)
     // =========================================================================
     // Step 3: Create test signal
     // =========================================================================
-    double *x = (double *)mkl_malloc(N * sizeof(double), 64);
+    ssa_real *x = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
     if (!x)
     {
         printf("ERROR: Memory allocation failed\n");
@@ -134,9 +134,9 @@ int main(void)
     }
 
     // Allocate buffers for reconstructions
-    double *recon_seq = (double *)mkl_malloc(N * sizeof(double), 64);
-    double *recon_block = (double *)mkl_malloc(N * sizeof(double), 64);
-    double *recon_rand = (double *)mkl_malloc(N * sizeof(double), 64);
+    ssa_real *recon_seq = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
+    ssa_real *recon_block = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
+    ssa_real *recon_rand = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
     int *group_all = (int *)malloc(k * sizeof(int));
     for (int i = 0; i < k; i++)
         group_all[i] = i;
@@ -215,7 +215,7 @@ int main(void)
     // =========================================================================
     printf("=== Test 4: W-Correlation (Cached FFT Optimization) ===\n");
 
-    double *W = (double *)mkl_malloc(k * k * sizeof(double), 64);
+    ssa_real *W = (ssa_real *)mkl_malloc(k * k * sizeof(ssa_real), 64);
 
     // Without cache
     t0 = get_time_ms();
@@ -287,8 +287,8 @@ int main(void)
     printf("=== Test 6: Streaming Updates ===\n");
 
     int n_hot_iterations = 100;
-    double *x_copy = (double *)mkl_malloc(N * sizeof(double), 64);
-    memcpy(x_copy, x, N * sizeof(double));
+    ssa_real *x_copy = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
+    memcpy(x_copy, x, N * sizeof(ssa_real));
 
     // Setup once with prepare
     SSA_Opt ssa_hot = {0};
