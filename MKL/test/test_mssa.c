@@ -43,20 +43,20 @@
 // Utility Functions
 // ============================================================================
 
-static double randn(void)
+static ssa_real randn(void)
 {
     static int have_spare = 0;
-    static double spare;
+    static ssa_real spare;
     
     if (have_spare) {
         have_spare = 0;
         return spare;
     }
     
-    double u, v, s;
+    ssa_real u, v, s;
     do {
-        u = (double)rand() / RAND_MAX * 2.0 - 1.0;
-        v = (double)rand() / RAND_MAX * 2.0 - 1.0;
+        u = (ssa_real)rand() / RAND_MAX * 2.0 - 1.0;
+        v = (ssa_real)rand() / RAND_MAX * 2.0 - 1.0;
         s = u * u + v * v;
     } while (s >= 1.0 || s == 0.0);
     
@@ -66,9 +66,9 @@ static double randn(void)
     return u * s;
 }
 
-static double compute_correlation(const double *x, const double *y, int n)
+static ssa_real compute_correlation(const ssa_real *x, const ssa_real *y, int n)
 {
-    double sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0, sum_y2 = 0;
+    ssa_real sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0, sum_y2 = 0;
     for (int i = 0; i < n; i++) {
         sum_x += x[i];
         sum_y += y[i];
@@ -76,16 +76,16 @@ static double compute_correlation(const double *x, const double *y, int n)
         sum_x2 += x[i] * x[i];
         sum_y2 += y[i] * y[i];
     }
-    double num = n * sum_xy - sum_x * sum_y;
-    double den = sqrt((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y));
+    ssa_real num = n * sum_xy - sum_x * sum_y;
+    ssa_real den = sqrt((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y));
     return (den > 1e-10) ? num / den : 0.0;
 }
 
-static double compute_rmse(const double *actual, const double *predicted, int n)
+static ssa_real compute_rmse(const ssa_real *actual, const ssa_real *predicted, int n)
 {
-    double sum_sq = 0.0;
+    ssa_real sum_sq = 0.0;
     for (int i = 0; i < n; i++) {
-        double diff = actual[i] - predicted[i];
+        ssa_real diff = actual[i] - predicted[i];
         sum_sq += diff * diff;
     }
     return sqrt(sum_sq / n);
@@ -96,10 +96,10 @@ static double compute_rmse(const double *actual, const double *predicted, int n)
 // ============================================================================
 
 typedef struct {
-    double *X;              // All series: M × N row-major
-    double *market;         // Common market factor: N
-    double *sector[N_SERIES]; // Sector-specific: N each
-    double *idio[N_SERIES];   // Idiosyncratic: N each
+    ssa_real *X;              // All series: M × N row-major
+    ssa_real *market;         // Common market factor: N
+    ssa_real *sector[N_SERIES]; // Sector-specific: N each
+    ssa_real *idio[N_SERIES];   // Idiosyncratic: N each
 } SyntheticMSSAData;
 
 static void generate_mssa_data(SyntheticMSSAData *data)
@@ -107,29 +107,29 @@ static void generate_mssa_data(SyntheticMSSAData *data)
     int M = N_SERIES;
     int N = N_SAMPLES;
     
-    data->X = (double *)malloc(M * N * sizeof(double));
-    data->market = (double *)malloc(N * sizeof(double));
+    data->X = (ssa_real *)malloc(M * N * sizeof(ssa_real));
+    data->market = (ssa_real *)malloc(N * sizeof(ssa_real));
     
     for (int m = 0; m < M; m++) {
-        data->sector[m] = (double *)malloc(N * sizeof(double));
-        data->idio[m] = (double *)malloc(N * sizeof(double));
+        data->sector[m] = (ssa_real *)malloc(N * sizeof(ssa_real));
+        data->idio[m] = (ssa_real *)malloc(N * sizeof(ssa_real));
     }
     
     // Generate common market factor (trend + slow cycle)
     for (int t = 0; t < N; t++) {
-        double trend = 100.0 + MARKET_TREND * t;
-        double cycle = MARKET_AMP * sin(2.0 * M_PI * t / 100.0);
+        ssa_real trend = 100.0 + MARKET_TREND * t;
+        ssa_real cycle = MARKET_AMP * sin(2.0 * M_PI * t / 100.0);
         data->market[t] = trend + cycle;
     }
     
     // Generate series with different sector loadings and idiosyncratic noise
-    double sector_loadings[N_SERIES] = {1.0, 0.9, 0.8, 1.1, 0.7};
-    double sector_phases[N_SERIES] = {0, 0.5, 1.0, 0.3, 1.5};
+    ssa_real sector_loadings[N_SERIES] = {1.0, 0.9, 0.8, 1.1, 0.7};
+    ssa_real sector_phases[N_SERIES] = {0, 0.5, 1.0, 0.3, 1.5};
     
     for (int m = 0; m < M; m++) {
         for (int t = 0; t < N; t++) {
             // Sector-specific component (different frequency/phase per series)
-            double sector_cycle = SECTOR_AMP * sin(2.0 * M_PI * t / 50.0 + sector_phases[m]);
+            ssa_real sector_cycle = SECTOR_AMP * sin(2.0 * M_PI * t / 50.0 + sector_phases[m]);
             data->sector[m][t] = sector_cycle;
             
             // Idiosyncratic noise
@@ -182,7 +182,7 @@ static int test_mssa_basic(void)
     for (int i = 0; i < N_SERIES; i++) {
         printf("  S%d:  ", i);
         for (int j = 0; j < N_SERIES; j++) {
-            double corr = compute_correlation(data.X + i * N_SAMPLES, 
+            ssa_real corr = compute_correlation(data.X + i * N_SAMPLES, 
                                               data.X + j * N_SAMPLES, N_SAMPLES);
             printf(" %6.3f ", corr);
         }
@@ -198,7 +198,7 @@ static int test_mssa_basic(void)
         free_mssa_data(&data);
         return -1;
     }
-    double init_time = (double)(clock() - start) / CLOCKS_PER_SEC;
+    ssa_real init_time = (ssa_real)(clock() - start) / CLOCKS_PER_SEC;
     printf("\nMSSA initialized in %.2f ms\n", init_time * 1000);
     
     // Decompose
@@ -209,7 +209,7 @@ static int test_mssa_basic(void)
         free_mssa_data(&data);
         return -1;
     }
-    double decomp_time = (double)(clock() - start) / CLOCKS_PER_SEC;
+    ssa_real decomp_time = (ssa_real)(clock() - start) / CLOCKS_PER_SEC;
     printf("MSSA decomposed in %.2f ms\n", decomp_time * 1000);
     
     // Print singular values
@@ -217,12 +217,12 @@ static int test_mssa_basic(void)
     printf("  Component | Singular Value | Cumulative Var\n");
     printf("  ----------|----------------|---------------\n");
     for (int i = 0; i < ssa_opt_min(10, mssa.n_components); i++) {
-        double cumvar = mssa_opt_variance_explained(&mssa, 0, i);
+        ssa_real cumvar = mssa_opt_variance_explained(&mssa, 0, i);
         printf("  %9d | %14.4f | %13.2f%%\n", i, mssa.sigma[i], cumvar * 100);
     }
     
     // Series contributions
-    double *contrib = (double *)malloc(N_SERIES * mssa.n_components * sizeof(double));
+    ssa_real *contrib = (ssa_real *)malloc(N_SERIES * mssa.n_components * sizeof(ssa_real));
     mssa_opt_series_contributions(&mssa, contrib);
     
     printf("\nSeries Contributions to First 5 Components:\n");
@@ -265,7 +265,7 @@ static int test_mssa_reconstruction(void)
     printf("  Components | RMSE\n");
     printf("  -----------|--------\n");
     
-    double *recon = (double *)malloc(N_SAMPLES * sizeof(double));
+    ssa_real *recon = (ssa_real *)malloc(N_SAMPLES * sizeof(ssa_real));
     int test_k[] = {1, 2, 3, 5, 10, 15, 20};
     int n_tests = sizeof(test_k) / sizeof(test_k[0]);
     
@@ -278,7 +278,7 @@ static int test_mssa_reconstruction(void)
         for (int i = 0; i < k; i++) group[i] = i;
         
         mssa_opt_reconstruct(&mssa, 0, group, k, recon);
-        double rmse = compute_rmse(data.X, recon, N_SAMPLES);
+        ssa_real rmse = compute_rmse(data.X, recon, N_SAMPLES);
         printf("  %10d | %7.4f\n", k, rmse);
         
         free(group);
@@ -286,14 +286,14 @@ static int test_mssa_reconstruction(void)
     
     // Test reconstruct_all
     printf("\nTesting mssa_opt_reconstruct_all:\n");
-    double *recon_all = (double *)malloc(N_SERIES * N_SAMPLES * sizeof(double));
+    ssa_real *recon_all = (ssa_real *)malloc(N_SERIES * N_SAMPLES * sizeof(ssa_real));
     int full_group[10] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     
     if (mssa_opt_reconstruct_all(&mssa, full_group, 10, recon_all) == 0) {
         printf("  Series | RMSE vs Original\n");
         printf("  -------|------------------\n");
         for (int m = 0; m < N_SERIES; m++) {
-            double rmse = compute_rmse(data.X + m * N_SAMPLES, 
+            ssa_real rmse = compute_rmse(data.X + m * N_SAMPLES, 
                                        recon_all + m * N_SAMPLES, N_SAMPLES);
             printf("  %6d | %7.4f\n", m, rmse);
         }
@@ -326,7 +326,7 @@ static int test_mssa_common_factor(void)
     
     // Extract first component from each series
     int common_group[] = {0};
-    double *common = (double *)malloc(N_SERIES * N_SAMPLES * sizeof(double));
+    ssa_real *common = (ssa_real *)malloc(N_SERIES * N_SAMPLES * sizeof(ssa_real));
     mssa_opt_reconstruct_all(&mssa, common_group, 1, common);
     
     // Compare common factors across series - they should be correlated
@@ -338,7 +338,7 @@ static int test_mssa_common_factor(void)
     for (int i = 0; i < N_SERIES; i++) {
         printf("  S%d:  ", i);
         for (int j = 0; j < N_SERIES; j++) {
-            double corr = compute_correlation(common + i * N_SAMPLES,
+            ssa_real corr = compute_correlation(common + i * N_SAMPLES,
                                               common + j * N_SAMPLES, N_SAMPLES);
             printf(" %6.3f ", corr);
         }
@@ -348,14 +348,14 @@ static int test_mssa_common_factor(void)
     // Compare with true market factor
     printf("\nCorrelation with True Market Factor:\n");
     for (int m = 0; m < N_SERIES; m++) {
-        double corr = compute_correlation(common + m * N_SAMPLES, data.market, N_SAMPLES);
+        ssa_real corr = compute_correlation(common + m * N_SAMPLES, data.market, N_SAMPLES);
         printf("  Series %d: %.4f\n", m, corr);
     }
     
     // Extract residuals (components 2+)
     printf("\nExtracting residuals (components 2-10):\n");
     int residual_group[] = {2, 3, 4, 5, 6, 7, 8, 9};
-    double *residuals = (double *)malloc(N_SERIES * N_SAMPLES * sizeof(double));
+    ssa_real *residuals = (ssa_real *)malloc(N_SERIES * N_SAMPLES * sizeof(ssa_real));
     mssa_opt_reconstruct_all(&mssa, residual_group, 8, residuals);
     
     printf("Residual Cross-Correlations (should be lower):\n");
@@ -366,7 +366,7 @@ static int test_mssa_common_factor(void)
     for (int i = 0; i < N_SERIES; i++) {
         printf("  S%d:  ", i);
         for (int j = 0; j < N_SERIES; j++) {
-            double corr = compute_correlation(residuals + i * N_SAMPLES,
+            ssa_real corr = compute_correlation(residuals + i * N_SAMPLES,
                                               residuals + j * N_SAMPLES, N_SAMPLES);
             printf(" %6.3f ", corr);
         }
@@ -395,9 +395,9 @@ static int test_mssa_pairs_analysis(void)
     generate_mssa_data(&data);
     
     // Use just 2 series for pairs
-    double *pairs_data = (double *)malloc(2 * N_SAMPLES * sizeof(double));
-    memcpy(pairs_data, data.X, N_SAMPLES * sizeof(double));
-    memcpy(pairs_data + N_SAMPLES, data.X + N_SAMPLES, N_SAMPLES * sizeof(double));
+    ssa_real *pairs_data = (ssa_real *)malloc(2 * N_SAMPLES * sizeof(ssa_real));
+    memcpy(pairs_data, data.X, N_SAMPLES * sizeof(ssa_real));
+    memcpy(pairs_data + N_SAMPLES, data.X + N_SAMPLES, N_SAMPLES * sizeof(ssa_real));
     
     MSSA_Opt mssa = {0};
     mssa_opt_init(&mssa, pairs_data, 2, N_SAMPLES, WINDOW_L);
@@ -405,8 +405,8 @@ static int test_mssa_pairs_analysis(void)
     
     // Extract common trend (components 0-1)
     int common[] = {0, 1};
-    double *s0_common = (double *)malloc(N_SAMPLES * sizeof(double));
-    double *s1_common = (double *)malloc(N_SAMPLES * sizeof(double));
+    ssa_real *s0_common = (ssa_real *)malloc(N_SAMPLES * sizeof(ssa_real));
+    ssa_real *s1_common = (ssa_real *)malloc(N_SAMPLES * sizeof(ssa_real));
     
     mssa_opt_reconstruct(&mssa, 0, common, 2, s0_common);
     mssa_opt_reconstruct(&mssa, 1, common, 2, s1_common);
@@ -415,10 +415,10 @@ static int test_mssa_pairs_analysis(void)
            compute_correlation(s0_common, s1_common, N_SAMPLES));
     
     // Compute spread (idiosyncratic difference)
-    double *spread = (double *)malloc(N_SAMPLES * sizeof(double));
+    ssa_real *spread = (ssa_real *)malloc(N_SAMPLES * sizeof(ssa_real));
     int idio[] = {2, 3, 4, 5};
-    double *s0_idio = (double *)malloc(N_SAMPLES * sizeof(double));
-    double *s1_idio = (double *)malloc(N_SAMPLES * sizeof(double));
+    ssa_real *s0_idio = (ssa_real *)malloc(N_SAMPLES * sizeof(ssa_real));
+    ssa_real *s1_idio = (ssa_real *)malloc(N_SAMPLES * sizeof(ssa_real));
     
     mssa_opt_reconstruct(&mssa, 0, idio, 4, s0_idio);
     mssa_opt_reconstruct(&mssa, 1, idio, 4, s1_idio);
@@ -428,12 +428,12 @@ static int test_mssa_pairs_analysis(void)
     }
     
     // Compute spread statistics
-    double mean = 0, std = 0;
+    ssa_real mean = 0, std = 0;
     for (int t = 0; t < N_SAMPLES; t++) mean += spread[t];
     mean /= N_SAMPLES;
     
     for (int t = 0; t < N_SAMPLES; t++) {
-        double diff = spread[t] - mean;
+        ssa_real diff = spread[t] - mean;
         std += diff * diff;
     }
     std = sqrt(std / N_SAMPLES);
@@ -445,10 +445,10 @@ static int test_mssa_pairs_analysis(void)
            spread[0], (spread[0] - mean) / std);  // Example
     
     // Find max absolute z-score
-    double max_z = 0;
+    ssa_real max_z = 0;
     int max_t = 0;
     for (int t = 0; t < N_SAMPLES; t++) {
-        double z = fabs(spread[t] - mean) / std;
+        ssa_real z = fabs(spread[t] - mean) / std;
         if (z > max_z) {
             max_z = z;
             max_t = t;
@@ -479,7 +479,7 @@ static int test_mssa_throughput(void)
     SyntheticMSSAData data;
     generate_mssa_data(&data);
     
-    double *recon_all = (double *)malloc(N_SERIES * N_SAMPLES * sizeof(double));
+    ssa_real *recon_all = (ssa_real *)malloc(N_SERIES * N_SAMPLES * sizeof(ssa_real));
     int group[] = {0, 1, 2, 3, 4};
     
     // Single MSSA setup
@@ -495,7 +495,7 @@ static int test_mssa_throughput(void)
         mssa_opt_reconstruct_all(&mssa, group, 5, recon_all);
     }
     
-    double recon_time = (double)(clock() - start) / CLOCKS_PER_SEC * 1000;
+    ssa_real recon_time = (ssa_real)(clock() - start) / CLOCKS_PER_SEC * 1000;
     
     printf("\nReconstruction throughput:\n");
     printf("  %d reconstructions: %.2f ms\n", n_recon, recon_time);
@@ -504,7 +504,7 @@ static int test_mssa_throughput(void)
     // Single decompose timing
     start = clock();
     mssa_opt_decompose(&mssa, N_COMPONENTS, 8);
-    double decomp_time = (double)(clock() - start) / CLOCKS_PER_SEC * 1000;
+    ssa_real decomp_time = (ssa_real)(clock() - start) / CLOCKS_PER_SEC * 1000;
     
     printf("\nDecomposition time: %.2f ms\n", decomp_time);
     

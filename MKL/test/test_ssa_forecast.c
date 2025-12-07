@@ -50,21 +50,21 @@
 // Utility Functions
 // ============================================================================
 
-static double randn(void)
+static ssa_real randn(void)
 {
     // Box-Muller transform for Gaussian random numbers
     static int have_spare = 0;
-    static double spare;
+    static ssa_real spare;
     
     if (have_spare) {
         have_spare = 0;
         return spare;
     }
     
-    double u, v, s;
+    ssa_real u, v, s;
     do {
-        u = (double)rand() / RAND_MAX * 2.0 - 1.0;
-        v = (double)rand() / RAND_MAX * 2.0 - 1.0;
+        u = (ssa_real)rand() / RAND_MAX * 2.0 - 1.0;
+        v = (ssa_real)rand() / RAND_MAX * 2.0 - 1.0;
         s = u * u + v * v;
     } while (s >= 1.0 || s == 0.0);
     
@@ -74,19 +74,19 @@ static double randn(void)
     return u * s;
 }
 
-static double compute_rmse(const double *actual, const double *predicted, int n)
+static ssa_real compute_rmse(const ssa_real *actual, const ssa_real *predicted, int n)
 {
-    double sum_sq = 0.0;
+    ssa_real sum_sq = 0.0;
     for (int i = 0; i < n; i++) {
-        double diff = actual[i] - predicted[i];
+        ssa_real diff = actual[i] - predicted[i];
         sum_sq += diff * diff;
     }
     return sqrt(sum_sq / n);
 }
 
-static double compute_mape(const double *actual, const double *predicted, int n)
+static ssa_real compute_mape(const ssa_real *actual, const ssa_real *predicted, int n)
 {
-    double sum = 0.0;
+    ssa_real sum = 0.0;
     for (int i = 0; i < n; i++) {
         if (fabs(actual[i]) > 1e-10) {
             sum += fabs((actual[i] - predicted[i]) / actual[i]);
@@ -95,9 +95,9 @@ static double compute_mape(const double *actual, const double *predicted, int n)
     return 100.0 * sum / n;
 }
 
-static double compute_correlation(const double *x, const double *y, int n)
+static ssa_real compute_correlation(const ssa_real *x, const ssa_real *y, int n)
 {
-    double sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0, sum_y2 = 0;
+    ssa_real sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0, sum_y2 = 0;
     for (int i = 0; i < n; i++) {
         sum_x += x[i];
         sum_y += y[i];
@@ -105,8 +105,8 @@ static double compute_correlation(const double *x, const double *y, int n)
         sum_x2 += x[i] * x[i];
         sum_y2 += y[i] * y[i];
     }
-    double num = n * sum_xy - sum_x * sum_y;
-    double den = sqrt((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y));
+    ssa_real num = n * sum_xy - sum_x * sum_y;
+    ssa_real den = sqrt((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y));
     return (den > 1e-10) ? num / den : 0.0;
 }
 
@@ -115,10 +115,10 @@ static double compute_correlation(const double *x, const double *y, int n)
 // ============================================================================
 
 typedef struct {
-    double *signal;      // Full signal (observed + future)
-    double *trend;       // Trend component only
-    double *seasonal;    // Seasonal component only
-    double *noise;       // Noise component only
+    ssa_real *signal;      // Full signal (observed + future)
+    ssa_real *trend;       // Trend component only
+    ssa_real *seasonal;    // Seasonal component only
+    ssa_real *noise;       // Noise component only
     int n_total;         // Total length (N_OBSERVED + N_FORECAST)
 } SyntheticSignal;
 
@@ -127,10 +127,10 @@ static void generate_synthetic_signal(SyntheticSignal *sig)
     int n_total = N_OBSERVED + N_FORECAST;
     sig->n_total = n_total;
     
-    sig->signal = (double *)malloc(n_total * sizeof(double));
-    sig->trend = (double *)malloc(n_total * sizeof(double));
-    sig->seasonal = (double *)malloc(n_total * sizeof(double));
-    sig->noise = (double *)malloc(n_total * sizeof(double));
+    sig->signal = (ssa_real *)malloc(n_total * sizeof(ssa_real));
+    sig->trend = (ssa_real *)malloc(n_total * sizeof(ssa_real));
+    sig->seasonal = (ssa_real *)malloc(n_total * sizeof(ssa_real));
+    sig->noise = (ssa_real *)malloc(n_total * sizeof(ssa_real));
     
     for (int t = 0; t < n_total; t++) {
         // Linear trend
@@ -209,7 +209,7 @@ static int test_basic_forecast(void)
         free_synthetic_signal(&sig);
         return -1;
     }
-    double decomp_time = (double)(clock() - start) / CLOCKS_PER_SEC;
+    ssa_real decomp_time = (ssa_real)(clock() - start) / CLOCKS_PER_SEC;
     printf("  Decomposition time: %.3f ms\n", decomp_time * 1000);
     
     // Print singular values and variance explained
@@ -217,7 +217,7 @@ static int test_basic_forecast(void)
     printf("  Component | Singular Value | Variance Explained\n");
     printf("  ----------|----------------|-------------------\n");
     for (int i = 0; i < ssa_opt_min(8, ssa.n_components); i++) {
-        double var = ssa_opt_variance_explained(&ssa, 0, i);
+        ssa_real var = ssa_opt_variance_explained(&ssa, 0, i);
         printf("  %9d | %14.4f | %17.2f%%\n", i, ssa.sigma[i], var * 100);
     }
     
@@ -244,20 +244,20 @@ static int test_basic_forecast(void)
     printf("\n--- Forecasting Trend (Component 0) ---\n");
     
     int trend_group[] = {0};
-    double *trend_forecast = (double *)malloc(N_FORECAST * sizeof(double));
+    ssa_real *trend_forecast = (ssa_real *)malloc(N_FORECAST * sizeof(ssa_real));
     
     start = clock();
     if (ssa_opt_forecast(&ssa, trend_group, 1, N_FORECAST, trend_forecast) != 0) {
         printf("ERROR: Trend forecast failed\n");
     } else {
-        double forecast_time = (double)(clock() - start) / CLOCKS_PER_SEC;
+        ssa_real forecast_time = (ssa_real)(clock() - start) / CLOCKS_PER_SEC;
         printf("  Forecast time: %.3f ms\n", forecast_time * 1000);
         
         // Compare with true trend
-        double *true_trend = sig.trend + N_OBSERVED;
-        double rmse = compute_rmse(true_trend, trend_forecast, N_FORECAST);
-        double mape = compute_mape(true_trend, trend_forecast, N_FORECAST);
-        double corr = compute_correlation(true_trend, trend_forecast, N_FORECAST);
+        ssa_real *true_trend = sig.trend + N_OBSERVED;
+        ssa_real rmse = compute_rmse(true_trend, trend_forecast, N_FORECAST);
+        ssa_real mape = compute_mape(true_trend, trend_forecast, N_FORECAST);
+        ssa_real corr = compute_correlation(true_trend, trend_forecast, N_FORECAST);
         
         printf("  RMSE:  %.4f\n", rmse);
         printf("  MAPE:  %.2f%%\n", mape);
@@ -280,24 +280,24 @@ static int test_basic_forecast(void)
     printf("\n--- Forecasting Trend + Seasonal (Components 0-2) ---\n");
     
     int signal_group[] = {0, 1, 2};
-    double *signal_forecast = (double *)malloc(N_FORECAST * sizeof(double));
+    ssa_real *signal_forecast = (ssa_real *)malloc(N_FORECAST * sizeof(ssa_real));
     
     start = clock();
     if (ssa_opt_forecast(&ssa, signal_group, 3, N_FORECAST, signal_forecast) != 0) {
         printf("ERROR: Signal forecast failed\n");
     } else {
-        double forecast_time = (double)(clock() - start) / CLOCKS_PER_SEC;
+        ssa_real forecast_time = (ssa_real)(clock() - start) / CLOCKS_PER_SEC;
         printf("  Forecast time: %.3f ms\n", forecast_time * 1000);
         
         // Compare with true signal (trend + seasonal, no noise)
-        double *true_signal = (double *)malloc(N_FORECAST * sizeof(double));
+        ssa_real *true_signal = (ssa_real *)malloc(N_FORECAST * sizeof(ssa_real));
         for (int i = 0; i < N_FORECAST; i++) {
             true_signal[i] = sig.trend[N_OBSERVED + i] + sig.seasonal[N_OBSERVED + i];
         }
         
-        double rmse = compute_rmse(true_signal, signal_forecast, N_FORECAST);
-        double mape = compute_mape(true_signal, signal_forecast, N_FORECAST);
-        double corr = compute_correlation(true_signal, signal_forecast, N_FORECAST);
+        ssa_real rmse = compute_rmse(true_signal, signal_forecast, N_FORECAST);
+        ssa_real mape = compute_mape(true_signal, signal_forecast, N_FORECAST);
+        ssa_real corr = compute_correlation(true_signal, signal_forecast, N_FORECAST);
         
         printf("  RMSE:  %.4f\n", rmse);
         printf("  MAPE:  %.2f%%\n", mape);
@@ -321,7 +321,7 @@ static int test_basic_forecast(void)
     // =========================================================================
     printf("\n--- Testing ssa_opt_forecast_full ---\n");
     
-    double *full_output = (double *)malloc((N_OBSERVED + N_FORECAST) * sizeof(double));
+    ssa_real *full_output = (ssa_real *)malloc((N_OBSERVED + N_FORECAST) * sizeof(ssa_real));
     
     if (ssa_opt_forecast_full(&ssa, signal_group, 3, N_FORECAST, full_output) != 0) {
         printf("ERROR: Full forecast failed\n");
@@ -330,12 +330,12 @@ static int test_basic_forecast(void)
                N_OBSERVED, N_FORECAST, N_OBSERVED + N_FORECAST);
         
         // Verify reconstruction matches
-        double *recon_only = (double *)malloc(N_OBSERVED * sizeof(double));
+        ssa_real *recon_only = (ssa_real *)malloc(N_OBSERVED * sizeof(ssa_real));
         ssa_opt_reconstruct(&ssa, signal_group, 3, recon_only);
         
-        double max_diff = 0.0;
+        ssa_real max_diff = 0.0;
         for (int i = 0; i < N_OBSERVED; i++) {
-            double diff = fabs(full_output[i] - recon_only[i]);
+            ssa_real diff = fabs(full_output[i] - recon_only[i]);
             if (diff > max_diff) max_diff = diff;
         }
         printf("  Max reconstruction difference: %.2e (should be ~0)\n", max_diff);
@@ -369,8 +369,8 @@ static int test_basic_forecast(void)
         printf("\n");
         
         // Use LRF directly for forecasting
-        double *recon = (double *)malloc(N_OBSERVED * sizeof(double));
-        double *lrf_forecast = (double *)malloc(N_FORECAST * sizeof(double));
+        ssa_real *recon = (ssa_real *)malloc(N_OBSERVED * sizeof(ssa_real));
+        ssa_real *lrf_forecast = (ssa_real *)malloc(N_FORECAST * sizeof(ssa_real));
         
         ssa_opt_reconstruct(&ssa, signal_group, 3, recon);
         if (ssa_opt_forecast_with_lrf(&lrf, recon, N_OBSERVED, N_FORECAST, lrf_forecast) == 0) {
@@ -420,8 +420,8 @@ static int test_forecast_accuracy_vs_horizon(void)
         int horizon = horizons[h];
         if (horizon > N_FORECAST) break;
         
-        double *forecast = (double *)malloc(horizon * sizeof(double));
-        double *true_signal = (double *)malloc(horizon * sizeof(double));
+        ssa_real *forecast = (ssa_real *)malloc(horizon * sizeof(ssa_real));
+        ssa_real *true_signal = (ssa_real *)malloc(horizon * sizeof(ssa_real));
         
         ssa_opt_forecast(&ssa, signal_group, 3, horizon, forecast);
         
@@ -429,9 +429,9 @@ static int test_forecast_accuracy_vs_horizon(void)
             true_signal[i] = sig.trend[N_OBSERVED + i] + sig.seasonal[N_OBSERVED + i];
         }
         
-        double rmse = compute_rmse(true_signal, forecast, horizon);
-        double mape = compute_mape(true_signal, forecast, horizon);
-        double corr = compute_correlation(true_signal, forecast, horizon);
+        ssa_real rmse = compute_rmse(true_signal, forecast, horizon);
+        ssa_real mape = compute_mape(true_signal, forecast, horizon);
+        ssa_real corr = compute_correlation(true_signal, forecast, horizon);
         
         printf("  %7d | %7.4f | %6.2f%% | %.4f\n", horizon, rmse, mape, corr);
         
@@ -462,9 +462,9 @@ static int test_different_component_groups(void)
     ssa_opt_decompose_randomized(&ssa, N_COMPONENTS, 8);
     
     // Prepare true components for comparison
-    double *true_trend = sig.trend + N_OBSERVED;
-    double *true_seasonal = sig.seasonal + N_OBSERVED;
-    double *true_signal = (double *)malloc(N_FORECAST * sizeof(double));
+    ssa_real *true_trend = sig.trend + N_OBSERVED;
+    ssa_real *true_seasonal = sig.seasonal + N_OBSERVED;
+    ssa_real *true_signal = (ssa_real *)malloc(N_FORECAST * sizeof(ssa_real));
     for (int i = 0; i < N_FORECAST; i++) {
         true_signal[i] = true_trend[i] + true_seasonal[i];
     }
@@ -473,7 +473,7 @@ static int test_different_component_groups(void)
     printf("  Group         | Description         | RMSE vs Signal\n");
     printf("  --------------|---------------------|---------------\n");
     
-    double *forecast = (double *)malloc(N_FORECAST * sizeof(double));
+    ssa_real *forecast = (ssa_real *)malloc(N_FORECAST * sizeof(ssa_real));
     
     // Test different groupings
     struct {
@@ -493,7 +493,7 @@ static int test_different_component_groups(void)
     for (int t = 0; t < n_tests; t++) {
         if (ssa_opt_forecast(&ssa, tests[t].group, tests[t].n_group, 
                              N_FORECAST, forecast) == 0) {
-            double rmse = compute_rmse(true_signal, forecast, N_FORECAST);
+            ssa_real rmse = compute_rmse(true_signal, forecast, N_FORECAST);
             printf("  %-13s | %-19s | %.4f\n", 
                    tests[t].name, tests[t].desc, rmse);
         } else {
@@ -521,7 +521,7 @@ static int test_streaming_updates(void)
     generate_synthetic_signal(&sig);
     
     int signal_group[] = {0, 1, 2};
-    double *recon = (double *)malloc(N_OBSERVED * sizeof(double));
+    ssa_real *recon = (ssa_real *)malloc(N_OBSERVED * sizeof(ssa_real));
     int n_updates = 20;
     
     // Setup once with prepare
@@ -543,11 +543,11 @@ static int test_streaming_updates(void)
         // Decompose (uses prepared workspace, no malloc)
         clock_t start = clock();
         ssa_opt_decompose_randomized(&ssa, N_COMPONENTS, 8);
-        double decomp_time = (double)(clock() - start) / CLOCKS_PER_SEC * 1000;
+        ssa_real decomp_time = (ssa_real)(clock() - start) / CLOCKS_PER_SEC * 1000;
         
         // Reconstruct
         ssa_opt_reconstruct(&ssa, signal_group, 3, recon);
-        double corr = compute_correlation(sig.signal, recon, N_OBSERVED);
+        ssa_real corr = compute_correlation(sig.signal, recon, N_OBSERVED);
         
         if (i % 5 == 0 || i == n_updates - 1) {
             printf("  %6d | %11.3f | %.6f\n", i, decomp_time, corr);

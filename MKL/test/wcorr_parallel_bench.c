@@ -27,16 +27,16 @@
 
 #ifdef _WIN32
 #include <windows.h>
-static double get_time_ms(void)
+static ssa_real get_time_ms(void)
 {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (double)count.QuadPart / freq.QuadPart * 1000.0;
+    return (ssa_real)count.QuadPart / freq.QuadPart * 1000.0;
 }
 #else
 #include <time.h>
-static double get_time_ms(void)
+static ssa_real get_time_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -48,14 +48,14 @@ static double get_time_ms(void)
  * Benchmark
  * ============================================================================ */
 
-typedef int (*wcorr_fn)(const SSA_Opt*, double*);
+typedef int (*wcorr_fn)(const SSA_Opt*, ssa_real*);
 
-static double benchmark_wcorr(wcorr_fn fn, const SSA_Opt *ssa, int runs)
+static ssa_real benchmark_wcorr(wcorr_fn fn, const SSA_Opt *ssa, int runs)
 {
     int n = ssa->n_components;
     int r;
-    double t0, t1;
-    double *W = (double *)mkl_malloc(n * n * sizeof(double), 64);
+    ssa_real t0, t1;
+    ssa_real *W = (ssa_real *)mkl_malloc(n * n * sizeof(ssa_real), 64);
 
     /* Warmup */
     fn(ssa, W);
@@ -69,20 +69,20 @@ static double benchmark_wcorr(wcorr_fn fn, const SSA_Opt *ssa, int runs)
     return (t1 - t0) / runs;
 }
 
-static double verify_results(const SSA_Opt *ssa)
+static ssa_real verify_results(const SSA_Opt *ssa)
 {
     int n = ssa->n_components;
     int i;
-    double max_diff = 0.0;
-    double *W1 = (double *)mkl_malloc(n * n * sizeof(double), 64);
-    double *W2 = (double *)mkl_malloc(n * n * sizeof(double), 64);
+    ssa_real max_diff = 0.0;
+    ssa_real *W1 = (ssa_real *)mkl_malloc(n * n * sizeof(ssa_real), 64);
+    ssa_real *W2 = (ssa_real *)mkl_malloc(n * n * sizeof(ssa_real), 64);
 
     ssa_opt_wcorr_matrix(ssa, W1);
     ssa_opt_wcorr_matrix_fast(ssa, W2);
 
     for (i = 0; i < n * n; i++)
     {
-        double d = fabs(W1[i] - W2[i]);
+        ssa_real d = fabs(W1[i] - W2[i]);
         if (d > max_diff) max_diff = d;
     }
 
@@ -117,18 +117,18 @@ int main(void)
         int N = configs[c][0];
         int L = configs[c][1];
         int k = configs[c][2];
-        double *x;
+        ssa_real *x;
         SSA_Opt ssa = {0};
-        double t_orig, t_fast, max_diff;
+        ssa_real t_orig, t_fast, max_diff;
 
         printf("-------------------------------------------------------------\n");
         printf("N=%d, L=%d, k=%d\n", N, L, k);
         printf("-------------------------------------------------------------\n");
 
         /* Generate test signal */
-        x = (double *)mkl_malloc(N * sizeof(double), 64);
+        x = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
         for (i = 0; i < N; i++)
-            x[i] = sin(2.0 * M_PI * i / 50.0) + 0.3 * ((double)rand() / RAND_MAX - 0.5);
+            x[i] = sin(2.0 * M_PI * i / 50.0) + 0.3 * ((ssa_real)rand() / RAND_MAX - 0.5);
 
         /* Decompose */
         ssa_opt_init(&ssa, x, N, L);

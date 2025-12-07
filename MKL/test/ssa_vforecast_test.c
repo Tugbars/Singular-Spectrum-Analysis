@@ -10,15 +10,15 @@
 
 #ifdef _WIN32
 #include <windows.h>
-static double get_time_ms(void) {
+static ssa_real get_time_ms(void) {
     LARGE_INTEGER freq, counter;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
+    return (ssa_real)counter.QuadPart * 1000.0 / (ssa_real)freq.QuadPart;
 }
 #else
 #include <time.h>
-static double get_time_ms(void) {
+static ssa_real get_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
@@ -35,13 +35,13 @@ int main(void) {
     int n_forecast = 50;
     
     // Generate test signal: trend + seasonal + noise
-    double *x = (double *)mkl_malloc(N * sizeof(double), 64);
+    ssa_real *x = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
     for (int i = 0; i < N; i++) {
-        double t = (double)i / N;
+        ssa_real t = (ssa_real)i / N;
         x[i] = 10.0 * t +                          // Linear trend
                5.0 * sin(2.0 * M_PI * 12 * t) +    // Annual cycle
                2.0 * sin(2.0 * M_PI * 52 * t) +    // Weekly cycle
-               0.5 * ((double)rand() / RAND_MAX - 0.5);  // Noise
+               0.5 * ((ssa_real)rand() / RAND_MAX - 0.5);  // Noise
     }
     
     // Initialize and decompose
@@ -58,8 +58,8 @@ int main(void) {
     int n_group = 6;
     
     // Allocate forecast arrays
-    double *r_forecast = (double *)mkl_malloc(n_forecast * sizeof(double), 64);
-    double *v_forecast = (double *)mkl_malloc(n_forecast * sizeof(double), 64);
+    ssa_real *r_forecast = (ssa_real *)mkl_malloc(n_forecast * sizeof(ssa_real), 64);
+    ssa_real *v_forecast = (ssa_real *)mkl_malloc(n_forecast * sizeof(ssa_real), 64);
     
     // ======================
     // Test 1: Compare outputs
@@ -75,14 +75,14 @@ int main(void) {
     }
     
     // Compare
-    double max_diff = 0.0;
-    double sum_diff = 0.0;
+    ssa_real max_diff = 0.0;
+    ssa_real sum_diff = 0.0;
     for (int i = 0; i < n_forecast; i++) {
-        double diff = fabs(r_forecast[i] - v_forecast[i]);
+        ssa_real diff = fabs(r_forecast[i] - v_forecast[i]);
         if (diff > max_diff) max_diff = diff;
         sum_diff += diff;
     }
-    double mean_diff = sum_diff / n_forecast;
+    ssa_real mean_diff = sum_diff / n_forecast;
     
     printf("  Max difference:  %.2e\n", max_diff);
     printf("  Mean difference: %.2e\n", mean_diff);
@@ -117,7 +117,7 @@ int main(void) {
     printf("Test 2: Performance comparison\n");
     
     int n_runs = 1000;
-    double t0, t1;
+    ssa_real t0, t1;
     
     // R-forecast timing
     t0 = get_time_ms();
@@ -125,7 +125,7 @@ int main(void) {
         ssa_opt_forecast(&ssa, group, n_group, n_forecast, r_forecast);
     }
     t1 = get_time_ms();
-    double r_time = (t1 - t0) / n_runs;
+    ssa_real r_time = (t1 - t0) / n_runs;
     
     // V-forecast timing
     t0 = get_time_ms();
@@ -133,7 +133,7 @@ int main(void) {
         ssa_opt_vforecast(&ssa, group, n_group, n_forecast, v_forecast);
     }
     t1 = get_time_ms();
-    double v_time = (t1 - t0) / n_runs;
+    ssa_real v_time = (t1 - t0) / n_runs;
     
     printf("  R-forecast: %.3f ms/call\n", r_time);
     printf("  V-forecast: %.3f ms/call\n", v_time);
@@ -144,7 +144,7 @@ int main(void) {
     // ======================
     printf("Test 3: V-forecast fast (from base signal)\n");
     
-    double *reconstructed = (double *)mkl_malloc(N * sizeof(double), 64);
+    ssa_real *reconstructed = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
     ssa_opt_reconstruct(&ssa, group, n_group, reconstructed);
     
     t0 = get_time_ms();
@@ -152,7 +152,7 @@ int main(void) {
         ssa_opt_vforecast_fast(&ssa, group, n_group, reconstructed, N, n_forecast, v_forecast);
     }
     t1 = get_time_ms();
-    double v_fast_time = (t1 - t0) / n_runs;
+    ssa_real v_fast_time = (t1 - t0) / n_runs;
     
     printf("  V-forecast fast: %.3f ms/call\n", v_fast_time);
     printf("  Speedup vs V-forecast: %.2fx\n\n", v_time / v_fast_time);
@@ -163,8 +163,8 @@ int main(void) {
     printf("Test 4: Long horizon stability (500 steps)\n");
     
     int long_horizon = 500;
-    double *r_long = (double *)mkl_malloc(long_horizon * sizeof(double), 64);
-    double *v_long = (double *)mkl_malloc(long_horizon * sizeof(double), 64);
+    ssa_real *r_long = (ssa_real *)mkl_malloc(long_horizon * sizeof(ssa_real), 64);
+    ssa_real *v_long = (ssa_real *)mkl_malloc(long_horizon * sizeof(ssa_real), 64);
     
     ssa_opt_forecast(&ssa, group, n_group, long_horizon, r_long);
     ssa_opt_vforecast(&ssa, group, n_group, long_horizon, v_long);
@@ -180,8 +180,8 @@ int main(void) {
     printf("  V-forecast stable: %s\n", v_stable ? "YES" : "NO");
     
     // Check variance explosion
-    double r_var_start = 0, r_var_end = 0;
-    double v_var_start = 0, v_var_end = 0;
+    ssa_real r_var_start = 0, r_var_end = 0;
+    ssa_real v_var_start = 0, v_var_end = 0;
     for (int i = 0; i < 50; i++) {
         r_var_start += r_long[i] * r_long[i];
         v_var_start += v_long[i] * v_long[i];

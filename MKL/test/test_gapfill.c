@@ -21,9 +21,9 @@
 #endif
 
 // Generate test signal: trend + two sinusoids
-void generate_signal(double *x, int N) {
+void generate_signal(ssa_real *x, int N) {
     for (int i = 0; i < N; i++) {
-        double t = (double)i / N;
+        ssa_real t = (ssa_real)i / N;
         x[i] = 0.02 * i +                          // trend
                sin(2 * M_PI * i / 50.0) +          // period 50
                0.5 * sin(2 * M_PI * i / 20.0);     // period 20
@@ -31,19 +31,19 @@ void generate_signal(double *x, int N) {
 }
 
 // Create gaps (set to NaN)
-void create_gaps(double *x, int start, int end) {
+void create_gaps(ssa_real *x, int start, int end) {
     for (int i = start; i < end; i++) {
         x[i] = NAN;
     }
 }
 
 // Check if value is NaN
-int is_nan(double x) {
+int is_nan(ssa_real x) {
     return x != x;
 }
 
 // Count NaNs
-int count_nans(const double *x, int N) {
+int count_nans(const ssa_real *x, int N) {
     int count = 0;
     for (int i = 0; i < N; i++) {
         if (is_nan(x[i])) count++;
@@ -52,13 +52,13 @@ int count_nans(const double *x, int N) {
 }
 
 // Compute RMSE at gap positions
-double compute_gap_rmse(const double *true_signal, const double *filled, 
+ssa_real compute_gap_rmse(const ssa_real *true_signal, const ssa_real *filled, 
                         const int *gap_mask, int N) {
-    double sum_sq = 0;
+    ssa_real sum_sq = 0;
     int count = 0;
     for (int i = 0; i < N; i++) {
         if (gap_mask[i]) {
-            double diff = filled[i] - true_signal[i];
+            ssa_real diff = filled[i] - true_signal[i];
             sum_sq += diff * diff;
             count++;
         }
@@ -74,11 +74,11 @@ int main() {
     int L = 100;
     int rank = 6;
     int max_iter = 30;
-    double tol = 1e-8;
+    ssa_real tol = 1e-8;
     
     // Allocate
-    double *true_signal = (double *)malloc(N * sizeof(double));
-    double *x = (double *)malloc(N * sizeof(double));
+    ssa_real *true_signal = (ssa_real *)malloc(N * sizeof(ssa_real));
+    ssa_real *x = (ssa_real *)malloc(N * sizeof(ssa_real));
     int *gap_mask = (int *)calloc(N, sizeof(int));
     
     if (!true_signal || !x || !gap_mask) {
@@ -90,7 +90,7 @@ int main() {
     generate_signal(true_signal, N);
     
     // Copy and create gaps
-    memcpy(x, true_signal, N * sizeof(double));
+    memcpy(x, true_signal, N * sizeof(ssa_real));
     
     // Gap regions: 50-64, 150-179, 300-319, 400-409
     int gap_regions[][2] = {{50, 65}, {150, 180}, {300, 320}, {400, 410}};
@@ -138,7 +138,7 @@ int main() {
     printf("  NaN count after: %d\n", nans_after);
     
     if (nans_after == 0) {
-        double rmse = compute_gap_rmse(true_signal, x, gap_mask, N);
+        ssa_real rmse = compute_gap_rmse(true_signal, x, gap_mask, N);
         printf("  RMSE at gap positions: %.6f\n", rmse);
         printf("  SUCCESS: All gaps filled\n");
     } else {
@@ -162,7 +162,7 @@ int main() {
     printf("Testing ssa_opt_gapfill_simple...\n");
     
     // Reset signal with gaps
-    memcpy(x, true_signal, N * sizeof(double));
+    memcpy(x, true_signal, N * sizeof(ssa_real));
     for (int r = 0; r < n_regions; r++) {
         create_gaps(x, gap_regions[r][0], gap_regions[r][1]);
     }
@@ -177,7 +177,7 @@ int main() {
     printf("  NaN count after: %d\n", nans_after);
     
     if (nans_after == 0) {
-        double rmse = compute_gap_rmse(true_signal, x, gap_mask, N);
+        ssa_real rmse = compute_gap_rmse(true_signal, x, gap_mask, N);
         printf("  RMSE at gap positions: %.6f\n", rmse);
         printf("  SUCCESS: All gaps filled\n");
     } else {
