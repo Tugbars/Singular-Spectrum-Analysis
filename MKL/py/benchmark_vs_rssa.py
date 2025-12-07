@@ -77,7 +77,7 @@ def compare_speed(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe'):
     
     for N in [500, 1000, 2000, 5000, 10000, 20000]:
         L = N // 4
-        k = 50
+        k = 15
         
         # Our implementation with malloc-free path
         np.random.seed(42)
@@ -174,7 +174,7 @@ def compare_speed_detailed(r_path=r'C:\Program Files\R\R-4.5.2\bin\Rscript.exe')
     
     for N in [1000, 2000, 5000, 10000, 20000]:
         L = N // 4
-        k = 30
+        k = 15
         
         np.random.seed(42)
         x = np.sin(np.linspace(0, 50*np.pi, N)) + 0.3*np.random.randn(N)
@@ -356,7 +356,7 @@ def benchmark_scaling():
     
     for N in [1000, 2000, 5000, 10000, 20000, 50000, 100000]:
         L = N // 4
-        k = 50
+        k = 15
         
         np.random.seed(42)
         x = np.sin(np.linspace(0, 50*np.pi, N)) + 0.3*np.random.randn(N)

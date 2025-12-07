@@ -93,7 +93,7 @@ int main(void)
     // =========================================================================
     int N = 10000;
     int L = 2500;
-    int k = 50;
+    int k = 15;
     int block_size = 32;
     int max_iter = 200;
     int oversampling = 10;
