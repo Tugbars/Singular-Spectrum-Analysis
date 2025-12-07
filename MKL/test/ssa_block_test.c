@@ -23,7 +23,7 @@
 #define _USE_MATH_DEFINES
 #define SSA_USE_MKL
 
-//#define SSA_USE_FLOAT  // optional, for float mode
+#define SSA_USE_FLOAT  // optional, for float mode
 
 #define SSA_OPT_IMPLEMENTATION
 #include "ssa_opt_r2c.h"
