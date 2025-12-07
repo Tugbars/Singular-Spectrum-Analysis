@@ -138,6 +138,13 @@ typedef double ssa_real;
 
 #define SSA_ALIGN 64
 
+// Restrict pointer hint for better vectorization
+#ifdef _MSC_VER
+#define SSA_RESTRICT __restrict
+#else
+#define SSA_RESTRICT __restrict__
+#endif
+
 #ifndef SSA_BATCH_SIZE
 #define SSA_BATCH_SIZE 32
 #endif
@@ -781,9 +788,9 @@ typedef double ssa_real;
      * Replaces: ssa_opt_complex_mul_r2c() + ssa_cblas_axpy() with single fused operation
      */
     static inline void ssa_opt_complex_mul_acc(
-        const ssa_real *__restrict u_fft,
-        const ssa_real *__restrict v_fft,
-        ssa_real *__restrict acc,
+        const ssa_real *SSA_RESTRICT u_fft,
+        const ssa_real *SSA_RESTRICT v_fft,
+        ssa_real *SSA_RESTRICT acc,
         int n)
     {
 #ifdef SSA_SIMD_AVX2
@@ -868,18 +875,21 @@ typedef double ssa_real;
     // OPTIMIZATION: Conjugate multiply eliminates reverse_copy entirely
     // Old: flip(v) → FFT → multiply → IFFT → extract [K-1 : K-1+L]
     // New: v → FFT → conj_multiply → IFFT → extract [0 : L]
-    static void ssa_opt_hankel_matvec(SSA_Opt *ssa, const ssa_real *v, ssa_real *y)
+    static void ssa_opt_hankel_matvec(SSA_Opt *ssa, const ssa_real *SSA_RESTRICT v, ssa_real *SSA_RESTRICT y)
     {
-        int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
+        const int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
+        ssa_real *SSA_RESTRICT ws_real = ssa->ws_real;
+        ssa_real *SSA_RESTRICT ws_complex = ssa->ws_complex;
+        const ssa_real *SSA_RESTRICT fft_x = ssa->fft_x;
 
         // Forward copy (no reverse needed with conjugate multiply)
-        memcpy(ssa->ws_real, v, K * sizeof(ssa_real));
-        memset(ssa->ws_real + K, 0, (fft_len - K) * sizeof(ssa_real));
+        memcpy(ws_real, v, K * sizeof(ssa_real));
+        memset(ws_real + K, 0, (fft_len - K) * sizeof(ssa_real));
 
-        DftiComputeForward(ssa->fft_r2c, ssa->ws_real, ssa->ws_complex);                     // FFT(v)
-        ssa_opt_complex_mul_conj_r2c(ssa->fft_x, ssa->ws_complex, ssa->ws_complex, r2c_len); // FFT(x) · conj(FFT(v))
-        DftiComputeBackward(ssa->fft_c2r, ssa->ws_complex, ssa->ws_real);                    // IFFT → correlation
-        memcpy(y, ssa->ws_real, L * sizeof(ssa_real));                                       // extract [0 : L]
+        DftiComputeForward(ssa->fft_r2c, ws_real, ws_complex);                // FFT(v)
+        ssa_opt_complex_mul_conj_r2c(fft_x, ws_complex, ws_complex, r2c_len); // FFT(x) · conj(FFT(v))
+        DftiComputeBackward(ssa->fft_c2r, ws_complex, ws_real);               // IFFT → correlation
+        memcpy(y, ws_real, L * sizeof(ssa_real));                             // extract [0 : L]
     }
 
     // Adjoint Hankel matvec: z = Hᵀ·u
@@ -888,18 +898,21 @@ typedef double ssa_real;
     //   z[j] = Σᵢ x[i+j]·u[i] = correlation(x, u)[j]
     //
     // OPTIMIZATION: Conjugate multiply eliminates reverse_copy entirely
-    static void ssa_opt_hankel_matvec_T(SSA_Opt *ssa, const ssa_real *u, ssa_real *y)
+    static void ssa_opt_hankel_matvec_T(SSA_Opt *ssa, const ssa_real *SSA_RESTRICT u, ssa_real *SSA_RESTRICT y)
     {
-        int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
+        const int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
+        ssa_real *SSA_RESTRICT ws_real = ssa->ws_real;
+        ssa_real *SSA_RESTRICT ws_complex = ssa->ws_complex;
+        const ssa_real *SSA_RESTRICT fft_x = ssa->fft_x;
 
         // Forward copy (no reverse needed with conjugate multiply)
-        memcpy(ssa->ws_real, u, L * sizeof(ssa_real));
-        memset(ssa->ws_real + L, 0, (fft_len - L) * sizeof(ssa_real));
+        memcpy(ws_real, u, L * sizeof(ssa_real));
+        memset(ws_real + L, 0, (fft_len - L) * sizeof(ssa_real));
 
-        DftiComputeForward(ssa->fft_r2c, ssa->ws_real, ssa->ws_complex);
-        ssa_opt_complex_mul_conj_r2c(ssa->fft_x, ssa->ws_complex, ssa->ws_complex, r2c_len);
-        DftiComputeBackward(ssa->fft_c2r, ssa->ws_complex, ssa->ws_real);
-        memcpy(y, ssa->ws_real, K * sizeof(ssa_real)); // extract [0 : K]
+        DftiComputeForward(ssa->fft_r2c, ws_real, ws_complex);
+        ssa_opt_complex_mul_conj_r2c(fft_x, ws_complex, ws_complex, r2c_len);
+        DftiComputeBackward(ssa->fft_c2r, ws_complex, ws_real);
+        memcpy(y, ws_real, K * sizeof(ssa_real)); // extract [0 : K]
     }
 
     // Block Hankel matvec: Y = H·V where V is K×b, Y is L×b
@@ -2353,17 +2366,17 @@ typedef double ssa_real;
         return 0;
     }
 
-    int ssa_opt_reconstruct(const SSA_Opt *ssa, const int *group, int n_group, ssa_real *output)
+    int ssa_opt_reconstruct(const SSA_Opt *ssa, const int *group, int n_group, ssa_real *SSA_RESTRICT output)
     {
         if (!ssa || !ssa->decomposed || !group || !output || n_group < 1)
             return -1;
 
-        int N = ssa->N, L = ssa->L, K = ssa->K;
-        int fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
+        const int N = ssa->N, L = ssa->L, K = ssa->K;
+        const int fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
         SSA_Opt *ssa_mut = (SSA_Opt *)ssa;
 
         // Use batch workspace as accumulator
-        ssa_real *freq_accum = ssa_mut->ws_batch_complex;
+        ssa_real *SSA_RESTRICT freq_accum = ssa_mut->ws_batch_complex;
         ssa_opt_zero(freq_accum, 2 * r2c_len);
 
         if (ssa->fft_cached && ssa->U_fft && ssa->V_fft)
@@ -2372,14 +2385,17 @@ typedef double ssa_real;
             // FAST PATH: Use cached FFTs with SIMD fused multiply-accumulate
             // Replaces: complex_mul + daxpy with single fused operation
             // ===================================================================
+            const ssa_real *SSA_RESTRICT U_fft = ssa->U_fft;
+            const ssa_real *SSA_RESTRICT V_fft = ssa->V_fft;
+
             for (int g = 0; g < n_group; g++)
             {
                 int idx = group[g];
                 if (idx < 0 || idx >= ssa->n_components)
                     continue;
 
-                const ssa_real *u_fft_cached = &ssa->U_fft[idx * 2 * r2c_len];
-                const ssa_real *v_fft_cached = &ssa->V_fft[idx * 2 * r2c_len];
+                const ssa_real *SSA_RESTRICT u_fft_cached = &U_fft[idx * 2 * r2c_len];
+                const ssa_real *SSA_RESTRICT v_fft_cached = &V_fft[idx * 2 * r2c_len];
 
                 // SIMD fused multiply-accumulate: freq_accum += u_fft * v_fft
                 ssa_opt_complex_mul_acc(u_fft_cached, v_fft_cached, freq_accum, r2c_len);
@@ -2391,7 +2407,10 @@ typedef double ssa_real;
             // SLOW PATH: Compute FFTs on-the-fly (no cache)
             // Still uses SIMD accumulate
             // ===================================================================
-            ssa_real *temp_fft2 = ssa_mut->ws_batch_complex + 2 * r2c_len;
+            ssa_real *SSA_RESTRICT temp_fft2 = ssa_mut->ws_batch_complex + 2 * r2c_len;
+            ssa_real *SSA_RESTRICT ws_real = ssa_mut->ws_real;
+            ssa_real *SSA_RESTRICT ws_real2 = ssa_mut->ws_real2;
+            ssa_real *SSA_RESTRICT ws_complex = ssa_mut->ws_complex;
 
             for (int g = 0; g < n_group; g++)
             {
@@ -2400,23 +2419,23 @@ typedef double ssa_real;
                     continue;
 
                 ssa_real sigma = ssa->sigma[idx];
-                const ssa_real *u_vec = &ssa->U[idx * L];
-                const ssa_real *v_vec = &ssa->V[idx * K];
+                const ssa_real *SSA_RESTRICT u_vec = &ssa->U[idx * L];
+                const ssa_real *SSA_RESTRICT v_vec = &ssa->V[idx * K];
 
                 // Compute FFT(σ * u)
-                ssa_opt_zero(ssa_mut->ws_real, fft_len);
+                ssa_opt_zero(ws_real, fft_len);
                 for (int i = 0; i < L; i++)
-                    ssa_mut->ws_real[i] = sigma * u_vec[i];
-                DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real, ssa_mut->ws_complex);
+                    ws_real[i] = sigma * u_vec[i];
+                DftiComputeForward(ssa_mut->fft_r2c, ws_real, ws_complex);
 
                 // Compute FFT(v)
-                ssa_opt_zero(ssa_mut->ws_real2, fft_len);
+                ssa_opt_zero(ws_real2, fft_len);
                 for (int i = 0; i < K; i++)
-                    ssa_mut->ws_real2[i] = v_vec[i];
-                DftiComputeForward(ssa_mut->fft_r2c, ssa_mut->ws_real2, temp_fft2);
+                    ws_real2[i] = v_vec[i];
+                DftiComputeForward(ssa_mut->fft_r2c, ws_real2, temp_fft2);
 
                 // SIMD fused multiply-accumulate: freq_accum += ws_complex * temp_fft2
-                ssa_opt_complex_mul_acc(ssa_mut->ws_complex, temp_fft2, freq_accum, r2c_len);
+                ssa_opt_complex_mul_acc(ws_complex, temp_fft2, freq_accum, r2c_len);
             }
         }
 
