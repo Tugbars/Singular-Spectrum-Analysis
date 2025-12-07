@@ -105,22 +105,34 @@ endif()
 # Compiler-Specific Optimization Flags
 # ============================================================================
 if(COMPILER_IS_ICX)
-    # Intel ICX: Maximum performance for Intel CPUs
-    # -xHost: Optimize for current CPU (use -xcore-avx2 for portable AVX2)
-    # -qopt-zmm-usage=high: Aggressive AVX-512 usage (if available)
-    # -ipo: Interprocedural optimization (whole-program)
-    # -ffast-math: Aggressive FP optimizations
-    # -qopenmp: Intel OpenMP runtime (lower overhead than libgomp)
-    set(ICX_RELEASE_FLAGS
-        -O3
-        -xHost
-        -ipo
-        -ffast-math
-        -fno-strict-aliasing
-        -qopt-report=3
-        -qopt-report-phase=vec
-    )
-    
+    if(WIN32)
+        # --- WINDOWS (ICX acts like MSVC) ---
+        # /QxHost: Optimize for host CPU (AVX2/AVX512)
+        # /Qipo: Interprocedural Optimization
+        # /fp:fast: Flush-to-zero, reassociation (critical for your 280us target)
+        # /Qopt-report:3: Vectorization report
+        set(ICX_RELEASE_FLAGS
+            /O3
+            /QxHost
+            /Qipo
+            /fp:fast
+            /Qopt-report:3
+            /Qopt-report-phase:vec
+        )
+        # Note: -fno-strict-aliasing is standard Clang flag, usually works on Windows too,
+        # but if it fails, remove it.
+    else()
+        # --- LINUX/UNIX (ICX acts like GCC) ---
+        set(ICX_RELEASE_FLAGS
+            -O3
+            -xHost
+            -ipo
+            -fp-model fast
+            -fno-strict-aliasing
+            -qopt-report=3
+            -qopt-report-phase=vec
+        )
+    endif()
     # For portable builds (works on any AVX2 CPU):
     # set(ICX_RELEASE_FLAGS -O3 -xcore-avx2 -ipo -ffast-math)
     
