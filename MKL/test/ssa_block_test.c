@@ -23,7 +23,7 @@
 #define _USE_MATH_DEFINES
 #define SSA_USE_MKL
 
-#define SSA_USE_FLOAT  // optional, for float mode
+#define SSA_USE_FLOAT // optional, for float mode
 
 #define SSA_OPT_IMPLEMENTATION
 #include "ssa_opt_r2c.h"
@@ -53,14 +53,107 @@ static double get_time_ms(void)
     QueryPerformanceCounter(&counter);
     return (double)counter.QuadPart * 1000.0 / freq.QuadPart;
 }
+
+// Pin current thread to a specific CPU core (P-core 0)
+static void pin_thread_to_core(int core_id)
+{
+    DWORD_PTR mask = (DWORD_PTR)1 << core_id;
+    SetThreadAffinityMask(GetCurrentThread(), mask);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+}
+
 #else
+#include <sched.h>
+#include <pthread.h>
 static double get_time_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
+
+static void pin_thread_to_core(int core_id)
+{
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+}
 #endif
+
+// ============================================================================
+// TLB Warmup - Pre-touch all memory pages to avoid TLB miss storms
+// ============================================================================
+static void tlb_warmup_ssa(SSA_Opt *ssa)
+{
+    volatile char dummy = 0;
+    const size_t PAGE_SIZE = 4096;
+
+    // Touch workspace pages
+    if (ssa->ws_real)
+    {
+        for (size_t i = 0; i < (size_t)ssa->fft_len * sizeof(ssa_real); i += PAGE_SIZE)
+            dummy += ((volatile char *)ssa->ws_real)[i];
+    }
+    if (ssa->ws_real2)
+    {
+        for (size_t i = 0; i < (size_t)ssa->fft_len * sizeof(ssa_real); i += PAGE_SIZE)
+            dummy += ((volatile char *)ssa->ws_real2)[i];
+    }
+    if (ssa->ws_complex)
+    {
+        for (size_t i = 0; i < (size_t)(2 * ssa->r2c_len) * sizeof(ssa_real); i += PAGE_SIZE)
+            dummy += ((volatile char *)ssa->ws_complex)[i];
+    }
+    if (ssa->ws_batch_real)
+    {
+        for (size_t i = 0; i < (size_t)(ssa->batch_size * ssa->fft_len) * sizeof(ssa_real); i += PAGE_SIZE)
+            dummy += ((volatile char *)ssa->ws_batch_real)[i];
+    }
+    if (ssa->ws_batch_complex)
+    {
+        for (size_t i = 0; i < (size_t)(ssa->batch_size * 2 * ssa->r2c_len) * sizeof(ssa_real); i += PAGE_SIZE)
+            dummy += ((volatile char *)ssa->ws_batch_complex)[i];
+    }
+
+    // Touch U, V, sigma arrays
+    if (ssa->U)
+    {
+        for (size_t i = 0; i < (size_t)(ssa->n_components * ssa->L) * sizeof(ssa_real); i += PAGE_SIZE)
+            dummy += ((volatile char *)ssa->U)[i];
+    }
+    if (ssa->V)
+    {
+        for (size_t i = 0; i < (size_t)(ssa->n_components * ssa->K) * sizeof(ssa_real); i += PAGE_SIZE)
+            dummy += ((volatile char *)ssa->V)[i];
+    }
+
+    // Touch decomposition workspaces if allocated
+    if (ssa->decomp_Omega)
+    {
+        int kp = ssa->n_components + 10; // oversampling estimate
+        for (size_t i = 0; i < (size_t)(ssa->K * kp) * sizeof(ssa_real); i += PAGE_SIZE)
+            dummy += ((volatile char *)ssa->decomp_Omega)[i];
+    }
+    if (ssa->decomp_Y)
+    {
+        int kp = ssa->n_components + 10;
+        for (size_t i = 0; i < (size_t)(ssa->L * kp) * sizeof(ssa_real); i += PAGE_SIZE)
+            dummy += ((volatile char *)ssa->decomp_Y)[i];
+    }
+
+    (void)dummy; // Suppress unused warning
+}
+
+// Warmup buffer for output
+static void tlb_warmup_buffer(void *buf, size_t size)
+{
+    volatile char dummy = 0;
+    const size_t PAGE_SIZE = 4096;
+    for (size_t i = 0; i < size; i += PAGE_SIZE)
+        dummy += ((volatile char *)buf)[i];
+    (void)dummy;
+}
 
 static double correlation(const ssa_real *a, const ssa_real *b, int n)
 {
@@ -327,6 +420,169 @@ int main(void)
     mkl_free(x_copy);
 
     // =========================================================================
+    // Test 7: PRODUCTION LATENCY TEST (N=500, L=375, k=15)
+    // Maximum speed configuration with TLB warmup and thread pinning
+    // =========================================================================
+    printf("=== Test 7: PRODUCTION LATENCY TEST (N=500) ===\n");
+    printf("Configuration: Thread pinned to P-core 0, TLB pre-warmed\n\n");
+
+    // Pin to P-core 0 for consistent latency
+    pin_thread_to_core(0);
+
+    // Production parameters
+    const int N_PROD = 500;
+    const int L_PROD = 375; // 0.75 * N - good for financial data
+    const int k_PROD = 15;
+    const int oversample_PROD = 10;
+    const int n_warmup = 50;      // Warmup iterations (not timed)
+    const int n_benchmark = 1000; // Benchmark iterations
+
+    // Allocate production buffers
+    ssa_real *x_prod = (ssa_real *)mkl_malloc(N_PROD * sizeof(ssa_real), 64);
+    ssa_real *recon_prod = (ssa_real *)mkl_malloc(N_PROD * sizeof(ssa_real), 64);
+    int *group_prod = (int *)malloc(k_PROD * sizeof(int));
+    for (int i = 0; i < k_PROD; i++)
+        group_prod[i] = i;
+
+    // Create test signal
+    for (int i = 0; i < N_PROD; i++)
+    {
+        x_prod[i] = (ssa_real)(0.01 * i + 10.0 * sin(2.0 * M_PI * i / 50.0) +
+                               5.0 * sin(2.0 * M_PI * i / 20.0) +
+                               0.5 * ((double)rand() / RAND_MAX - 0.5));
+    }
+
+    // Initialize SSA
+    SSA_Opt ssa_prod = {0};
+    ssa_opt_init(&ssa_prod, x_prod, N_PROD, L_PROD);
+    ssa_opt_prepare(&ssa_prod, k_PROD, oversample_PROD);
+
+    // TLB warmup - pre-touch all memory pages
+    printf("Pre-warming TLB and caches...\n");
+    tlb_warmup_ssa(&ssa_prod);
+    tlb_warmup_buffer(x_prod, N_PROD * sizeof(ssa_real));
+    tlb_warmup_buffer(recon_prod, N_PROD * sizeof(ssa_real));
+
+    // CPU warmup iterations (not timed)
+    printf("Running %d warmup iterations...\n", n_warmup);
+    for (int i = 0; i < n_warmup; i++)
+    {
+        x_prod[0] += (ssa_real)0.0001;
+        ssa_opt_update_signal(&ssa_prod, x_prod);
+        ssa_opt_decompose_randomized(&ssa_prod, k_PROD, oversample_PROD);
+        ssa_opt_reconstruct(&ssa_prod, group_prod, k_PROD, recon_prod);
+    }
+
+    // Re-warm TLB after warmup (in case of eviction)
+    tlb_warmup_ssa(&ssa_prod);
+
+    // Benchmark: measure individual iteration times
+    printf("Running %d benchmark iterations...\n\n", n_benchmark);
+
+    double *latencies = (double *)malloc(n_benchmark * sizeof(double));
+    double total_time = 0;
+    double min_latency = 1e9, max_latency = 0;
+
+    for (int i = 0; i < n_benchmark; i++)
+    {
+        // Simulate new tick
+        x_prod[i % N_PROD] += (ssa_real)0.0001;
+
+        t0 = get_time_ms();
+
+        ssa_opt_update_signal(&ssa_prod, x_prod);
+        ssa_opt_decompose_randomized(&ssa_prod, k_PROD, oversample_PROD);
+        ssa_opt_reconstruct(&ssa_prod, group_prod, k_PROD, recon_prod);
+
+        double latency = get_time_ms() - t0;
+        latencies[i] = latency;
+        total_time += latency;
+
+        if (latency < min_latency)
+            min_latency = latency;
+        if (latency > max_latency)
+            max_latency = latency;
+    }
+
+    // Calculate statistics
+    double mean_latency = total_time / n_benchmark;
+
+    // Sort for percentiles
+    for (int i = 0; i < n_benchmark - 1; i++)
+    {
+        for (int j = i + 1; j < n_benchmark; j++)
+        {
+            if (latencies[j] < latencies[i])
+            {
+                double tmp = latencies[i];
+                latencies[i] = latencies[j];
+                latencies[j] = tmp;
+            }
+        }
+    }
+
+    double p50 = latencies[n_benchmark / 2];
+    double p95 = latencies[(int)(n_benchmark * 0.95)];
+    double p99 = latencies[(int)(n_benchmark * 0.99)];
+    double p999 = latencies[(int)(n_benchmark * 0.999)];
+
+    // Calculate standard deviation
+    double variance = 0;
+    for (int i = 0; i < n_benchmark; i++)
+    {
+        double diff = latencies[i] - mean_latency;
+        variance += diff * diff;
+    }
+    double stddev = sqrt(variance / n_benchmark);
+
+    printf("╔═══════════════════════════════════════════════════════════╗\n");
+    printf("║           PRODUCTION LATENCY RESULTS (N=500)              ║\n");
+    printf("╠═══════════════════════════════════════════════════════════╣\n");
+    printf("║  Parameters: N=%d, L=%d, k=%d, oversampling=%d          ║\n",
+           N_PROD, L_PROD, k_PROD, oversample_PROD);
+    printf("║  Iterations: %d (after %d warmup)                       ║\n",
+           n_benchmark, n_warmup);
+    printf("╠═══════════════════════════════════════════════════════════╣\n");
+    printf("║  Mean latency:    %8.2f μs                             ║\n", mean_latency * 1000);
+    printf("║  Std deviation:   %8.2f μs                             ║\n", stddev * 1000);
+    printf("║  Min latency:     %8.2f μs                             ║\n", min_latency * 1000);
+    printf("║  Max latency:     %8.2f μs                             ║\n", max_latency * 1000);
+    printf("╠═══════════════════════════════════════════════════════════╣\n");
+    printf("║  P50 (median):    %8.2f μs                             ║\n", p50 * 1000);
+    printf("║  P95:             %8.2f μs                             ║\n", p95 * 1000);
+    printf("║  P99:             %8.2f μs                             ║\n", p99 * 1000);
+    printf("║  P99.9:           %8.2f μs                             ║\n", p999 * 1000);
+    printf("╠═══════════════════════════════════════════════════════════╣\n");
+    printf("║  Throughput:      %8.0f updates/sec                    ║\n",
+           1000.0 / mean_latency);
+    printf("╚═══════════════════════════════════════════════════════════╝\n\n");
+
+    // Check if we hit 200 μs target
+    if (mean_latency * 1000 < 200.0)
+    {
+        printf("✓ TARGET MET: Mean latency < 200 μs\n\n");
+    }
+    else if (mean_latency * 1000 < 300.0)
+    {
+        printf("◐ CLOSE: Mean latency < 300 μs (target: 200 μs)\n\n");
+    }
+    else
+    {
+        printf("✗ TARGET MISSED: Mean latency > 300 μs\n\n");
+    }
+
+    // Verify correctness
+    double corr_prod = correlation(recon_prod, x_prod, N_PROD);
+    printf("Reconstruction correlation: %.6f\n\n", corr_prod);
+
+    // Cleanup production test
+    free(latencies);
+    free(group_prod);
+    mkl_free(x_prod);
+    mkl_free(recon_prod);
+    ssa_opt_free(&ssa_prod);
+
+    // =========================================================================
     // Comparison Summary
     // =========================================================================
     printf("============================================================\n");
@@ -342,6 +598,7 @@ int main(void)
     printf("%-25s %10.2f %10.2fx\n", "W-corr (cached)", t_wcorr_cached, t_wcorr_nocache / t_wcorr_cached);
     printf("------------------------------------------------------------\n");
     printf("%-25s %10.2f %10s\n", "Streaming (per iter)", t_streaming / n_hot_iterations, "-");
+    printf("%-25s %10.2f %10s\n", "Production N=500 (mean)", mean_latency, "-");
     printf("============================================================\n\n");
 
     // =========================================================================
@@ -365,6 +622,11 @@ int main(void)
     if (corr_rand < 0.99)
     {
         printf("[FAIL] Randomized reconstruction correlation < 0.99\n");
+        pass = 0;
+    }
+    if (corr_prod < 0.99)
+    {
+        printf("[FAIL] Production reconstruction correlation < 0.99\n");
         pass = 0;
     }
 
@@ -395,7 +657,6 @@ int main(void)
     {
         printf("[WARN] Randomized SVD speedup < 1.5x (may be expected for small k)\n");
     }
-
 
     if (pass)
     {

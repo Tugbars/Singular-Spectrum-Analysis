@@ -27,3 +27,5 @@ MKL/py/cadzow_comparison.png
 MKL/py/forecast_finance.png
 MKL/py/benchmark_vs_rssa.py
 MKL/test/ssa_block_test.c
+/CMakeFiles
+CMakeCache.txt
