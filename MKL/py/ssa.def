@@ -67,5 +67,4 @@ EXPORTS
     ssa_mkl_set_threads
     ssa_mkl_get_threads
     ssa_mkl_get_cpu_info
-    ssa_mkl_set_p_core_affinity
     ssa_mkl_disable_affinity

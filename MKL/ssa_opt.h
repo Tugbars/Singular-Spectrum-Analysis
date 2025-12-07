@@ -61,6 +61,14 @@ extern "C"
         DFTI_DESCRIPTOR_HANDLE fft_c2r_batch; // Inverse batched: up to SSA_BATCH_SIZE vectors
         DFTI_DESCRIPTOR_HANDLE fft_c2r_wcorr; // Inverse for W-correlation (n_components at once)
 
+        // === Thread-Local FFT Descriptor Pool (OpenMP optimization) ===
+        // Pre-allocated per-thread descriptors to avoid expensive DftiCommitDescriptor
+        // calls inside hot loops like ssa_opt_cache_ffts
+#ifdef _OPENMP
+        DFTI_DESCRIPTOR_HANDLE *thread_fft_pool; // Array of descriptors, one per thread
+        int thread_pool_size;                    // Number of threads (omp_get_max_threads at init)
+#endif
+
         // === Random Number Generator ===
         VSLStreamStatePtr rng; // MKL VSL stream for randomized SVD (Mersenne Twister)
 
@@ -742,6 +750,8 @@ extern "C"
      * - Creates MKL FFT descriptors (forward, inverse, batched)
      * - Pre-computes FFT of signal (reused in every Hankel matvec)
      * - Pre-computes diagonal averaging weights
+     * - Creates per-thread FFT descriptor pool for OpenMP (avoids expensive
+     *   DftiCommitDescriptor calls in hot loops like ssa_opt_cache_ffts)
      *
      * After init, call ssa_opt_decompose*() then ssa_opt_reconstruct().
      *
@@ -904,6 +914,49 @@ extern "C"
             return -1;
         }
 
+        // === Initialize Per-Thread FFT Descriptor Pool (OpenMP Optimization) ===
+        // DftiCommitDescriptor is extremely expensive (computes trig tables, factorizes length).
+        // By creating one descriptor per thread at init time, we avoid this cost in hot loops
+        // like ssa_opt_cache_ffts() which previously created/destroyed descriptors per call.
+#ifdef _OPENMP
+        {
+            int max_threads = omp_get_max_threads();
+            ssa->thread_pool_size = max_threads;
+            ssa->thread_fft_pool = (DFTI_DESCRIPTOR_HANDLE *)malloc(max_threads * sizeof(DFTI_DESCRIPTOR_HANDLE));
+
+            if (!ssa->thread_fft_pool)
+            {
+                ssa_opt_free(ssa);
+                return -1;
+            }
+
+            // Initialize all handles to NULL first (for safe cleanup on partial failure)
+            for (int t = 0; t < max_threads; t++)
+            {
+                ssa->thread_fft_pool[t] = NULL;
+            }
+
+            // Create and commit each thread's descriptor
+            for (int t = 0; t < max_threads; t++)
+            {
+                status = DftiCreateDescriptor(&ssa->thread_fft_pool[t], DFTI_DOUBLE, DFTI_REAL, 1, fft_n);
+                if (status != 0)
+                {
+                    ssa_opt_free(ssa);
+                    return -1;
+                }
+                DftiSetValue(ssa->thread_fft_pool[t], DFTI_PLACEMENT, DFTI_NOT_INPLACE);
+                DftiSetValue(ssa->thread_fft_pool[t], DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
+                status = DftiCommitDescriptor(ssa->thread_fft_pool[t]);
+                if (status != 0)
+                {
+                    ssa_opt_free(ssa);
+                    return -1;
+                }
+            }
+        }
+#endif
+
         // === Initialize Random Number Generator ===
         // Used by randomized SVD for generating Gaussian random matrices
         // MT2203: Mersenne Twister variant optimized for parallel streams
@@ -953,6 +1006,8 @@ extern "C"
     {
         if (!ssa)
             return;
+
+        // Free MKL FFT descriptors
         if (ssa->fft_r2c)
             DftiFreeDescriptor(&ssa->fft_r2c);
         if (ssa->fft_c2r)
@@ -963,6 +1018,22 @@ extern "C"
             DftiFreeDescriptor(&ssa->fft_c2r_batch);
         if (ssa->fft_c2r_wcorr)
             DftiFreeDescriptor(&ssa->fft_c2r_wcorr);
+
+        // Free per-thread FFT descriptor pool
+#ifdef _OPENMP
+        if (ssa->thread_fft_pool)
+        {
+            for (int t = 0; t < ssa->thread_pool_size; t++)
+            {
+                if (ssa->thread_fft_pool[t])
+                    DftiFreeDescriptor(&ssa->thread_fft_pool[t]);
+            }
+            free(ssa->thread_fft_pool);
+            ssa->thread_fft_pool = NULL;
+            ssa->thread_pool_size = 0;
+        }
+#endif
+
         if (ssa->rng)
             vslDeleteStream(&ssa->rng);
         ssa_opt_free_ptr(ssa->fft_x);
@@ -1748,9 +1819,12 @@ extern "C"
      *
      * Memory cost: ~4 * k * fft_len doubles (typically 1-5 MB)
      *
+     * OPTIMIZATION: Uses pre-allocated per-thread FFT descriptors from init()
+     * instead of creating/destroying descriptors per call. This eliminates
+     * the expensive DftiCommitDescriptor overhead in hot loops.
+     *
      * @param ssa  Decomposed SSA structure
      * @return     0 on success, -1 on failure
-     *
      */
     int ssa_opt_cache_ffts(SSA_Opt *ssa)
     {
@@ -1784,11 +1858,11 @@ extern "C"
 
 #ifdef _OPENMP
         // =========================================================================
-        // PARALLEL PATH: Each thread gets its own workspace and FFT descriptor
-        // MKL FFT descriptors are not thread-safe for concurrent execution,
-        // so each thread needs its own descriptor instance.
+        // PARALLEL PATH: Use pre-allocated per-thread FFT descriptors
+        // This eliminates the expensive DftiCommitDescriptor calls that were
+        // previously done inside this function on every call.
         // =========================================================================
-        int n_threads = omp_get_max_threads();
+        int n_threads = ssa->thread_pool_size;
 
         // Allocate per-thread workspaces for zero-padded input
         double *ws_pool = (double *)ssa_opt_alloc(n_threads * fft_len * sizeof(double));
@@ -1798,95 +1872,55 @@ extern "C"
             return -1;
         }
 
-        // Create per-thread FFT descriptors
-        DFTI_DESCRIPTOR_HANDLE *fft_handles = (DFTI_DESCRIPTOR_HANDLE *)malloc(n_threads * sizeof(DFTI_DESCRIPTOR_HANDLE));
-        if (!fft_handles)
+        // === Compute FFT of Each Scaled Left Singular Vector (PARALLEL) ===
+        // U_fft[i] = FFT(σᵢ · uᵢ)
+        // The σᵢ scaling is baked in so reconstruction just needs element-wise multiply
+        #pragma omp parallel
         {
-            ssa_opt_free_ptr(ws_pool);
-            ssa_opt_free_cached_ffts(ssa);
-            return -1;
-        }
+            int tid = omp_get_thread_num();
+            double *ws_real = ws_pool + tid * fft_len;
+            DFTI_DESCRIPTOR_HANDLE my_fft = ssa->thread_fft_pool[tid]; // Pre-allocated!
+            int i; // Declare BEFORE pragma for MSVC OpenMP 2.0 compatibility
 
-        int fft_init_ok = 1;
-        for (int t = 0; t < n_threads; t++)
-        {
-            MKL_LONG status = DftiCreateDescriptor(&fft_handles[t], DFTI_DOUBLE, DFTI_REAL, 1, fft_len);
-            if (status != 0)
+            #pragma omp for schedule(static)
+            for (i = 0; i < k; i++)
             {
-                fft_init_ok = 0;
-                break;
-            }
-            DftiSetValue(fft_handles[t], DFTI_PLACEMENT, DFTI_NOT_INPLACE);
-            DftiSetValue(fft_handles[t], DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
-            status = DftiCommitDescriptor(fft_handles[t]);
-            if (status != 0)
-            {
-                fft_init_ok = 0;
-                break;
+                double sigma = ssa->sigma[i];
+                const double *u_vec = &ssa->U[i * L];
+                double *dst = &ssa->U_fft[i * 2 * r2c_len];
+
+                memset(ws_real, 0, fft_len * sizeof(double));
+                for (int j = 0; j < L; j++)
+                    ws_real[j] = sigma * u_vec[j];
+
+                DftiComputeForward(my_fft, ws_real, dst);
             }
         }
 
-        if (!fft_init_ok)
+        // === Compute FFT of Each Right Singular Vector (PARALLEL) ===
+        // V_fft[i] = FFT(vᵢ)
+        #pragma omp parallel
         {
-            for (int t = 0; t < n_threads; t++)
-                DftiFreeDescriptor(&fft_handles[t]);
-            free(fft_handles);
-            ssa_opt_free_ptr(ws_pool);
-            ssa_opt_free_cached_ffts(ssa);
-            return -1;
+            int tid = omp_get_thread_num();
+            double *ws_real = ws_pool + tid * fft_len;
+            DFTI_DESCRIPTOR_HANDLE my_fft = ssa->thread_fft_pool[tid]; // Pre-allocated!
+            int i; // Declare BEFORE pragma for MSVC OpenMP 2.0 compatibility
+
+            #pragma omp for schedule(static)
+            for (i = 0; i < k; i++)
+            {
+                const double *v_vec = &ssa->V[i * K];
+                double *dst = &ssa->V_fft[i * 2 * r2c_len];
+
+                memset(ws_real, 0, fft_len * sizeof(double));
+                for (int j = 0; j < K; j++)
+                    ws_real[j] = v_vec[j];
+
+                DftiComputeForward(my_fft, ws_real, dst);
+            }
         }
 
-// === Compute FFT of Each Scaled Left Singular Vector (PARALLEL) ===
-// U_fft[i] = FFT(σᵢ · uᵢ)
-// The σᵢ scaling is baked in so reconstruction just needs element-wise multiply
- #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        double *ws_real = ws_pool + tid * fft_len;
-        DFTI_DESCRIPTOR_HANDLE my_fft = fft_handles[tid];
-        int i;  // Declare BEFORE pragma for MSVC OpenMP 2.0 compatibility
-
-        #pragma omp for schedule(static)
-        for (i = 0; i < k; i++)
-        {
-            double sigma = ssa->sigma[i];
-            const double *u_vec = &ssa->U[i * L];
-            double *dst = &ssa->U_fft[i * 2 * r2c_len];
-
-            memset(ws_real, 0, fft_len * sizeof(double));
-            for (int j = 0; j < L; j++)
-                ws_real[j] = sigma * u_vec[j];
-
-            DftiComputeForward(my_fft, ws_real, dst);
-        }
-    }
-
-// === Compute FFT of Each Right Singular Vector (PARALLEL) ===
-// V_fft[i] = FFT(vᵢ)
- #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        double *ws_real = ws_pool + tid * fft_len;
-        DFTI_DESCRIPTOR_HANDLE my_fft = fft_handles[tid];
-        int i;  // Declare BEFORE pragma for MSVC OpenMP 2.0 compatibility
-
-        #pragma omp for schedule(static)
-        for (i = 0; i < k; i++)
-        {
-            const double *v_vec = &ssa->V[i * K];
-            double *dst = &ssa->V_fft[i * 2 * r2c_len];
-
-            memset(ws_real, 0, fft_len * sizeof(double));
-            for (int j = 0; j < K; j++)
-                ws_real[j] = v_vec[j];
-
-            DftiComputeForward(my_fft, ws_real, dst);
-        }
-    }
-        // Cleanup per-thread resources
-        for (int t = 0; t < n_threads; t++)
-            DftiFreeDescriptor(&fft_handles[t]);
-        free(fft_handles);
+        // Free per-thread workspace (but NOT the descriptors - they're reused!)
         ssa_opt_free_ptr(ws_pool);
 
 #else

@@ -116,15 +116,6 @@ DLL_EXPORT void ssa_mkl_get_cpu_info(int *p_cores, int *e_cores,
 }
 
 /**
- * Set thread affinity to P-cores only.
- * Must be called BEFORE ssa_mkl_init() or any MKL operations.
- */
-DLL_EXPORT void ssa_mkl_set_p_core_affinity(void)
-{
-    mkl_config_set_p_core_affinity();
-}
-
-/**
  * Disable thread affinity (let OS schedule).
  */
 DLL_EXPORT void ssa_mkl_disable_affinity(void)
