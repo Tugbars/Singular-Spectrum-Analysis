@@ -3,8 +3,18 @@
  * Test finite-rank signal approximation via iterative projection
  */
 
+
 #define SSA_OPT_IMPLEMENTATION
-#include "ssa_opt.h"
+#include "ssa_opt_r2c.h"
+
+#define SSA_OPT_ANALYSIS_IMPLEMENTATION
+#include "ssa_opt_analysis.h"
+
+#define SSA_OPT_FORECAST_IMPLEMENTATION
+#include "ssa_opt_forecast.h"
+
+#define SSA_OPT_ADVANCED_IMPLEMENTATION
+#include "ssa_opt_advanced.h"
 #include <stdio.h>
 #include <math.h>
 

@@ -14,7 +14,16 @@
 #include <math.h>
 
 #define SSA_OPT_IMPLEMENTATION
-#include "ssa_opt.h"
+#include "ssa_opt_r2c.h"
+
+#define SSA_OPT_ANALYSIS_IMPLEMENTATION
+#include "ssa_opt_analysis.h"
+
+#define SSA_OPT_FORECAST_IMPLEMENTATION
+#include "ssa_opt_forecast.h"
+
+#define SSA_OPT_ADVANCED_IMPLEMENTATION
+#include "ssa_opt_advanced.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

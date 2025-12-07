@@ -12,7 +12,17 @@
 
 #define _USE_MATH_DEFINES
 #define SSA_OPT_IMPLEMENTATION
-#include "ssa_opt.h"
+#define SSA_OPT_IMPLEMENTATION
+#include "ssa_opt_r2c.h"
+
+#define SSA_OPT_ANALYSIS_IMPLEMENTATION
+#include "ssa_opt_analysis.h"
+
+#define SSA_OPT_FORECAST_IMPLEMENTATION
+#include "ssa_opt_forecast.h"
+
+#define SSA_OPT_ADVANCED_IMPLEMENTATION
+#include "ssa_opt_advanced.h"
 #include "mkl_config.h"
 
 #include <stdio.h>
