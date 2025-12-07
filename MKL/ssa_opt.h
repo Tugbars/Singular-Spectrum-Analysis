@@ -641,11 +641,17 @@ extern "C"
     // Hankel matvec via R2C FFT: y = H·v where H[i,j] = x[i+j]
     // Exploits: H·v = conv(x, flip(v))[K-1 : K-1+L]
     // See docs/HANKEL_MATVEC.md for derivation
+    //
+    // OPTIMIZATION: Smart zero-fill - only zero the tail, not the data region
+    // Saves ~30-50% of memory writes (K writes instead of fft_len writes)
     static void ssa_opt_hankel_matvec(SSA_Opt *ssa, const double *v, double *y)
     {
         int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
-        ssa_opt_zero(ssa->ws_real, fft_len);
-        ssa_opt_reverse_copy(v, ssa->ws_real, K);                                       // flip(v) for correlation
+        
+        // Smart zero-fill: write data first, then zero only the padding tail
+        ssa_opt_reverse_copy(v, ssa->ws_real, K);                                       // flip(v) into [0..K)
+        memset(ssa->ws_real + K, 0, (fft_len - K) * sizeof(double));                    // zero [K..fft_len)
+        
         DftiComputeForward(ssa->fft_r2c, ssa->ws_real, ssa->ws_complex);                // FFT(flip(v))
         ssa_opt_complex_mul_r2c(ssa->fft_x, ssa->ws_complex, ssa->ws_complex, r2c_len); // FFT(x) ⊙ FFT(flip(v))
         DftiComputeBackward(ssa->fft_c2r, ssa->ws_complex, ssa->ws_real);               // IFFT → conv result
@@ -654,19 +660,26 @@ extern "C"
 
     // Adjoint Hankel matvec: z = Hᵀ·u
     // Exploits: Hᵀ·u = conv(x, flip(u))[L-1 : L-1+K]
+    //
+    // OPTIMIZATION: Smart zero-fill - only zero the tail
     static void ssa_opt_hankel_matvec_T(SSA_Opt *ssa, const double *u, double *y)
     {
         int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
-        ssa_opt_zero(ssa->ws_real, fft_len);
-        ssa_opt_reverse_copy(u, ssa->ws_real, L);
+        
+        // Smart zero-fill: write data first, then zero only the padding tail
+        ssa_opt_reverse_copy(u, ssa->ws_real, L);                                       // flip(u) into [0..L)
+        memset(ssa->ws_real + L, 0, (fft_len - L) * sizeof(double));                    // zero [L..fft_len)
+        
         DftiComputeForward(ssa->fft_r2c, ssa->ws_real, ssa->ws_complex);
         ssa_opt_complex_mul_r2c(ssa->fft_x, ssa->ws_complex, ssa->ws_complex, r2c_len);
         DftiComputeBackward(ssa->fft_c2r, ssa->ws_complex, ssa->ws_real);
-        memcpy(y, ssa->ws_real + (L - 1), K * sizeof(double)); // extract [L-1, L-1+K)
+        memcpy(y, ssa->ws_real + (L - 1), K * sizeof(double));                          // extract [L-1, L-1+K)
     }
 
     // Block Hankel matvec: Y = H·V where V is K×b, Y is L×b
     // Batches up to SSA_BATCH_SIZE vectors per MKL FFT call for efficiency
+    //
+    // OPTIMIZATION: Smart zero-fill in batch packing loop
     static void ssa_opt_hankel_matvec_block(SSA_Opt *ssa, const double *V_block, double *Y_block, int b)
     {
         int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
@@ -683,13 +696,16 @@ extern "C"
                 continue;
             }
             // Pack reversed vectors contiguously for batched FFT
-            memset(ws_real, 0, SSA_BATCH_SIZE * fft_len * sizeof(double));
+            // Smart zero-fill: write data, then zero only the tail per slot
             for (int i = 0; i < batch_count; i++)
             {
                 const double *v = &V_block[(col + i) * K];
                 double *dst = ws_real + i * fft_len;
+                // Reverse copy into [0..K)
                 for (int j = 0; j < K; j++)
                     dst[j] = v[K - 1 - j];
+                // Zero only the tail [K..fft_len)
+                memset(dst + K, 0, (fft_len - K) * sizeof(double));
             }
             DftiComputeForward(ssa->fft_r2c_batch, ws_real, ws_complex); // Batched FFT (single MKL call)
             for (int i = 0; i < batch_count; i++)
@@ -705,6 +721,8 @@ extern "C"
     }
 
     // Block adjoint Hankel matvec: Z = Hᵀ·U where U is L×b, Z is K×b
+    //
+    // OPTIMIZATION: Smart zero-fill in batch packing loop
     static void ssa_opt_hankel_matvec_T_block(SSA_Opt *ssa, const double *U_block, double *Y_block, int b)
     {
         int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
@@ -720,13 +738,16 @@ extern "C"
                 col += batch_count;
                 continue;
             }
-            memset(ws_real, 0, SSA_BATCH_SIZE * fft_len * sizeof(double));
+            // Smart zero-fill: write data, then zero only the tail per slot
             for (int i = 0; i < batch_count; i++)
             {
                 const double *u = &U_block[(col + i) * L];
                 double *dst = ws_real + i * fft_len;
+                // Reverse copy into [0..L)
                 for (int j = 0; j < L; j++)
                     dst[j] = u[L - 1 - j];
+                // Zero only the tail [L..fft_len)
+                memset(dst + L, 0, (fft_len - L) * sizeof(double));
             }
             DftiComputeForward(ssa->fft_r2c_batch, ws_real, ws_complex);
             for (int i = 0; i < batch_count; i++)
@@ -2117,6 +2138,9 @@ extern "C"
 
         return 0;
     }
+
+// ***************************************************** FEATURES *********************************************************************
+
 
     // Forward declaration for auto-dispatch
     int ssa_opt_wcorr_matrix_fast(const SSA_Opt *ssa, double *W);
