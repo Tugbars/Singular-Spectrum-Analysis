@@ -52,7 +52,6 @@ extern "C"
 //   - Trading signal extraction (noise floor >> float epsilon)
 // ============================================================================
 
-
 #ifdef SSA_USE_FLOAT
     typedef float ssa_real;
     #define SSA_DFTI_PRECISION      DFTI_SINGLE
@@ -151,12 +150,13 @@ extern "C"
         int K;       // Number of lagged copies, K = N - L + 1
         int fft_len; // FFT length (next power of 2 >= N + K for convolution)
         int r2c_len; // Real-to-complex output length = fft_len/2 + 1 (Hermitian symmetry)
+        int batch_size; // Dynamic batch size for FFT (cache-optimized at init)
 
         // === MKL FFT Descriptors ===
         DFTI_DESCRIPTOR_HANDLE fft_r2c;       // Forward: real → complex (single vector)
         DFTI_DESCRIPTOR_HANDLE fft_c2r;       // Inverse: complex → real (single vector)
-        DFTI_DESCRIPTOR_HANDLE fft_r2c_batch; // Forward batched: up to SSA_BATCH_SIZE vectors
-        DFTI_DESCRIPTOR_HANDLE fft_c2r_batch; // Inverse batched: up to SSA_BATCH_SIZE vectors
+        DFTI_DESCRIPTOR_HANDLE fft_r2c_batch; // Forward batched: processes batch_size vectors
+        DFTI_DESCRIPTOR_HANDLE fft_c2r_batch; // Inverse batched: processes batch_size vectors
         DFTI_DESCRIPTOR_HANDLE fft_c2r_wcorr; // Inverse for W-correlation (n_components at once)
 
         // === Thread-Local FFT Descriptor Pool (OpenMP optimization) ===
@@ -178,8 +178,8 @@ extern "C"
         ssa_real *ws_proj;    // Projection workspace for power iteration
 
         // === Batched FFT Workspaces ===
-        ssa_real *ws_batch_real;    // Batched real input, fft_len * SSA_BATCH_SIZE
-        ssa_real *ws_batch_complex; // Batched complex output, 2*r2c_len * SSA_BATCH_SIZE
+        ssa_real *ws_batch_real;    // Batched real input, fft_len * batch_size
+        ssa_real *ws_batch_complex; // Batched complex output, 2*r2c_len * batch_size
 
         // === SVD Results ===
         ssa_real *U;           // Left singular vectors, L × n_components (column-major)
@@ -903,17 +903,19 @@ extern "C"
     }
 
     // Block Hankel matvec: Y = H·V where V is K×b, Y is L×b
-    // Batches up to SSA_BATCH_SIZE vectors per MKL FFT call for efficiency
+    // Batches vectors per MKL FFT call for efficiency (batch_size computed at init)
     //
     // OPTIMIZATION: Conjugate multiply eliminates reverse copy in batch packing
+    // OPTIMIZATION: OpenMP parallel packing when sufficient work to hide overhead
     static void ssa_opt_hankel_matvec_block(SSA_Opt *ssa, const ssa_real *V_block, ssa_real *Y_block, int b)
     {
         int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
+        int batch_size = ssa->batch_size;
         ssa_real *ws_real = ssa->ws_batch_real, *ws_complex = ssa->ws_batch_complex;
         int col = 0;
         while (col < b)
         {
-            int batch_count = ssa_opt_min(SSA_BATCH_SIZE, b - col);
+            int batch_count = ssa_opt_min(batch_size, b - col);
             if (batch_count < 2)
             { // Fallback for tiny batches
                 for (int i = 0; i < batch_count; i++)
@@ -921,15 +923,22 @@ extern "C"
                 col += batch_count;
                 continue;
             }
-            // Pack vectors contiguously for batched FFT (forward copy, no reverse)
-            for (int i = 0; i < batch_count; i++)
+            // Pack vectors contiguously for batched FFT
+            // Parallelize only when enough work to hide OpenMP overhead
             {
-                const ssa_real *v = &V_block[(col + i) * K];
-                ssa_real *dst = ws_real + i * fft_len;
-                // Forward copy into [0..K)
-                memcpy(dst, v, K * sizeof(ssa_real));
-                // Zero only the tail [K..fft_len)
-                memset(dst + K, 0, (fft_len - K) * sizeof(ssa_real));
+                int i;
+#ifdef _OPENMP
+                #pragma omp parallel for schedule(static) if(batch_count >= 8 && K > 2048)
+#endif
+                for (i = 0; i < batch_count; i++)
+                {
+                    const ssa_real *v = &V_block[(col + i) * K];
+                    ssa_real *dst = ws_real + i * fft_len;
+                    // Forward copy into [0..K)
+                    memcpy(dst, v, K * sizeof(ssa_real));
+                    // Zero only the tail [K..fft_len)
+                    memset(dst + K, 0, (fft_len - K) * sizeof(ssa_real));
+                }
             }
             DftiComputeForward(ssa->fft_r2c_batch, ws_real, ws_complex); // Batched FFT
             for (int i = 0; i < batch_count; i++)
@@ -947,14 +956,16 @@ extern "C"
     // Block adjoint Hankel matvec: Z = Hᵀ·U where U is L×b, Z is K×b
     //
     // OPTIMIZATION: Conjugate multiply eliminates reverse copy in batch packing
+    // OPTIMIZATION: OpenMP parallel packing when sufficient work to hide overhead
     static void ssa_opt_hankel_matvec_T_block(SSA_Opt *ssa, const ssa_real *U_block, ssa_real *Y_block, int b)
     {
         int K = ssa->K, L = ssa->L, fft_len = ssa->fft_len, r2c_len = ssa->r2c_len;
+        int batch_size = ssa->batch_size;
         ssa_real *ws_real = ssa->ws_batch_real, *ws_complex = ssa->ws_batch_complex;
         int col = 0;
         while (col < b)
         {
-            int batch_count = ssa_opt_min(SSA_BATCH_SIZE, b - col);
+            int batch_count = ssa_opt_min(batch_size, b - col);
             if (batch_count < 2)
             {
                 for (int i = 0; i < batch_count; i++)
@@ -962,15 +973,22 @@ extern "C"
                 col += batch_count;
                 continue;
             }
-            // Pack vectors contiguously for batched FFT (forward copy, no reverse)
-            for (int i = 0; i < batch_count; i++)
+            // Pack vectors contiguously for batched FFT
+            // Parallelize only when enough work to hide OpenMP overhead
             {
-                const ssa_real *u = &U_block[(col + i) * L];
-                ssa_real *dst = ws_real + i * fft_len;
-                // Forward copy into [0..L)
-                memcpy(dst, u, L * sizeof(ssa_real));
-                // Zero only the tail [L..fft_len)
-                memset(dst + L, 0, (fft_len - L) * sizeof(ssa_real));
+                int i;
+#ifdef _OPENMP
+                #pragma omp parallel for schedule(static) if(batch_count >= 8 && L > 2048)
+#endif
+                for (i = 0; i < batch_count; i++)
+                {
+                    const ssa_real *u = &U_block[(col + i) * L];
+                    ssa_real *dst = ws_real + i * fft_len;
+                    // Forward copy into [0..L)
+                    memcpy(dst, u, L * sizeof(ssa_real));
+                    // Zero only the tail [L..fft_len)
+                    memset(dst + L, 0, (fft_len - L) * sizeof(ssa_real));
+                }
             }
             DftiComputeForward(ssa->fft_r2c_batch, ws_real, ws_complex);
             for (int i = 0; i < batch_count; i++)
@@ -1052,10 +1070,29 @@ extern "C"
         ssa->ws_real2 = (ssa_real *)ssa_opt_alloc(fft_n * sizeof(ssa_real));
 
         // ws_batch_real/complex: Batched FFT workspaces
-        // Process up to SSA_BATCH_SIZE (default 32) vectors in one MKL call
+        // Process multiple vectors in one MKL call for efficiency
         // Reduces function call overhead, improves cache utilization
-        ssa->ws_batch_real = (ssa_real *)ssa_opt_alloc(SSA_BATCH_SIZE * fft_n * sizeof(ssa_real));
-        ssa->ws_batch_complex = (ssa_real *)ssa_opt_alloc(SSA_BATCH_SIZE * 2 * ssa->r2c_len * sizeof(ssa_real));
+        
+        // === Calculate optimal batch size based on L3 cache ===
+        // Target ~8MB working set to fit in L3 cache of most modern CPUs
+        // Too large: cache thrashing; too small: MKL thread underutilization
+        {
+            int vec_bytes = fft_n * sizeof(ssa_real);
+            int target_batch = (8 * 1024 * 1024) / vec_bytes;  // Target 8MB
+            
+            // Clamp to reasonable limits
+            if (target_batch < 4) target_batch = 4;      // Minimum for ILP
+            if (target_batch > 64) target_batch = 64;    // Diminishing returns
+            
+            // Round down to power of 2 (better for alignment/MKL heuristics)
+            int optimal_batch = 1;
+            while (optimal_batch * 2 <= target_batch) optimal_batch *= 2;
+            
+            ssa->batch_size = optimal_batch;
+        }
+        
+        ssa->ws_batch_real = (ssa_real *)ssa_opt_alloc(ssa->batch_size * fft_n * sizeof(ssa_real));
+        ssa->ws_batch_complex = (ssa_real *)ssa_opt_alloc(ssa->batch_size * 2 * ssa->r2c_len * sizeof(ssa_real));
 
         // fft_x: Pre-computed FFT of the input signal
         // This is the key optimization: signal doesn't change during decomposition,
@@ -1115,7 +1152,7 @@ extern "C"
         }
 
         // --- Forward R2C Batched ---
-        // Same as fft_r2c but processes SSA_BATCH_SIZE vectors in one call
+        // Same as fft_r2c but processes batch_size vectors in one call
         // Used by block power iteration and randomized SVD
         status = DftiCreateDescriptor(&ssa->fft_r2c_batch, SSA_DFTI_PRECISION, DFTI_REAL, 1, fft_n);
         if (status != 0)
@@ -1126,7 +1163,7 @@ extern "C"
         DftiSetValue(ssa->fft_r2c_batch, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
         DftiSetValue(ssa->fft_r2c_batch, DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
         // NUMBER_OF_TRANSFORMS: how many FFTs to compute in parallel
-        DftiSetValue(ssa->fft_r2c_batch, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)SSA_BATCH_SIZE);
+        DftiSetValue(ssa->fft_r2c_batch, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)ssa->batch_size);
         // INPUT_DISTANCE: stride between consecutive input vectors (each is fft_n doubles)
         DftiSetValue(ssa->fft_r2c_batch, DFTI_INPUT_DISTANCE, (MKL_LONG)fft_n);
         // OUTPUT_DISTANCE: stride between consecutive output vectors (each is r2c_len complex = 2*r2c_len doubles)
@@ -1148,7 +1185,7 @@ extern "C"
         DftiSetValue(ssa->fft_c2r_batch, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
         DftiSetValue(ssa->fft_c2r_batch, DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
         DftiSetValue(ssa->fft_c2r_batch, DFTI_BACKWARD_SCALE, 1.0 / fft_n);
-        DftiSetValue(ssa->fft_c2r_batch, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)SSA_BATCH_SIZE);
+        DftiSetValue(ssa->fft_c2r_batch, DFTI_NUMBER_OF_TRANSFORMS, (MKL_LONG)ssa->batch_size);
         // For inverse: input is complex (r2c_len), output is real (fft_n)
         DftiSetValue(ssa->fft_c2r_batch, DFTI_INPUT_DISTANCE, (MKL_LONG)ssa->r2c_len);
         DftiSetValue(ssa->fft_c2r_batch, DFTI_OUTPUT_DISTANCE, (MKL_LONG)fft_n);
@@ -1732,7 +1769,7 @@ extern "C"
         ssa_opt_free_cached_ffts(ssa);
         int L = ssa->L, K = ssa->K;
         if (block_size <= 0)
-            block_size = SSA_BATCH_SIZE;
+            block_size = ssa->batch_size;  // Use dynamically computed batch size
         int b = ssa_opt_min(block_size, ssa_opt_min(k, ssa_opt_min(L, K)));
         k = ssa_opt_min(k, ssa_opt_min(L, K));
         ssa->U = (ssa_real *)ssa_opt_alloc(L * k * sizeof(ssa_real));
@@ -2355,15 +2392,14 @@ extern "C"
         // Inverse FFT to get time-domain result
         DftiComputeBackward(ssa_mut->fft_c2r, freq_accum, ssa_mut->ws_real);
 
-        // Copy and apply diagonal averaging weights
-        memcpy(output, ssa_mut->ws_real, N * sizeof(ssa_real));
-        ssa_vMul_real(N, output, ssa->inv_diag_count, output);
+        // Apply diagonal averaging weights directly to output (fused copy+multiply)
+        // This eliminates an extra memory pass vs memcpy followed by in-place vMul
+        ssa_vMul_real(N, ssa_mut->ws_real, ssa->inv_diag_count, output);
 
         return 0;
     }
 
-// ***************************************************** FEATURES *********************************************************************
-
+    // ***************************************************** FEATURES *********************************************************************
 
     // Forward declaration for auto-dispatch
     int ssa_opt_wcorr_matrix_fast(const SSA_Opt *ssa, double *W);
