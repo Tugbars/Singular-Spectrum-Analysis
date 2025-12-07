@@ -10,35 +10,35 @@
 
 #ifdef _WIN32
 #include <windows.h>
-static double get_time_ms(void) {
+static ssa_real get_time_ms(void) {
     LARGE_INTEGER freq, counter;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
+    return (ssa_real)counter.QuadPart * 1000.0 / (ssa_real)freq.QuadPart;
 }
 #else
 #include <time.h>
-static double get_time_ms(void) {
+static ssa_real get_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 #endif
 
-double compute_rmse(const double *a, const double *b, int n) {
-    double sum = 0.0;
+ssa_real compute_rmse(const ssa_real *a, const ssa_real *b, int n) {
+    ssa_real sum = 0.0;
     for (int i = 0; i < n; i++) {
-        double d = a[i] - b[i];
+        ssa_real d = a[i] - b[i];
         sum += d * d;
     }
     return sqrt(sum / n);
 }
 
-double compute_snr(const double *signal, const double *noisy, int n) {
-    double sig_power = 0.0, noise_power = 0.0;
+ssa_real compute_snr(const ssa_real *signal, const ssa_real *noisy, int n) {
+    ssa_real sig_power = 0.0, noise_power = 0.0;
     for (int i = 0; i < n; i++) {
         sig_power += signal[i] * signal[i];
-        double noise = noisy[i] - signal[i];
+        ssa_real noise = noisy[i] - signal[i];
         noise_power += noise * noise;
     }
     return 10.0 * log10(sig_power / noise_power);
@@ -51,17 +51,17 @@ int main(void) {
     int N = 500;
     int L = 125;
     int rank = 4;  // True signal has rank 4 (2 sinusoids = 2 pairs)
-    double noise_std = 0.5;
+    ssa_real noise_std = 0.5;
     
     // Allocate arrays
-    double *x_true = (double *)mkl_malloc(N * sizeof(double), 64);
-    double *x_noisy = (double *)mkl_malloc(N * sizeof(double), 64);
-    double *x_ssa = (double *)mkl_malloc(N * sizeof(double), 64);
-    double *x_cadzow = (double *)mkl_malloc(N * sizeof(double), 64);
+    ssa_real *x_true = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
+    ssa_real *x_noisy = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
+    ssa_real *x_ssa = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
+    ssa_real *x_cadzow = (ssa_real *)mkl_malloc(N * sizeof(ssa_real), 64);
     
     // Generate true signal: sum of two sinusoids (rank 4)
     for (int i = 0; i < N; i++) {
-        double t = (double)i / N;
+        ssa_real t = (ssa_real)i / N;
         x_true[i] = 3.0 * sin(2.0 * M_PI * 5 * t) +   // Frequency 5
                     2.0 * sin(2.0 * M_PI * 12 * t);   // Frequency 12
     }
@@ -69,9 +69,9 @@ int main(void) {
     // Add noise
     srand(42);
     for (int i = 0; i < N; i++) {
-        double u1 = (double)rand() / RAND_MAX;
-        double u2 = (double)rand() / RAND_MAX;
-        double noise = noise_std * sqrt(-2.0 * log(u1 + 1e-10)) * cos(2.0 * M_PI * u2);
+        ssa_real u1 = (ssa_real)rand() / RAND_MAX;
+        ssa_real u2 = (ssa_real)rand() / RAND_MAX;
+        ssa_real noise = noise_std * sqrt(-2.0 * log(u1 + 1e-10)) * cos(2.0 * M_PI * u2);
         x_noisy[i] = x_true[i] + noise;
     }
     
@@ -95,9 +95,9 @@ int main(void) {
     
     // Cadzow iterations
     SSA_CadzowResult cadzow_result;
-    double t0 = get_time_ms();
+    ssa_real t0 = get_time_ms();
     int iters = ssa_opt_cadzow(x_noisy, N, L, rank, 20, 1e-9, x_cadzow, &cadzow_result);
-    double t1 = get_time_ms();
+    ssa_real t1 = get_time_ms();
     
     printf("  Single-pass SSA:\n");
     printf("    RMSE vs true: %.6f\n", compute_rmse(x_true, x_ssa, N));
@@ -116,11 +116,11 @@ int main(void) {
     // =============================
     printf("Test 2: Weighted Cadzow (alpha blending)\n");
     
-    double alphas[] = {1.0, 0.9, 0.7, 0.5};
+    ssa_real alphas[] = {1.0, 0.9, 0.7, 0.5};
     int n_alphas = 4;
     
     for (int a = 0; a < n_alphas; a++) {
-        double alpha = alphas[a];
+        ssa_real alpha = alphas[a];
         SSA_CadzowResult res;
         ssa_opt_cadzow_weighted(x_noisy, N, L, rank, 20, 1e-9, alpha, x_cadzow, &res);
         printf("  alpha=%.1f: RMSE=%.6f, SNR=%.2f dB\n", 
@@ -180,7 +180,7 @@ int main(void) {
         ssa_opt_free(&ssa2);
     }
     t1 = get_time_ms();
-    double ssa_time = (t1 - t0) / n_runs;
+    ssa_real ssa_time = (t1 - t0) / n_runs;
     
     // Cadzow timing (typically 5-10 iterations)
     t0 = get_time_ms();
@@ -189,7 +189,7 @@ int main(void) {
         ssa_opt_cadzow(x_noisy, N, L, rank, 10, 1e-9, x_cadzow, &res);
     }
     t1 = get_time_ms();
-    double cadzow_time = (t1 - t0) / n_runs;
+    ssa_real cadzow_time = (t1 - t0) / n_runs;
     
     printf("  Single-pass SSA: %.2f ms\n", ssa_time);
     printf("  Cadzow (10 iter): %.2f ms\n", cadzow_time);
